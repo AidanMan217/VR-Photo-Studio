@@ -13,6 +13,8 @@ again).  Models whose registry entry says ``dml_ok=False`` never use DirectML.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -26,6 +28,23 @@ from ..core.log import get_logger
 from ..core.types import CancelToken, ProgressReporter
 
 log = get_logger(__name__)
+
+
+_stdout_lock = threading.Lock()
+
+
+def quiet_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Call ``fn`` while capturing anything it prints to stdout (onnxruntime prints
+    "EP Error ... Falling back" banners with ``print()``), logging it instead, so the
+    CLI's ``--json`` output stays machine-readable."""
+    buf = io.StringIO()
+    with _stdout_lock, contextlib.redirect_stdout(buf):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            text = buf.getvalue().strip()
+            if text:
+                log.info("onnxruntime: %s", " ".join(text.split()))
 
 CPU = "CPUExecutionProvider"
 DML = "DmlExecutionProvider"
@@ -252,7 +271,8 @@ class OrtModel:
         if chain[0][0] == DML:
             so.enable_mem_pattern = False
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        sess = ort.InferenceSession(
+        sess = quiet_call(
+            ort.InferenceSession,
             str(self.path),
             sess_options=so,
             providers=[p for p, _ in chain],

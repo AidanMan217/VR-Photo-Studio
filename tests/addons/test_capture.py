@@ -30,7 +30,9 @@ def _texture(h: int, w: int, seed: int) -> np.ndarray:
 
 
 def _write_jpg(path: Path, img: np.ndarray) -> Path:
-    cv2.imwrite(str(path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 95])
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 95])
+    assert ok
+    path.write_bytes(buf.tobytes())  # unicode-safe on Windows (cv2.imwrite is not)
     return path
 
 
@@ -138,7 +140,7 @@ def test_extract_frames_and_blur_filter(video, tmp_path):
     frames = capture.extract_frames(video, tmp_path / "frames", fps=4, max_long=80,
                                     progress=ProgressReporter(lambda f, m: rec.append(f)))
     assert 10 <= len(frames) <= 14
-    img = cv2.imread(str(frames[0]))
+    img = cv2.imdecode(np.fromfile(str(frames[0]), dtype=np.uint8), cv2.IMREAD_COLOR)
     assert img.shape[:2] == (60, 80)  # long side limited, aspect kept
     scores = [capture.sharpness(f) for f in frames]
     keep = capture.select_sharp(frames, group=2, scores=scores)

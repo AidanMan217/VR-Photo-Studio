@@ -139,14 +139,23 @@ def save_depth16(path: str | Path, disparity: np.ndarray) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     arr = (np.clip(disparity, 0, 1) * 65535.0 + 0.5).astype(np.uint16)
-    ok = cv2.imwrite(str(path), arr)
+    # cv2.imwrite cannot handle non-ASCII paths on Windows: encode in memory, write via Python
+    ok, buf = cv2.imencode(".png", arr)
     if not ok:
-        raise InputError(f"Cannot write {path}")
+        raise InputError(f"Cannot encode depth map for {path.name}")
+    try:
+        path.write_bytes(buf.tobytes())
+    except OSError as e:
+        raise InputError(f"Cannot write {path}: {e}") from e
     return path
 
 
 def load_depth16(path: str | Path) -> np.ndarray:
-    arr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)  # unicode-safe (cv2.imread is not on Windows)
+    except OSError as e:
+        raise InputError(f"Cannot read depth map {path}: {e}") from e
+    arr = cv2.imdecode(data, cv2.IMREAD_UNCHANGED) if data.size else None
     if arr is None:
         raise InputError(f"Cannot read depth map {path}")
     if arr.ndim == 3:

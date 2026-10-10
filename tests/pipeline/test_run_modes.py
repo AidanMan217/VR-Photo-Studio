@@ -29,7 +29,7 @@ def test_depth_mode(make_job, gradient_photo, out_dir):
     pc = _out(res, "Depth map (colour preview)")
     assert p16.name == "photo_depth.png" and pc.name == "photo_depth_color.jpg"
     assert p16.parent == out_dir
-    d = cv2.imread(str(p16), cv2.IMREAD_UNCHANGED)
+    d = cv2.imdecode(np.fromfile(str(p16), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     assert d.dtype == np.uint16 and d.shape == (480, 640)
     assert d.max() > d.min()
     assert image_size(pc) == (640, 480)

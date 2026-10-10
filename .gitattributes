@@ -1,0 +1,11 @@
+# Keep line endings stable on every OS: vendored files are verified by checksum and the
+# Windows CI checks out with core.autocrlf=true by default.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.jpg binary
+*.ico binary
+*.glb binary
+*.onnx binary
+*.splat binary

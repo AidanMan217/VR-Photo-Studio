@@ -190,7 +190,9 @@ def check_onnxruntime() -> dict[str, Any]:
                 so.enable_mem_pattern = False
                 so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             chain = [p] if p == "CPUExecutionProvider" else [p, "CPUExecutionProvider"]
-            sess = ort.InferenceSession(model, sess_options=so, providers=chain)
+            from .models.ort import quiet_call
+
+            sess = quiet_call(ort.InferenceSession, model, sess_options=so, providers=chain)
             used = sess.get_providers()[0]
             y = sess.run(None, {"x": x})[0]
             err = float(np.abs(y - ref).max())

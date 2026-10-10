@@ -406,6 +406,16 @@ def _abort_response(resp: object) -> None:
     if sock is not None:
         with contextlib.suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
+        if sys.platform == "win32":
+            # Winsock does not wake a recv() blocked in another thread on shutdown(); closing
+            # the handle does.  socket.close() would be deferred while the response's makefile
+            # still references the socket, so close the underlying handle directly.
+            real_close = getattr(sock, "_real_close", None)
+            with contextlib.suppress(OSError):
+                if callable(real_close):
+                    real_close()
+                else:
+                    sock.close()
 
 
 class _Transient(Exception):

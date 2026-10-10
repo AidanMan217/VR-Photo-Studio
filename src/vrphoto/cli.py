@@ -50,6 +50,12 @@ MODE_KINDS = ("depth", "stereo", "parallax", "vr180", "pano", "scene", "object",
 COMMANDS = (*MODE_KINDS, "run", "serve", "models", "addons", "selftest", "devices", "version")
 _STRUCTURAL = ("inputs", "common")
 
+#: Help text of the INPUT argument per mode (default: photos).
+_INPUT_HELP = {
+    "video": "video files or folders of videos (wildcards like *.mp4 work)",
+    "capture": "photos, phone videos or folders with them - all used together for one 3D scene",
+}
+
 #: Short descriptions of the modes (shown in ``vrphoto-cli --help``).
 MODE_SUMMARY = {
     "depth": "save depth maps (16-bit PNG + colour preview)",
@@ -309,9 +315,9 @@ def _choices_table() -> dict[tuple[str, str], tuple[str, ...]]:
         ("pano", "fill"): R.FILLS,
         ("scene", "look_behind"): R.SCENE_LOOK_BEHIND,
         ("object", "method"): R.OBJECT_METHODS,
-        ("object", "back"): ("diffuse", "mirror"),
+        ("object", "back"): R.BACKS,
         ("object", "placement"): R.PLACEMENTS,
-        ("video", "output"): ("sbs", "half_sbs", "tb", "vr180"),
+        ("video", "output"): R.VIDEO_OUTPUTS,
         ("video", "encoder_preset"): presets,
         ("common", "quest_model"): R.QUEST_MODELS,
     }
@@ -551,7 +557,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp = sub.add_parser(kind, parents=[parent], help=MODE_SUMMARY.get(kind, doc), description=doc)
         sp.add_argument(
             "inputs", nargs="+", metavar="INPUT",
-            help="photo/video files" + (" or folders" if kind == "capture" else ""),
+            help=_INPUT_HELP.get(kind, "photo files or folders of photos (wildcards like *.jpg work)"),
         )  # fmt: skip
         sp.add_argument(
             "--dry-run", action="store_true", help="print the job as JSON and exit without running it"
@@ -974,11 +980,14 @@ def _cmd_addons(console: Console, ns: argparse.Namespace) -> int:
 
 
 def _cmd_selftest(console: Console, ns: argparse.Namespace) -> int:
-    from .selftest import run_selftest
+    from .selftest import check_names, run_selftest
+
+    names = check_names(bool(ns.models))
 
     def step(name: str) -> None:
         if not console.json_mode:
-            console.progress(0.0, f"Checking {name}")
+            i = names.index(name) if name in names else 0
+            console.progress(i / max(1, len(names)), f"Checking {name.replace('_', ' ')}")
 
     report = run_selftest(ns.out, models=bool(ns.models), progress=step)
     console.end_progress()

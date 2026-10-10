@@ -55,7 +55,7 @@ SOURCE_FILES: tuple[str, ...] = ("addons/protocol.py",)
 #: Files/directories never bundled from the source tree.
 _SKIP_DIRS = {"__pycache__", "node_modules", ".pytest_cache", ".ruff_cache", ".mypy_cache", ".git"}
 _SKIP_SUFFIXES = {".pyc", ".pyo", ".part", ".tmp", ".orig", ".rej"}
-_SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", ".gitignore", ".gitkeep", ".npmrc"}
+_SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", ".gitignore", ".gitkeep", ".npmrc", ".gitattributes"}
 
 #: Python modules that must never end up in the bundle (huge or dev-only).
 EXCLUDES: list[str] = [

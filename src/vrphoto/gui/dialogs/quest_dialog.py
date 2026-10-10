@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 from ...core.log import get_logger
 from .. import util
 from ..server_ctl import ServerController
-from ..workers import TaskRunner
+from ..workers import DIALOG_CLOSE_WAIT_MS, TaskRunner
 from . import common as dc
 
 log = get_logger(__name__)
@@ -102,11 +102,16 @@ class QuestDialog(QDialog):
         self.adb_path: str | None = None
         self.devices: list[str] = []
         self._usb_after_start = False  # "Set up USB" was clicked while the viewer was stopped
+        self._long_tasks: set[str] = set()  # "copy" / "install" while running (asked on close)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_wifi(), "Wi-Fi (recommended)")
-        self.tabs.addTab(self._build_usb(), "USB cable")
+        self.usb_tab_index = self.tabs.addTab(self._build_usb(), "USB cable")
         self.tabs.addTab(self._build_library(), "Your scenes")
+        self._usb_checked_once = False
+        # adb is only looked for when the USB tab is opened: asking adb for devices starts
+        # its background server, which Wi-Fi users do not need
+        self.tabs.currentChanged.connect(self._tab_changed)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         box.rejected.connect(self.reject)
         lay = QVBoxLayout(self)
@@ -123,7 +128,10 @@ class QuestDialog(QDialog):
         elif autostart:
             self.start_server()
         self.refresh_library()
-        self.check_usb()
+
+    def _tab_changed(self, index: int) -> None:
+        if index == self.usb_tab_index and not self._usb_checked_once:
+            self.check_usb()
 
     # ================================================================= Wi-Fi tab
     def _build_wifi(self) -> QWidget:
@@ -414,7 +422,7 @@ class QuestDialog(QDialog):
         self.usb_steps = QLabel(USB_STEPS.format(port=self._http_port()))
         self.usb_steps.setWordWrap(True)
         self.usb_steps.setTextFormat(Qt.TextFormat.RichText)
-        self.adb_label = QLabel("Looking for USB tools (adb)…")
+        self.adb_label = QLabel("USB tools (adb): not checked yet.")
         self.adb_label.setWordWrap(True)
         self.usb_check_button = QPushButton("Check again")
         self.usb_check_button.clicked.connect(self.check_usb)
@@ -474,11 +482,13 @@ class QuestDialog(QDialog):
         self.copy_files_button.setEnabled(bool(existing) and self.quest is not None)
 
     def check_usb(self) -> None:
+        """Look for adb and connected headsets (background thread)."""
         if self.quest is None:
             self.adb_label.setText("USB helpers are not available.")
             for b in (self.install_tools_button, self.usb_setup_button, self.usb_check_button):
                 b.setEnabled(False)
             return
+        self._usb_checked_once = True
         self.adb_label.setText("Looking for USB tools (adb)…")
         q = self.quest
 
@@ -523,12 +533,19 @@ class QuestDialog(QDialog):
         self.usb_progress.setVisible(True)
         self.usb_progress.setValue(0)
         self.install_tools_button.setEnabled(False)
+        self._long_tasks.add("install")
+
+        def finished() -> None:
+            self._long_tasks.discard("install")
+            self.install_tools_button.setEnabled(True)
+
         self.tasks.start(
             self.quest.install_platform_tools,
             on_progress=self._usb_progress,
             on_result=self._tools_installed,
             on_error=self._usb_error,
-            on_finished=lambda: self.install_tools_button.setEnabled(True),
+            on_cancelled=lambda: self.usb_progress.setVisible(False),
+            on_finished=finished,
             name="install-adb",
         )
 
@@ -601,22 +618,45 @@ class QuestDialog(QDialog):
                 ok = all(q.adb_push(f, "/sdcard/Movies", progress=progress, cancel=cancel) for f in files)
                 if ok:
                     return f"Copied {len(files)} file(s) to the Quest's Movies folder (USB debugging)."
+            reason = ""
+            last_error = getattr(q, "last_error", None)
+            if callable(last_error):
+                try:
+                    reason = str(last_error() or "").strip()
+                except Exception:  # pragma: no cover - defensive
+                    reason = ""
+            explorer = (
+                "You can also copy the files in File Explorer: This PC → Quest 3 → Internal shared "
+                "storage → Movies."
+            )
+            if reason:
+                return f"Could not copy the files: {reason}\n{explorer}"
             return (
                 "Could not copy the files. Connect the Quest with a USB data cable, put it on and choose "
-                "'Allow' when it asks to allow access to data. You can also copy the files in File "
-                "Explorer: This PC → Quest 3 → Internal shared storage → Movies."
+                f"'Allow' when it asks to allow access to data. {explorer}"
             )
 
         self.usb_progress.setVisible(True)
         self.usb_progress.setValue(0)
         self.copy_files_button.setEnabled(False)
         self.usb_result.setText("Copying…")
+        self._long_tasks.add("copy")
+
+        def finished() -> None:
+            self._long_tasks.discard("copy")
+            self._update_files_label()
+
+        def cancelled() -> None:
+            self.usb_progress.setVisible(False)
+            self.usb_result.setText("Copying was stopped.")
+
         self.tasks.start(
             work,
             on_progress=self._usb_progress,
             on_result=lambda msg: (self.usb_progress.setVisible(False), self.usb_result.setText(msg)),
             on_error=self._usb_error,
-            on_finished=self._update_files_label,
+            on_cancelled=cancelled,
+            on_finished=finished,
             name="copy-to-quest",
         )
 
@@ -747,7 +787,19 @@ class QuestDialog(QDialog):
         return True
 
     # ================================================================= closing
+    def busy(self) -> bool:
+        """True while files are copied to the headset or the USB tools are installed."""
+        return bool(self._long_tasks)
+
     def done(self, result: int) -> None:  # noqa: D401 - QDialog API
+        if self._long_tasks:
+            what = "Copying files to the Quest" if "copy" in self._long_tasks else "Installing the USB tools"
+            if not util.ask_yes_no(
+                self, "Still working", f"{what} is not finished yet.", informative="Stop it and close?"
+            ):
+                return
+            self.tasks.cancel_all()
+            self._long_tasks.clear()
         for sig, slot in (
             (self.ctl.started, self._server_started),
             (self.ctl.stopped, self._server_stopped),
@@ -758,5 +810,5 @@ class QuestDialog(QDialog):
                 sig.disconnect(slot)
             except (RuntimeError, TypeError):
                 pass
-        self.tasks.shutdown(3000)
+        self.tasks.shutdown(DIALOG_CLOSE_WAIT_MS)
         super().done(result)

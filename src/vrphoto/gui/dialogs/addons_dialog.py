@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from ...core.log import get_logger
 from .. import util
-from ..workers import TaskRunner, Worker
+from ..workers import DIALOG_CLOSE_WAIT_MS, TaskRunner, Worker
 from . import common as dc
 
 log = get_logger(__name__)
@@ -224,6 +224,12 @@ class AddonCard(QFrame):
         self.req_label.setText("<br>".join(rows))
         self.req_label.setVisible(bool(rows))
 
+    def set_checking(self) -> None:
+        """Placeholder while the install status is being read (buttons disabled)."""
+        self.state_label.setText("Checking…")
+        for b in (self.install_button, self.uninstall_button, self.folder_button):
+            b.setEnabled(False)
+
     def set_status(self, status: dict[str, Any], *, busy: bool = False, any_busy: bool = False) -> None:
         self.status = status
         installed = bool(status.get("installed"))
@@ -281,7 +287,18 @@ class AddonCard(QFrame):
 
 
 class AddonsDialog(QDialog):
-    """Install / uninstall add-ons via :mod:`vrphoto.addons.manager`."""
+    """Install / uninstall add-ons via :mod:`vrphoto.addons.manager`.
+
+    The install status is read in a background thread (for a partly installed add-on the
+    manager measures its folder, which can take seconds for a large Python environment).
+
+    Signals:
+        experimentalChanged(bool): "Show experimental add-ons" was toggled (and saved).
+        statusRefreshed(): the cards show freshly read install states.
+    """
+
+    experimentalChanged = Signal(bool)
+    statusRefreshed = Signal()
 
     def __init__(self, parent: QWidget | None = None, *, settings: Any = None) -> None:
         super().__init__(parent)
@@ -292,11 +309,15 @@ class AddonsDialog(QDialog):
 
             settings = get_settings()
         self.settings = settings
-        self.tasks = TaskRunner(self, max_threads=2)
+        self.tasks = TaskRunner(self, max_threads=3)  # install + status + GPU check
         self.cards: dict[str, AddonCard] = {}
+        self._empty_label: QLabel | None = None
         self.worker: Worker | None = None
         self.active_id: str | None = None
         self.gpu: dict[str, Any] | None = None
+        self.statuses: dict[str, dict[str, Any]] = {}
+        self._status_gen = 0
+        self._status_pending = False
         self.log_timer = QTimer(self)
         self.log_timer.setInterval(1000)
         self.log_timer.timeout.connect(self._refresh_log)
@@ -354,6 +375,7 @@ class AddonsDialog(QDialog):
             return []
 
     def _status(self, addon_id: str) -> dict[str, Any]:
+        """Install status of one add-on (may walk its folder: call from a worker thread)."""
         try:
             return dict(self.manager.status(addon_id))
         except Exception as e:
@@ -382,17 +404,62 @@ class AddonsDialog(QDialog):
             card.set_requirements(self.gpu, free)
             self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
             self.cards[m.id] = card
+        if self._empty_label is not None:
+            self._empty_label.setParent(None)
+            self._empty_label.deleteLater()
+            self._empty_label = None
         if self.manager is not None and not self.cards:
-            empty = QLabel("No add-ons are available.")
-            empty.setObjectName("Muted")
-            self.cards_layout.insertWidget(0, empty)
+            self._empty_label = QLabel("No add-ons are available.")
+            self._empty_label.setObjectName("Muted")
+            self.cards_layout.insertWidget(0, self._empty_label)
         self.refresh_status()
 
+    @property
+    def status_pending(self) -> bool:
+        """True while install states are being read in the background."""
+        return self._status_pending
+
     def refresh_status(self) -> None:
+        """Re-read every card's install status in the background, then update the cards."""
+        if self.manager is None or not self.cards:
+            self._status_pending = False
+            return
+        self._status_gen += 1
+        gen = self._status_gen
+        ids = list(self.cards)
+        self._status_pending = True
         for aid, card in self.cards.items():
-            card.set_status(
-                self._status(aid), busy=aid == self.active_id, any_busy=self.active_id is not None
-            )
+            if aid not in self.statuses:
+                card.set_checking()
+        self._apply_status()
+
+        def work() -> dict[str, dict[str, Any]]:
+            return {aid: self._status(aid) for aid in ids}
+
+        def done(result: dict[str, dict[str, Any]]) -> None:
+            if gen != self._status_gen:
+                return  # a newer refresh is running
+            self.statuses.update(result)
+            self._status_pending = False
+            self._apply_status()
+            self.statusRefreshed.emit()
+
+        def failed(exc: BaseException) -> None:
+            if gen == self._status_gen:
+                self._status_pending = False
+                log.warning("Could not read the add-on states: %s", exc)
+
+        self.tasks.start(
+            work, pass_progress=False, pass_cancel=False, on_result=done, on_error=failed, name="addon-status"
+        )
+
+    def _apply_status(self) -> None:
+        """Show the last known states with the current busy flags (UI thread, no I/O)."""
+        for aid, card in self.cards.items():
+            st = self.statuses.get(aid)
+            if st is None:
+                continue
+            card.set_status(st, busy=aid == self.active_id, any_busy=self.active_id is not None)
 
     def _gpu_done(self, info: dict[str, Any]) -> None:
         self.gpu = info
@@ -408,6 +475,7 @@ class AddonsDialog(QDialog):
     def _toggle_experimental(self, on: bool) -> None:
         self.settings.show_experimental = bool(on)
         dc.save_settings(self.settings)
+        self.experimentalChanged.emit(bool(on))
         if self.active_id is None:
             self.populate()
 
@@ -461,7 +529,7 @@ class AddonsDialog(QDialog):
             name=f"install-{addon_id}",
         )
         self.log_timer.start()
-        self.refresh_status()
+        self._apply_status()
         return True
 
     def _finished(self, addon_id: str, error: Any) -> None:
@@ -481,6 +549,7 @@ class AddonsDialog(QDialog):
             util.show_error(self, "Installation failed", error)
         if card:
             card.end(msg)
+        self.statuses.pop(addon_id, None)  # show "Checking…" until the new state is read
         self.refresh_status()
 
     def _refresh_log(self) -> None:
@@ -516,12 +585,13 @@ class AddonsDialog(QDialog):
         ):
             return False
         self.active_id = addon_id
-        self.refresh_status()
+        self._apply_status()
 
         def done(_r: Any = None, err: Any = None) -> None:
             self.active_id = None
             if err is not None:
                 util.show_error(self, "Uninstall failed", err)
+            self.statuses.pop(addon_id, None)
             self.refresh_status()
 
         self.tasks.start(
@@ -536,7 +606,7 @@ class AddonsDialog(QDialog):
         return True
 
     def open_folder(self, addon_id: str) -> None:
-        st = self._status(addon_id)
+        st = self.statuses.get(addon_id) or {}
         p = st.get("path")
         if p and Path(p).is_dir():
             util.open_path(p)
@@ -556,5 +626,5 @@ class AddonsDialog(QDialog):
                 return
             self.worker.cancel()
         self.log_timer.stop()
-        self.tasks.shutdown(5000)
+        self.tasks.shutdown(DIALOG_CLOSE_WAIT_MS)
         super().done(result)

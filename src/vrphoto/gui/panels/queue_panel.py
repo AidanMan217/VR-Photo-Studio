@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -59,6 +60,41 @@ class JobInfo:
         return getattr(self.result, "scene_id", None) if self.result is not None else None
 
 
+class ElidedLabel(QLabel):
+    """One-line label that shortens long text with "…" to fit (the full text is in the
+    tooltip).  Keeps job rows a fixed height however long an error message is."""
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._full = ""
+        self._tip = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(40)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt API
+        self._full = str(text or "")
+        self._elide()
+
+    def text(self) -> str:
+        """The full (not shortened) text."""
+        return self._full
+
+    def setToolTip(self, tip: str) -> None:  # noqa: N802 - Qt API
+        self._tip = str(tip or "")
+        self._elide()
+
+    def resizeEvent(self, e) -> None:  # noqa: N802, ANN001
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self) -> None:
+        shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, max(20, self.width()))
+        super().setText(shown)
+        tip = self._tip or (self._full if shown != self._full else "")
+        super().setToolTip(tip)
+
+
 class JobRow(QFrame):
     """Widget for one job in the queue list."""
 
@@ -74,9 +110,8 @@ class JobRow(QFrame):
         self.title = QLabel(info.title)
         self.title.setObjectName("ModeTitle")
         self.title.setToolTip("\n".join(info.inputs))
-        self.status = QLabel("Waiting")
+        self.status = ElidedLabel("Waiting")
         self.status.setObjectName("Muted")
-        self.status.setWordWrap(True)
         self.bar = QProgressBar()
         self.bar.setRange(0, 1000)
         self.bar.setTextVisible(True)

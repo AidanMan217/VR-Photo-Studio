@@ -186,6 +186,9 @@ def check_onnxruntime() -> dict[str, Any]:
         try:
             so = ort.SessionOptions()
             so.log_severity_level = 3
+            if p == "DmlExecutionProvider":  # DirectML needs these (as models.ort sets them)
+                so.enable_mem_pattern = False
+                so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             chain = [p] if p == "CPUExecutionProvider" else [p, "CPUExecutionProvider"]
             sess = ort.InferenceSession(model, sess_options=so, providers=chain)
             used = sess.get_providers()[0]
@@ -424,6 +427,31 @@ def _devices() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- runner
+def _plan(tmp: Path, models: bool) -> list[tuple[str, Callable[[], dict[str, Any]], bool]]:
+    """``(name, check, required)`` in run order; checks that write files use ``tmp``."""
+    plan: list[tuple[str, Callable[[], dict[str, Any]], bool]] = [
+        ("imports", check_imports, True),
+        ("data_folder", check_data_folder, True),
+        ("onnxruntime", check_onnxruntime, True),
+        ("ffmpeg", lambda: check_ffmpeg(tmp), True),
+        ("spatial_metadata", lambda: check_spatial(tmp), True),
+        ("https_server", lambda: check_https_server(tmp), True),
+        ("viewer_assets", check_viewer_assets, True),
+        ("addons", check_addons, True),
+        ("uv", check_uv, True),
+        ("geometry", lambda: check_geometry(tmp), True),
+        ("devices", _devices, False),
+    ]
+    if models:
+        plan.append(("models", lambda: check_models(tmp), True))
+    return plan
+
+
+def check_names(models: bool = False) -> list[str]:
+    """Names of the checks :func:`run_selftest` runs, in order (e.g. for a progress bar)."""
+    return [name for name, _fn, _req in _plan(Path(tempfile.gettempdir()), models)]
+
+
 def _run_check(
     results: dict[str, Any], name: str, fn: Callable[[], dict[str, Any]], *, required: bool = True
 ) -> None:
@@ -458,23 +486,7 @@ def run_selftest(
     t0 = time.perf_counter()
     checks: dict[str, Any] = {}
     with tempfile.TemporaryDirectory(prefix="vrphoto-selftest-", ignore_cleanup_errors=True) as td:
-        tmp = Path(td)
-        plan: list[tuple[str, Callable[[], dict[str, Any]], bool]] = [
-            ("imports", check_imports, True),
-            ("data_folder", check_data_folder, True),
-            ("onnxruntime", check_onnxruntime, True),
-            ("ffmpeg", lambda: check_ffmpeg(tmp), True),
-            ("spatial_metadata", lambda: check_spatial(tmp), True),
-            ("https_server", lambda: check_https_server(tmp), True),
-            ("viewer_assets", check_viewer_assets, True),
-            ("addons", check_addons, True),
-            ("uv", check_uv, True),
-            ("geometry", lambda: check_geometry(tmp), True),
-            ("devices", _devices, False),
-        ]
-        if models:
-            plan.append(("models", lambda: check_models(tmp), True))
-        for name, fn, required in plan:
+        for name, fn, required in _plan(Path(td), models):
             if progress is not None:
                 progress(name)
             _run_check(checks, name, fn, required=required)
@@ -505,4 +517,5 @@ __all__ = [
     "TINY_ONNX_B64",
     "VIEWER_FILES",
     "CheckFailed",
+    "check_names",
 ]

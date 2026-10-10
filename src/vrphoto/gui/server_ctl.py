@@ -127,16 +127,19 @@ class ServerController(QObject):
         self._reconcile()
 
     def restart(self) -> None:
-        """Apply new settings (ports): restart if running (or starting)."""
+        """Apply new settings (ports, folders): restart if running (or starting).
+
+        Both the stop and the new start run in the background (stopping waits for the
+        server threads, which must never freeze the window).
+        """
         if self._busy:
             if self._want:
                 self._restart_pending = True
             return
         if not self.running:
             return
-        srv, self.server = self.server, None
-        self._stop_now(srv)
-        self.start()
+        self._want = True
+        self._begin_stop()  # -> _on_stopped -> _reconcile starts it again (still wanted)
 
     def _reconcile(self) -> None:
         if self._busy:

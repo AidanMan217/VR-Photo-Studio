@@ -126,6 +126,22 @@ def test_error_reporter_one_dialog_at_a_time(qtbot, monkeypatch):
     assert shown == ["first"]
 
 
+def test_error_reporter_does_not_repeat_the_same_error(qtbot, monkeypatch):
+    """A recurring error (e.g. raised in a timer) is shown once, not in an endless loop."""
+    from vrphoto.gui.app import ErrorReporter
+
+    rep = ErrorReporter(repeat_after_s=60)
+    shown: list[str] = []
+    monkeypatch.setattr(rep, "show_dialog", lambda info: shown.append(str(info[1])))
+    for _ in range(3):
+        rep._show((ValueError, ValueError("timer broke"), None))
+    rep._show((ValueError, ValueError("something else"), None))
+    assert shown == ["timer broke", "something else"]
+    rep.repeat_after_s = 0
+    rep._show((ValueError, ValueError("timer broke"), None))
+    assert shown[-1] == "timer broke" and len(shown) == 3
+
+
 def test_install_excepthook_routes_and_restores(qtbot):
     from vrphoto.gui.app import ErrorReporter, install_excepthook
 
@@ -177,6 +193,7 @@ def test_themes_apply(qtbot):
     assert resolve_theme("system") in ("dark", "light")
     assert colors("dark") is DARK
     assert "arrow_down" in stylesheet(DARK)  # bundled arrow images found via resource_path
+    assert "check_light.png" in stylesheet(DARK) and "QCheckBox::indicator:checked" in stylesheet(LIGHT)
 
 
 def test_resources_bundled():
@@ -188,6 +205,7 @@ def test_resources_bundled():
         "arrow_down_light.png",
         "arrow_up_dark.png",
         "arrow_down_dark.png",
+        "check_light.png",
     ):
         assert resource_path("gui", "resources", name).is_file(), name
 
@@ -264,6 +282,8 @@ def test_human_formatting_and_output_folder(tmp_path):
 
     assert human_size_mb(1500) == "1.5 GB" and human_size_mb(99.4) == "99 MB" and human_size_mb(0) == "?"
     assert human_duration(5) == "5 s" and human_duration(125) == "2 min 05 s" and "h" in human_duration(7300)
+    assert human_duration(0.5) == "0.5 s" and human_duration(0.01) == "less than 0.1 s"  # never "0 s"
+    assert human_duration(42.4) == "42 s"
     f = tmp_path / "x.jpg"
     f.write_bytes(b"1")
     assert output_folder_of({"a": str(tmp_path / "missing.jpg"), "b": str(f)}) == tmp_path
@@ -346,3 +366,198 @@ def test_server_controller_failure_is_not_retried(qtbot, settings):
     qtbot.wait(50)
     assert attempts == [1] and not ctl.busy and not ctl.running
     ctl.shutdown()
+
+
+# --------------------------------------------------------------------------- review fixes
+def test_stylesheet_image_urls_are_quoted(monkeypatch, tmp_path):
+    """Install paths with spaces/parentheses (e.g. 'Program Files (x86)') keep working."""
+    from vrphoto.gui import theme
+
+    res = tmp_path / "VR Photo Studio (x86)" / "vrphoto" / "gui" / "resources"
+    res.mkdir(parents=True)
+    for n in ("arrow_up_light.png", "arrow_down_light.png"):
+        (res / n).write_bytes(b"png")
+    monkeypatch.setattr(
+        "vrphoto.core.config.resource_path", lambda *parts: res.parent.parent.joinpath(*parts)
+    )
+    qss = theme.stylesheet(theme.DARK)
+    assert f'url("{(res / "arrow_up_light.png").as_posix()}")' in qss
+
+
+def test_follow_system_theme_reapplies_only_for_system(qtbot):
+    from vrphoto.gui.theme import apply_theme, follow_system_theme
+
+    app = QApplication.instance()
+    chosen = {"theme": "dark"}
+    stop = follow_system_theme(app, lambda: chosen["theme"])
+    apply_theme(app, "light")
+    from PySide6.QtGui import QGuiApplication
+
+    QGuiApplication.styleHints().colorSchemeChanged.emit(QGuiApplication.styleHints().colorScheme())
+    assert app.property("vrphoto_theme") == "light"  # user chose a fixed theme: untouched
+    chosen["theme"] = "system"
+    QGuiApplication.styleHints().colorSchemeChanged.emit(QGuiApplication.styleHints().colorScheme())
+    from vrphoto.gui.theme import resolve_theme
+
+    assert app.property("vrphoto_theme") == resolve_theme("system")
+    stop()
+    apply_theme(app, "light")
+    chosen["theme"] = "system"
+    QGuiApplication.styleHints().colorSchemeChanged.emit(QGuiApplication.styleHints().colorScheme())
+    assert app.property("vrphoto_theme") == "light"  # no longer following
+    apply_theme(app, "dark")
+
+
+def test_collect_media_stops_at_the_limit(media):
+    from vrphoto.gui.util import collect_media_ex
+
+    found, truncated = collect_media_ex([media["dir"]], max_files=2)
+    assert len(found) == 2 and truncated
+    found, truncated = collect_media_ex([media["dir"]], max_files=100)
+    assert len(found) >= 3 and not truncated
+    found, truncated = collect_media_ex([media["a"], media["a"]], max_files=1)
+    assert found == [media["a"]] and not truncated  # duplicates do not count
+
+
+# --------------------------------------------------------------------------- single instance
+def _run_client(qtbot, code: str, *args: str) -> str:
+    """Run ``code`` in another Python process (a second "start" of the app) while this
+    process keeps serving Qt events; returns its stdout."""
+    import os
+    import subprocess
+
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    try:
+        qtbot.waitUntil(lambda: proc.poll() is not None, timeout=30000)
+        out, err = proc.communicate(timeout=5)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 0, err
+    return out
+
+
+SEND = (
+    "import sys, json\n"
+    "from PySide6.QtCore import QCoreApplication\n"
+    "from vrphoto.gui.single_instance import SingleInstance\n"
+    "app = QCoreApplication([])\n"
+    "print(SingleInstance(sys.argv[1]).send_to_running(json.loads(sys.argv[2]), timeout_ms=5000))\n"
+)
+
+
+def test_single_instance_hands_files_to_the_running_one(qtbot, tmp_path):
+    import json
+
+    from vrphoto.gui.single_instance import SingleInstance
+
+    key = str(tmp_path / "home")
+    first = SingleInstance(key)
+    assert first.listen() and first.listening
+    got: list[list[str]] = []
+    first.activated.connect(got.append)
+    files = ["C:/photos/a b.jpg", "x.png"]
+    assert _run_client(qtbot, SEND, key, json.dumps(files)).strip() == "True"
+    qtbot.waitUntil(lambda: bool(got), timeout=5000)
+    assert got == [files]
+    first.close()
+    assert not first.listening
+    assert _run_client(qtbot, SEND, key, "[]").strip() == "False"  # nobody listening: start normally
+
+
+def test_single_instance_names_are_per_data_folder(tmp_path):
+    from vrphoto.gui.single_instance import server_name
+
+    assert server_name(str(tmp_path / "a")) != server_name(str(tmp_path / "b"))
+    assert server_name(str(tmp_path / "a")) == server_name(str(tmp_path / "a"))
+    assert server_name(str(tmp_path / "a")).startswith("VRPhotoStudio-")
+
+
+def test_single_instance_ignores_garbage(qtbot, tmp_path):
+    from vrphoto.gui.single_instance import SingleInstance
+
+    key = str(tmp_path / "home")
+    first = SingleInstance(key)
+    assert first.listen()
+    got: list[list[str]] = []
+    first.activated.connect(got.append)
+    junk = (
+        "import sys\n"
+        "from PySide6.QtCore import QCoreApplication\n"
+        "from PySide6.QtNetwork import QLocalSocket\n"
+        "app = QCoreApplication([])\n"
+        "s = QLocalSocket(); s.connectToServer(sys.argv[1]); assert s.waitForConnected(3000)\n"
+        "s.write(b'not json\\n'); s.flush()\n"
+        "s.waitForReadyRead(5000); print(bytes(s.readAll().data()).decode().strip())\n"
+    )
+    assert _run_client(qtbot, junk, first.name).strip() == "OK"
+    qtbot.waitUntil(lambda: bool(got), timeout=5000)
+    assert got == [[]]  # just "show yourself"
+    first.close()
+
+
+def test_second_start_hands_over_and_exits(qtbot, monkeypatch, isolated_home, tmp_path):
+    """run_gui exits at once when another instance (here: a subprocess) is running."""
+    import os
+    import subprocess
+
+    from vrphoto.gui import app as gui_app
+
+    script = tmp_path / "first.py"
+    script.write_text(
+        "import sys\n"
+        "from PySide6.QtCore import QCoreApplication, QTimer\n"
+        "from vrphoto.gui.single_instance import SingleInstance\n"
+        "app = QCoreApplication([])\n"
+        "g = SingleInstance()\n"
+        "assert g.listen()\n"
+        "g.activated.connect(lambda files: (print('GOT', files, flush=True), app.quit()))\n"
+        "print('READY', flush=True)\n"
+        "QTimer.singleShot(30000, app.quit)\n"
+        "app.exec()\n"
+    )
+    env = dict(os.environ, VRPHOTO_HOME=str(isolated_home), QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.Popen(
+        [sys.executable, str(script)], stdout=subprocess.PIPE, text=True, env=env, cwd=str(tmp_path)
+    )
+    try:
+        assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == "READY"
+        monkeypatch.setattr(gui_app, "setup_logging", lambda *a, **k: None)
+        monkeypatch.setattr(gui_app.QMessageBox, "critical", lambda *a, **k: None)  # never block
+        built = []
+        from vrphoto.gui import main_window
+
+        monkeypatch.setattr(main_window, "MainWindow", lambda *a, **k: built.append(1))
+        photo = tmp_path / "p.jpg"
+        photo.write_bytes(b"x")
+        assert gui_app.run_gui(["vrphoto", str(photo)]) == 0
+        assert built == []  # no second window
+        out, _ = proc.communicate(timeout=20)
+        assert "GOT" in out and "p.jpg" in out
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_bring_to_front_adds_files_and_guard_closes_on_shutdown(make_window, media, tmp_path):
+    from vrphoto.gui.single_instance import SingleInstance
+
+    w, _ = make_window()
+    guard = SingleInstance(str(tmp_path / "guard"))
+    assert guard.listen()
+    w.instance_guard = guard
+    w.showMinimized()
+    w.bring_to_front([str(media["a"])])
+    assert w.inputs.paths() == [media["a"]] and not w.isMinimized()
+    w.shutdown()
+    assert not guard.listening
+    w.bring_to_front([str(media["b"])])  # ignored after shutdown
+    assert w.inputs.paths() == [media["a"]]

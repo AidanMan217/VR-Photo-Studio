@@ -11,6 +11,7 @@ from typing import Any
 from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QKeySequence
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QLabel,
     QMainWindow,
@@ -40,7 +41,15 @@ from .workers import TaskRunner
 log = get_logger(__name__)
 
 #: depth/inpaint/segment option values whose model id differs from the option value
-MODEL_ALIASES = {"moge2": "moge2-vitl", "da3": "da3-mono-large", "isnet": "isnet-general"}
+MODEL_ALIASES = {
+    "moge2": "moge2-vitl",
+    "moge": "moge2-vitl",
+    "da3": "da3-mono-large",
+    "isnet": "isnet-general",
+}
+#: On exit: how long to wait for cancelled jobs to stop (so add-on worker processes and
+#: ffmpeg are terminated by the job instead of being left running without the app).
+JOB_STOP_WAIT_S = 8.0
 
 
 def app_icon() -> QIcon:
@@ -99,6 +108,8 @@ class MainWindow(QMainWindow):
         self.state = state or GuiState.load()
         self.dialogs: dict[str, QWidget] = {}
         self._shut_down = False
+        self._declined_licenses: set[str] = set()  # preview prompts declined this session
+        self.instance_guard: Any = None  # single-instance guard (set by run_gui)
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
         self.setAcceptDrops(True)
@@ -118,7 +129,11 @@ class MainWindow(QMainWindow):
             show_experimental=bool(getattr(settings, "show_experimental", False)),
             remembered=self.state.options,
         )
-        self.preview = PreviewPanel(engine=preview_engine, options_provider=self.modes.current_options)
+        self.preview = PreviewPanel(
+            engine=preview_engine,
+            options_provider=self.modes.current_options,
+            license_gate=self._preview_license_ok,
+        )
         self.queue = QueuePanel(self.bridge)
         self.log_panel = LogPanel()
 
@@ -129,7 +144,7 @@ class MainWindow(QMainWindow):
         self.top_split.setStretchFactor(0, 0)
         self.top_split.setStretchFactor(1, 1)
         self.top_split.setStretchFactor(2, 0)
-        self.top_split.setSizes([300, 760, 420])
+        self.top_split.setSizes([280, 720, 460])
         self.top_split.setChildrenCollapsible(False)
         self.bottom_split = QSplitter(Qt.Orientation.Horizontal)
         self.bottom_split.addWidget(self.queue)
@@ -139,7 +154,7 @@ class MainWindow(QMainWindow):
         self.main_split.addWidget(self.top_split)
         self.main_split.addWidget(self.bottom_split)
         self.main_split.setStretchFactor(0, 1)
-        self.main_split.setSizes([640, 240])
+        self.main_split.setSizes([700, 190])
         self.setCentralWidget(self.main_split)
 
         self._build_actions()
@@ -154,6 +169,7 @@ class MainWindow(QMainWindow):
         self.modes.createRequested.connect(self.create_jobs)
         self.queue.viewInHeadset.connect(self.view_in_headset)
         self.preview.statusMessage.connect(lambda m: self.statusBar().showMessage(m, 6000))
+        self.inputs.notice.connect(lambda m: self.statusBar().showMessage(m, 12000))
         self.bridge.countsChanged.connect(self._counts_changed)
         self.server.started.connect(self._server_status)
         self.server.stopped.connect(self._server_status)
@@ -341,9 +357,21 @@ class MainWindow(QMainWindow):
     def add_inputs(self, paths: Iterable[str | Path]) -> int:
         """Add files/folders to the input list (same API as drag & drop)."""
         n = self.inputs.add_paths(paths)
-        if n:
+        if n and not self.inputs.last_truncated:  # keep the "folder too big" notice visible
             self.statusBar().showMessage(f"Added {n} file{'s' if n != 1 else ''}", 4000)
         return n
+
+    def bring_to_front(self, files: list[str] | None = None) -> None:
+        """Show this window (another start of the app was handed over) and add its files."""
+        if self._shut_down:
+            return
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        if files:
+            self.add_inputs(files)
 
     def dragEnterEvent(self, e: QDragEnterEvent) -> None:  # noqa: N802 - Qt API
         if e.mimeData().hasUrls():
@@ -358,28 +386,54 @@ class MainWindow(QMainWindow):
         if paths:
             e.acceptProposedAction()
             n = self.add_inputs(paths)
-            if not n:
-                self.statusBar().showMessage("No supported photos or videos in what you dropped.", 6000)
+            if not n and not self.inputs.last_truncated:
+                self.statusBar().showMessage(
+                    "Nothing new to add: no supported photos or videos, or they are already in the list.",
+                    6000,
+                )
 
     # ================================================================= jobs
+    def _model_spec(self, name: str) -> Any:
+        """Registry spec of a depth/inpaint/segment option value, or None ("auto", unknown)."""
+        reg, _err = dc.try_backend("models.registry")
+        if reg is None or not name:
+            return None
+        try:
+            return reg.get_spec(MODEL_ALIASES.get(name, name))
+        except Exception:
+            return None
+
+    def ensure_license(self, name: str) -> bool:
+        """True if model option ``name`` may be used; asks to accept a non-commercial license
+        (remembered via ``Settings.accept_license``)."""
+        m = self._model_spec(str(name or ""))
+        if m is None or not getattr(m, "noncommercial", False) or self.settings.license_accepted(m.id):
+            return True
+        if not dc.confirm_license(self, m.title, m.license, url=getattr(m, "page_url", "")):
+            return False
+        self.settings.accept_license(m.id)
+        self._declined_licenses.discard(m.id)
+        dc.save_settings(self.settings)
+        return True
+
+    def _preview_license_ok(self, depth_model: str) -> bool:
+        """License gate of the preview: asks once per session, then shows a hint instead."""
+        m = self._model_spec(str(depth_model or ""))
+        if m is None or not getattr(m, "noncommercial", False) or self.settings.license_accepted(m.id):
+            return True
+        if m.id in self._declined_licenses:
+            return False
+        if self.ensure_license(depth_model):
+            return True
+        self._declined_licenses.add(m.id)
+        return False
+
     def _check_model_licenses(self, spec: Any) -> bool:
         """Ask for non-commercial license acceptance of models the job will download."""
-        reg, _err = dc.try_backend("models.registry")
-        if reg is None:
-            return True
         common = getattr(spec, "common", None)
         for attr in ("depth_model", "inpaint_model", "segment_model"):
-            name = str(getattr(common, attr, "") or "")
-            model_id = MODEL_ALIASES.get(name, name)
-            try:
-                m = reg.get_spec(model_id)
-            except Exception:
-                continue
-            if m.noncommercial and not self.settings.license_accepted(model_id):
-                if not dc.confirm_license(self, m.title, m.license, url=getattr(m, "page_url", "")):
-                    return False
-                self.settings.accept_license(model_id)
-                dc.save_settings(self.settings)
+            if not self.ensure_license(str(getattr(common, attr, "") or "")):
+                return False
         return True
 
     def _check_addons(self, kind: str, values: dict[str, Any]) -> bool:
@@ -419,6 +473,9 @@ class MainWindow(QMainWindow):
 
     def create_jobs(self) -> list[str]:
         """Build and submit jobs for the selected inputs in the current mode; returns job ids."""
+        fw = QApplication.focusWidget()
+        if isinstance(fw, QAbstractSpinBox):  # Ctrl+Enter while typing a number: use it
+            fw.interpretText()
         if not self.modes.create_button.isEnabled() and self.inputs.count() == 0:
             util.show_info(
                 self, "Nothing to do", "Add photos on the left first (or drag them into the window)."
@@ -463,11 +520,19 @@ class MainWindow(QMainWindow):
                 msg += f" ({len(skipped)} unsuitable file{'s' if len(skipped) != 1 else ''} skipped)"
             self.statusBar().showMessage(msg, 6000)
             log.info(msg)
-            self.state.options = self.modes.remember_all()
+            try:  # remember these options now (not only on a clean exit)
+                self.save_state()
+            except Exception:
+                log.debug("Could not save the GUI state", exc_info=True)
         return ids
 
     # ================================================================= dialogs
-    def _show_dialog(self, name: str, factory: Callable[[], QWidget]) -> QWidget:
+    def _show_dialog(self, name: str, factory: Callable[[], QWidget]) -> QWidget | None:
+        """Show the single instance of dialog ``name`` (created by ``factory`` if needed).
+
+        Returns None (after a friendly message) if the dialog cannot be created, e.g.
+        because one of its modules is broken in this installation.
+        """
         dlg = self.dialogs.get(name)
         if dlg is not None:
             try:
@@ -481,9 +546,14 @@ class MainWindow(QMainWindow):
         try:
             dlg = factory()
         except Exception as e:
-            log.exception("Cannot open %s", name)
-            util.show_error(self, "Not available", f"The {name} window could not be opened: {e}")
-            raise
+            log.exception("Cannot open the %s window", name)
+            util.show_error(
+                self,
+                "Not available",
+                f"The {name} window could not be opened: {e}",
+                details=util.format_exception(e),
+            )
+            return None
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dlg.finished.connect(lambda _r, n=name, d=dlg: self._dialog_closed(n, d))
         self.dialogs[name] = dlg
@@ -494,64 +564,81 @@ class MainWindow(QMainWindow):
     def _dialog_closed(self, name: str, dlg: QWidget) -> None:
         if self.dialogs.get(name) is dlg:
             self.dialogs.pop(name, None)
+        if name == "models":  # a license may have been accepted / a model downloaded
+            self.preview.options_changed()
 
-    def open_models(self) -> QWidget:
-        from .dialogs.models_dialog import ModelsDialog
-
-        return self._show_dialog("models", lambda: ModelsDialog(self, settings=self.settings))
-
-    def open_addons(self) -> QWidget:
-        from .dialogs.addons_dialog import AddonsDialog
-
-        return self._show_dialog("addons", lambda: AddonsDialog(self, settings=self.settings))
-
-    def open_settings(self) -> QWidget:
-        from .dialogs.settings_dialog import SettingsDialog
-
+    def open_models(self) -> QWidget | None:
         def make() -> QWidget:
+            from .dialogs.models_dialog import ModelsDialog
+
+            return ModelsDialog(self, settings=self.settings)
+
+        return self._show_dialog("models", make)
+
+    def open_addons(self) -> QWidget | None:
+        def make() -> QWidget:
+            from .dialogs.addons_dialog import AddonsDialog
+
+            d = AddonsDialog(self, settings=self.settings)
+            d.experimentalChanged.connect(lambda _on: self.apply_settings({"show_experimental"}))
+            return d
+
+        return self._show_dialog("addons", make)
+
+    def open_settings(self) -> QWidget | None:
+        def make() -> QWidget:
+            from .dialogs.settings_dialog import SettingsDialog
+
             d = SettingsDialog(self, settings=self.settings)
             d.saved.connect(self.apply_settings)
             return d
 
         return self._show_dialog("settings", make)
 
-    def open_about(self) -> QWidget:
-        from .dialogs.about_dialog import AboutDialog
+    def open_about(self) -> QWidget | None:
+        def make() -> QWidget:
+            from .dialogs.about_dialog import AboutDialog
 
-        return self._show_dialog("about", lambda: AboutDialog(self))
+            return AboutDialog(self)
 
-    def open_log(self) -> QWidget:
-        from .dialogs.log_dialog import LogDialog
+        return self._show_dialog("about", make)
 
-        return self._show_dialog("log", lambda: LogDialog(self))
+    def open_log(self) -> QWidget | None:
+        def make() -> QWidget:
+            from .dialogs.log_dialog import LogDialog
+
+            return LogDialog(self)
+
+        return self._show_dialog("log", make)
 
     def _job_files(self, job_id: str | None) -> list[Path]:
         if job_id:
             return self.queue.output_files(job_id)
         return []
 
-    def open_quest(self, scene_id: str | None = None, job_id: str | None = None) -> QWidget:
+    def open_quest(self, scene_id: str | None = None, job_id: str | None = None) -> QWidget | None:
         """Open "Send to Quest" (focused on ``scene_id``, offering the files of ``job_id``)."""
-        from .dialogs.quest_dialog import QuestDialog
-
         job_id = job_id or self.queue.selected_job()
         if scene_id is None and job_id and job_id in self.queue.jobs:
             scene_id = self.queue.jobs[job_id].scene_id
         files = self._job_files(job_id)
         existing = self.dialogs.get("quest")
-        dlg = self._show_dialog(
-            "quest",
-            lambda: QuestDialog(
+
+        def make() -> QWidget:
+            from .dialogs.quest_dialog import QuestDialog
+
+            return QuestDialog(
                 self, controller=self.server, settings=self.settings, focus_scene=scene_id, files=files
-            ),
-        )
-        if existing is dlg:  # already open: refocus
+            )
+
+        dlg = self._show_dialog("quest", make)
+        if dlg is not None and existing is dlg:  # already open: refocus
             dlg.set_files(files)  # type: ignore[attr-defined]
             dlg.refresh_library()  # type: ignore[attr-defined]
             dlg.set_focus_scene(scene_id)  # type: ignore[attr-defined]
         return dlg
 
-    def view_in_headset(self, job_id: str, scene_id: Any) -> QWidget:
+    def view_in_headset(self, job_id: str, scene_id: Any) -> QWidget | None:
         return self.open_quest(scene_id=scene_id or None, job_id=job_id)
 
     def _open_outputs(self) -> None:
@@ -621,18 +708,29 @@ class MainWindow(QMainWindow):
         e.accept()
 
     def shutdown(self) -> None:
-        """Stop jobs, previews, the viewer server and save state.  Idempotent."""
+        """Stop jobs, previews, the viewer server and save state.  Idempotent.
+
+        The window is hidden first; cancelled jobs then get up to ``JOB_STOP_WAIT_S`` to
+        stop, so they can end their add-on / ffmpeg processes instead of leaving them
+        running (and using the GPU) after the app is gone.
+        """
         if self._shut_down:
             return
         self._shut_down = True
+        if self.instance_guard is not None:  # a new start must not hand over to a closing app
+            try:
+                self.instance_guard.close()
+            except Exception:
+                log.debug("Could not close the single-instance guard", exc_info=True)
         try:
             self.save_state()
         except Exception:
             log.exception("Could not save the window state")
+        self.hide()
         self.preview.shutdown()
         self.inputs.shutdown()
-        self.bridge.shutdown(wait=False)
-        self.server.shutdown()
+        self.server.shutdown()  # free the viewer ports first (in case the app is restarted)
+        self.bridge.shutdown(wait_s=JOB_STOP_WAIT_S)
         self.tasks.shutdown(2000)
         self.log_panel.detach()
         log.info("Main window closed")

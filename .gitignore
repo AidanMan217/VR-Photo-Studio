@@ -18,3 +18,9 @@ packaging/Output/
 *.log
 .DS_Store
 Thumbs.db
+.ci-home/
+.models-cache/
+.venv-build/
+tests/viewer/node_modules/
+tests/viewer/playwright-report/
+tests/viewer/test-results/

@@ -177,6 +177,8 @@ def test_object_sharp_splat(make_job, gradient_photo, fake_manager, check_scene)
     assert sp.name == "photo_sharp.splat"
     sc = read_splats(sp)
     assert 1000 < len(sc) <= 2000
+    # the random cloud is not on the subject's cut-out: the whole reconstruction is kept
+    assert any("whole scene was kept" in w for w in res.warnings)
     m = check_scene(res, "object")
     assert m["object"]["format"] == "splat" and m["object"]["asset"] == "object.splat"
     assert any("non-commercial" in n for n in m["notices"])

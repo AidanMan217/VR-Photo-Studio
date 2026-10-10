@@ -45,20 +45,30 @@ def _ensure_streams() -> None:
         sys.stderr = stream
 
 
+def _windowed() -> bool:
+    """True in the windowed (``console=False``) exe, where CLI output would be invisible."""
+    return sys.stdout is None or sys.stderr is None
+
+
 def _wants_gui(args: Sequence[str]) -> bool:
-    """True for no arguments, or only existing file/folder paths (file association / drag & drop)."""
+    """True for no arguments, or only existing file/folder paths (file association / drag & drop).
+
+    In the windowed exe any arguments that are neither a command nor an option also open the
+    window (e.g. a file association pointing at a file that was moved): running the invisible
+    CLI there would just do nothing from the user's point of view.
+    """
     if not args:
         return True
     if args[0] in _SUBCOMMANDS:
         return False
+    if any(not a or a.startswith("-") for a in args):
+        return False
     for a in args:
-        if not a or a.startswith("-"):
-            return False
         try:
             if not Path(a).exists():
-                return False
+                return _windowed()
         except (OSError, ValueError):
-            return False
+            return _windowed()
     return True
 
 

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from ...core.log import get_logger
 from .. import util
-from ..workers import TaskRunner, Worker
+from ..workers import DIALOG_CLOSE_WAIT_MS, TaskRunner, Worker
 from . import common as dc
 
 log = get_logger(__name__)
@@ -292,5 +292,5 @@ class ModelsDialog(QDialog):
             ):
                 return
             self.cancel_download()
-        self.tasks.shutdown(3000)
+        self.tasks.shutdown(DIALOG_CLOSE_WAIT_MS)
         super().done(result)

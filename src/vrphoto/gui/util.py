@@ -47,20 +47,30 @@ def is_video_path(path: str | Path) -> bool:
     return Path(path).suffix.lower() in media_exts()[1]
 
 
-def collect_media(paths: Iterable[str | Path], *, max_files: int = 5000) -> list[Path]:
-    """Expand files and folders (recursively) into supported media files.
+def collect_media_ex(
+    paths: Iterable[str | Path], *, max_files: int = 5000, time_budget_s: float = 8.0
+) -> tuple[list[Path], bool]:
+    """Like :func:`collect_media`; also returns True if the search stopped early (more
+    than ``max_files`` files, or a huge folder tree took longer than ``time_budget_s``)."""
+    import time
 
-    Order is preserved for explicitly given files; folder contents are sorted by name.
-    Hidden files/folders (starting with ``.``) are skipped.  Duplicates are removed.
-    """
     out: list[Path] = []
     seen: set[str] = set()
+    deadline = time.monotonic() + max(0.1, float(time_budget_s))
+    truncated = False
 
-    def add(p: Path) -> None:
+    def add(p: Path) -> bool:
+        """Add ``p`` (duplicates are ignored); False once the limit is reached."""
+        nonlocal truncated
         key = os.path.normcase(str(p.resolve()))
-        if key not in seen and len(out) < max_files:
-            seen.add(key)
-            out.append(p)
+        if key in seen:
+            return True
+        if len(out) >= max_files:
+            truncated = True
+            return False
+        seen.add(key)
+        out.append(p)
+        return True
 
     for raw in paths:
         p = Path(raw)
@@ -69,13 +79,29 @@ def collect_media(paths: Iterable[str | Path], *, max_files: int = 5000) -> list
                 for dirpath, dirnames, filenames in os.walk(p):
                     dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
                     for name in sorted(filenames, key=str.lower):
-                        if not name.startswith(".") and is_media(name):
-                            add(Path(dirpath) / name)
+                        if not name.startswith(".") and is_media(name) and not add(Path(dirpath) / name):
+                            break
+                    if truncated or time.monotonic() > deadline:
+                        truncated = True
+                        break
             elif p.is_file() and is_media(p):
                 add(p)
         except OSError as e:  # unreadable folder, broken link...
             log.warning("Skipping %s: %s", p, e)
-    return out
+        if truncated:
+            log.warning("Stopped looking for photos after %d files", len(out))
+            break
+    return out, truncated
+
+
+def collect_media(paths: Iterable[str | Path], *, max_files: int = 5000) -> list[Path]:
+    """Expand files and folders (recursively) into supported media files.
+
+    Order is preserved for explicitly given files; folder contents are sorted by name.
+    Hidden files/folders (starting with ``.``) are skipped.  Duplicates are removed.  The
+    search stops after ``max_files`` files (or a few seconds in a gigantic folder tree).
+    """
+    return collect_media_ex(paths, max_files=max_files)[0]
 
 
 def file_dialog_filter() -> str:
@@ -212,7 +238,12 @@ def human_size_mb(mb: float | None) -> str:
 
 
 def human_duration(seconds: float) -> str:
+    """``0.4`` -> ``"0.4 s"``; ``5`` -> ``"5 s"``; ``75`` -> ``"1 min 15 s"``; hours too."""
     seconds = max(0.0, float(seconds))
+    if seconds < 0.05:
+        return "less than 0.1 s"
+    if seconds < 10:
+        return f"{seconds:.1f}".rstrip("0").rstrip(".") + " s"
     if seconds < 60:
         return f"{seconds:.0f} s"
     m, s = divmod(int(round(seconds)), 60)

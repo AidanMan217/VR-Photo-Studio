@@ -34,6 +34,10 @@ log = get_logger(__name__)
 
 _ids = itertools.count(1)
 PROGRESS_INTERVAL_S = 0.04
+#: How long closing a dialog waits for its background tasks.  Tasks still running after
+#: that (e.g. a firewall check or an adb call that cannot be interrupted) are cancelled and
+#: detached (see :meth:`TaskRunner.shutdown`) instead of freezing the window.
+DIALOG_CLOSE_WAIT_MS = 300
 _ORPHAN_POOLS: set[QThreadPool] = set()
 
 

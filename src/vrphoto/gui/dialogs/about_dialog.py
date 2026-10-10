@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from ...core.log import get_logger
 from .. import util
-from ..workers import TaskRunner
+from ..workers import DIALOG_CLOSE_WAIT_MS, TaskRunner
 
 log = get_logger(__name__)
 
@@ -162,5 +162,5 @@ class AboutDialog(QDialog):
         lay.addWidget(box)
 
     def done(self, result: int) -> None:  # noqa: D401 - QDialog API
-        self.tasks.shutdown(3000)
+        self.tasks.shutdown(DIALOG_CLOSE_WAIT_MS)
         super().done(result)

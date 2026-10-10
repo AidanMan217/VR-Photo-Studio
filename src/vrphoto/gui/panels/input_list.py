@@ -21,13 +21,23 @@ from PySide6.QtWidgets import (
 )
 
 from ...core.log import get_logger
-from ..util import collect_media, file_dialog_filter, is_video_path, np_to_pixmap
+from ..util import collect_media_ex, file_dialog_filter, is_video_path, np_to_pixmap
 from ..workers import TaskRunner
 
 log = get_logger(__name__)
 
 THUMB = 72
 PATH_ROLE = Qt.ItemDataRole.UserRole
+KEY_ROLE = Qt.ItemDataRole.UserRole + 1  # normalised path (duplicate detection)
+MAX_FILES = 5000
+
+
+def path_key(p: Path) -> str:
+    """Normalised identity of a file (case-insensitive on Windows, symlinks resolved)."""
+    try:
+        return os.path.normcase(str(p.resolve()))
+    except OSError:
+        return os.path.normcase(str(p.absolute()))
 
 
 def urls_to_paths(mime) -> list[Path]:  # noqa: ANN001 - QMimeData
@@ -107,16 +117,20 @@ class InputListPanel(QWidget):
         currentChanged(object): the current (highlighted) path or None.
         pathsChanged(): items were added or removed.
         selectionChanged(): the selected set changed.
+        notice(str): a message for the status bar (e.g. a folder was too big).
     """
 
     currentChanged = Signal(object)
     pathsChanged = Signal()
     selectionChanged = Signal()
+    notice = Signal(str)
 
     def __init__(self, parent: QWidget | None = None, *, last_dir: str = "") -> None:
         super().__init__(parent)
         self.last_dir = last_dir
         self.tasks = TaskRunner(self, max_threads=2)
+        self._items: dict[str, QListWidgetItem] = {}  # path_key -> item
+        self.last_truncated = False  # the last add_paths() stopped early (see ``notice``)
         title = QLabel("Your photos and videos")
         title.setObjectName("SectionTitle")
         self.count_label = QLabel("")
@@ -186,23 +200,35 @@ class InputListPanel(QWidget):
         Unsupported files and duplicates are skipped.  The added items become the selection
         (what "Create" works on) and the first of them is shown in the preview.
         """
-        existing = {os.path.normcase(str(p.resolve())) for p in self.paths()}
+        room = MAX_FILES - self.list.count()
+        self.last_truncated = room <= 0
+        if room <= 0:
+            self.notice.emit(f"The list is full ({MAX_FILES} files). Remove some files first.")
+            return 0
+        found, truncated = collect_media_ex(paths, max_files=room)
+        self.last_truncated = truncated
         added = 0
         first: QListWidgetItem | None = None
         new_items: list[QListWidgetItem] = []
-        for p in collect_media(paths):
-            key = os.path.normcase(str(p.resolve()))
-            if key in existing:
+        for p in found:
+            key = path_key(p)
+            if key in self._items:
                 continue
-            existing.add(key)
             item = QListWidgetItem(_placeholder_icon(is_video_path(p)), self._label(p))
             item.setData(PATH_ROLE, str(p))
+            item.setData(KEY_ROLE, key)
             item.setToolTip(str(p))
             self.list.addItem(item)
-            self._load_thumb(item, p)
+            self._items[key] = item
+            self._load_thumb(key, p)
             first = first or item
             new_items.append(item)
             added += 1
+        if truncated:
+            self.notice.emit(
+                f"Stopped after {len(found)} files: the list holds at most {MAX_FILES} photos/videos and "
+                "very large folders are only partly searched. Add smaller folders instead."
+            )
         if added and first is not None:
             # select what was just added, so "Create" processes it; preview the first one
             self.list.blockSignals(True)
@@ -221,7 +247,9 @@ class InputListPanel(QWidget):
         if not rows and self.list.currentItem() is not None:
             rows = [self.list.currentRow()]
         for r in rows:
-            self.list.takeItem(r)
+            item = self.list.takeItem(r)
+            if item is not None:
+                self._items.pop(str(item.data(KEY_ROLE)), None)
         if rows:
             self.pathsChanged.emit()
             if self.list.count() == 0:
@@ -230,6 +258,7 @@ class InputListPanel(QWidget):
 
     def clear(self) -> None:
         if self.list.count():
+            self._items.clear()
             self.list.clear()
             self.pathsChanged.emit()
             self.currentChanged.emit(None)
@@ -266,17 +295,13 @@ class InputListPanel(QWidget):
         kind = "Video" if is_video_path(p) else "Photo"
         return f"{p.name}\n{kind} · {size}"
 
-    def _load_thumb(self, item: QListWidgetItem, p: Path) -> None:
+    def _load_thumb(self, key: str, p: Path) -> None:
         from ..util import load_thumbnail
 
-        key = str(p)
-
         def done(img) -> None:  # noqa: ANN001
-            for i in range(self.list.count()):
-                it = self.list.item(i)
-                if it.data(PATH_ROLE) == key:
-                    it.setIcon(QIcon(np_to_pixmap(img)))
-                    break
+            it = self._items.get(key)  # None if the item was removed meanwhile
+            if it is not None:
+                it.setIcon(QIcon(np_to_pixmap(img)))
 
         def failed(exc: BaseException) -> None:
             log.debug("No thumbnail for %s: %s", p, exc)

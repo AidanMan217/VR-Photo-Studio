@@ -11,7 +11,7 @@ Per job the event order is always ``queued`` -> (``started`` -> ``progress``* ->
 ``finished`` | ``failed`` | ``cancelled``) or ``queued`` -> ``cancelled``.  A runner
 exception becomes a ``failed`` event whose ``error`` is the friendly message (a
 :class:`~vrphoto.core.errors.VRPhotoError`'s text plus its hint); the traceback goes to
-the log.
+the log.  Any exception raised after the job was asked to cancel counts as ``cancelled``.
 """
 
 from __future__ import annotations
@@ -315,6 +315,8 @@ class JobQueue:
 
         def on_progress(frac: float, msg: str = "") -> None:
             f = min(1.0, max(0.0, float(frac)))
+            if tok.cancelled:
+                msg = "Cancelling..."  # keep showing that the job is stopping
             with self._lock:
                 rec.frac = f
                 if msg:
@@ -329,10 +331,15 @@ class JobQueue:
         try:
             result = self._runner(rec.spec, self.ctx, progress=ProgressReporter(on_progress), cancel=tok)
         except BaseException as e:  # noqa: BLE001 - every failure becomes an event; workers never die
-            if isinstance(e, Cancelled) or (tok.cancelled and not isinstance(e, VRPhotoError | MemoryError)):
+            if isinstance(e, Cancelled) or tok.cancelled:
+                # after the user pressed Cancel, whatever error the interrupted work raises
+                # (a killed add-on worker, a broken ffmpeg pipe...) just means "stopped"
                 with self._lock:
                     rec.status, rec.msg, rec.finished = "cancelled", "Cancelled", time.time()
-                log.info("Job %s cancelled", job_id)
+                if isinstance(e, Cancelled):
+                    log.info("Job %s cancelled", job_id)
+                else:
+                    log.info("Job %s cancelled (it stopped with: %s)", job_id, error_message(e), exc_info=e)
                 ev = JobEvent(job_id, "cancelled", frac=rec.frac, msg="Cancelled")
             else:
                 msg = error_message(e)

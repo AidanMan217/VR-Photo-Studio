@@ -276,11 +276,12 @@ def test_addons_dialog_install_and_uninstall(qtbot, settings, fake_manager, prom
     qtbot.addWidget(dlg)
     dlg.show()
     card = dlg.cards["capture"]
+    qtbot.waitUntil(lambda: not dlg.status_pending, timeout=5000)
     assert card.install_button.isVisible() and not card.uninstall_button.isVisible()
     card.install_button.click()
     qtbot.waitUntil(lambda: dlg.active_id is None, timeout=5000)
     assert fake_manager.calls[0] == ("install", "capture", "hf_secret")
-    assert "Installed" in card.state_label.text()
+    qtbot.waitUntil(lambda: "Installed" in card.state_label.text(), timeout=5000)
     assert card.uninstall_button.isVisible()
     assert "step 2" in card.log_view.toPlainText()
     card.uninstall_button.click()
@@ -392,7 +393,8 @@ def test_addons_dialog_with_real_manifests(qtbot, settings, monkeypatch):
     qtbot.addWidget(dlg)
     dlg.show()
     assert "capture" in dlg.cards
-    assert all(not c.status.get("installed") for c in dlg.cards.values())
+    qtbot.waitUntil(lambda: not dlg.status_pending, timeout=10000)
+    assert all(c.status and not c.status.get("installed") for c in dlg.cards.values())
     dlg.close()
 
 
@@ -522,6 +524,7 @@ def test_quest_dialog_usb(qtbot, settings, controller, fake_quest, tmp_path, mon
     dlg = quest_dialog.QuestDialog(controller=controller, settings=settings, files=[out], focus_scene="beach")
     qtbot.addWidget(dlg)
     dlg.show()
+    dlg.tabs.setCurrentIndex(dlg.usb_tab_index)  # adb is only looked for on the USB tab
     qtbot.waitUntil(lambda: "2G0YC1ZF8B07WD" in dlg.adb_label.text(), timeout=5000)
     assert dlg.usb_setup_button.isEnabled()
     qtbot.waitUntil(lambda: controller.running and not controller.busy, timeout=5000)
@@ -549,6 +552,7 @@ def test_quest_dialog_install_usb_tools(qtbot, settings, controller, fake_quest,
     dlg = QuestDialog(controller=controller, settings=settings, autostart=False)
     qtbot.addWidget(dlg)
     dlg.show()
+    dlg.tabs.setCurrentIndex(dlg.usb_tab_index)
     qtbot.waitUntil(lambda: "not installed" in dlg.adb_label.text(), timeout=5000)
     assert not dlg.install_tools_button.isHidden()  # (on a background tab)
     assert not dlg.usb_setup_button.isEnabled()
@@ -597,6 +601,7 @@ def test_quest_dialog_backends_unavailable(qtbot, settings, controller, monkeypa
     qtbot.addWidget(dlg)
     dlg.show()
     assert dlg.quest is None and dlg.net is None and dlg.scene_mod is None
+    dlg.tabs.setCurrentIndex(dlg.usb_tab_index)
     assert "not available" in dlg.adb_label.text()
     dlg.close()
 
@@ -789,3 +794,163 @@ def test_tail_text(tmp_path):
     assert tail_text(p) == "a\nb\nc"
     assert tail_text(p, max_lines=2) == "b\nc"
     assert tail_text(tmp_path / "missing") == ""
+
+
+# =========================================================================== review fixes
+def test_closing_a_dialog_never_waits_long_for_a_stuck_task(qtbot, settings, controller, monkeypatch):
+    """E.g. the Windows firewall check (PowerShell) cannot be interrupted: closing must not freeze."""
+    import time
+
+    from vrphoto.gui.dialogs.quest_dialog import QuestDialog
+    from vrphoto.webxr import net
+
+    release = threading.Event()
+    monkeypatch.setattr(
+        net, "firewall_report", lambda port: release.wait(10) and {"status": "ok", "reason": ""}
+    )
+    dlg = QuestDialog(controller=controller, settings=settings)
+    qtbot.addWidget(dlg)
+    dlg.show()
+    qtbot.waitUntil(lambda: "checking" in dlg.fw_label.text(), timeout=5000)
+    t0 = time.monotonic()
+    dlg.close()
+    assert time.monotonic() - t0 < 1.5
+    release.set()
+
+
+def test_quest_dialog_does_not_start_adb_until_usb_tab(qtbot, settings, controller, monkeypatch):
+    from vrphoto.gui.dialogs.quest_dialog import QuestDialog
+    from vrphoto.webxr import quest
+
+    calls: list[str] = []
+    monkeypatch.setattr(quest, "find_adb", lambda: calls.append("find") or "/tools/adb")
+    monkeypatch.setattr(quest, "adb_devices", lambda: calls.append("devices") or [])
+    dlg = QuestDialog(controller=controller, settings=settings, autostart=False)
+    qtbot.addWidget(dlg)
+    dlg.show()
+    qtbot.wait(100)
+    assert calls == []
+    dlg.tabs.setCurrentIndex(dlg.usb_tab_index)
+    qtbot.waitUntil(lambda: "No headset connected" in dlg.adb_label.text(), timeout=5000)
+    assert calls == ["find", "devices"]
+    dlg.tabs.setCurrentIndex(0)
+    dlg.tabs.setCurrentIndex(dlg.usb_tab_index)  # checked once; "Check again" re-checks
+    qtbot.wait(50)
+    assert calls == ["find", "devices"]
+    dlg.close()
+
+
+def test_quest_dialog_asks_before_stopping_a_copy(
+    qtbot, settings, controller, fake_quest, tmp_path, monkeypatch, prompts
+):
+    from vrphoto.gui.dialogs import quest_dialog
+    from vrphoto.webxr import quest
+
+    release = threading.Event()
+
+    def slow_push(f, d="/sdcard/Movies", serial=None, *, progress=None, cancel=None):
+        while not release.wait(0.01):
+            cancel.check()
+        return True
+
+    monkeypatch.setattr(quest, "adb_push", slow_push)
+    monkeypatch.setattr(quest_dialog.sys, "platform", "linux")
+    out = tmp_path / "x_LR.jpg"
+    out.write_bytes(b"jpg")
+    dlg = quest_dialog.QuestDialog(controller=controller, settings=settings, files=[out], autostart=False)
+    qtbot.addWidget(dlg)
+    dlg.show()
+    dlg.copy_files()
+    assert dlg.busy()
+    prompts.answer = False
+    dlg.close()
+    assert dlg.isVisible() and any("not finished" in q for q in prompts.questions)
+    prompts.answer = True
+    dlg.close()
+    assert not dlg.isVisible() and not dlg.busy()
+    release.set()
+
+
+def test_quest_copy_failure_explains_why(qtbot, settings, controller, fake_quest, tmp_path, monkeypatch):
+    from vrphoto.gui.dialogs import quest_dialog
+    from vrphoto.webxr import quest
+
+    def failing_push(f, d="/sdcard/Movies", serial=None, **kw):
+        return quest._set_error("The headset is not authorized.", "Put on the headset and choose 'Allow'.")
+
+    monkeypatch.setattr(quest, "adb_push", failing_push)
+    monkeypatch.setattr(quest_dialog.sys, "platform", "linux")
+    out = tmp_path / "x_LR.jpg"
+    out.write_bytes(b"jpg")
+    dlg = quest_dialog.QuestDialog(controller=controller, settings=settings, files=[out], autostart=False)
+    qtbot.addWidget(dlg)
+    dlg.show()
+    dlg.copy_files()
+    qtbot.waitUntil(lambda: "Could not copy" in dlg.usb_result.text(), timeout=5000)
+    assert "not authorized" in dlg.usb_result.text() and "File Explorer" in dlg.usb_result.text()
+    dlg.close()
+
+
+def test_addons_status_is_read_off_the_ui_thread(qtbot, settings, fake_manager):
+    from vrphoto.gui.dialogs.addons_dialog import AddonsDialog
+
+    main = threading.get_ident()
+    threads: list[int] = []
+    inner = fake_manager.status
+
+    def spy(aid):
+        threads.append(threading.get_ident())
+        return inner(aid)
+
+    fake_manager.status = spy
+    dlg = AddonsDialog(settings=settings)
+    qtbot.addWidget(dlg)
+    dlg.show()
+    assert "Checking" in dlg.cards["capture"].state_label.text()
+    assert not dlg.cards["capture"].install_button.isEnabled()  # until the state is known
+    with qtbot.waitSignal(dlg.statusRefreshed, timeout=5000, raising=False):
+        pass
+    qtbot.waitUntil(lambda: not dlg.status_pending, timeout=5000)
+    assert threads and main not in threads
+    assert dlg.cards["capture"].install_button.isEnabled()
+    dlg.close()
+
+
+def test_server_restart_does_not_stop_on_the_ui_thread(qtbot, settings, fake_server_factory):
+    from vrphoto.gui.server_ctl import ServerController
+
+    main = threading.get_ident()
+    stop_threads: list[int] = []
+    orig_stop = fake_server_factory.stop
+
+    def stop(self):
+        stop_threads.append(threading.get_ident())
+        orig_stop(self)
+
+    fake_server_factory.stop = stop  # type: ignore[method-assign]
+    try:
+        ctl = ServerController(settings, server_factory=fake_server_factory)
+        with qtbot.waitSignal(ctl.started, timeout=5000):
+            ctl.start()
+        ctl.restart()
+        qtbot.waitUntil(lambda: ctl.running and not ctl.busy and len(fake_server_factory.instances) == 2)
+        assert stop_threads and main not in stop_threads
+        ctl.shutdown()
+    finally:
+        fake_server_factory.stop = orig_stop  # type: ignore[method-assign]
+
+
+def test_settings_dialog_rejects_unusable_output_folder(qtbot, settings, tmp_path):
+    from vrphoto.gui.dialogs.settings_dialog import SettingsDialog
+
+    dlg = SettingsDialog(settings=settings)
+    qtbot.addWidget(dlg)
+    v = dlg.values()
+    blocker = tmp_path / "a_file"
+    blocker.write_text("x")
+    assert "is a file" in dlg.validate({**v, "output_dir": str(blocker)})
+    assert "cannot be created" in dlg.validate({**v, "output_dir": str(blocker / "sub")})
+    assert "Browse" in dlg.validate({**v, "output_dir": "relative/folder"})
+    new_dir = tmp_path / "new" / "outputs"
+    assert dlg.validate({**v, "output_dir": str(new_dir)}) is None and new_dir.is_dir()
+    dlg.close()

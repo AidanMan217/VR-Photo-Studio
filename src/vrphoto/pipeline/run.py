@@ -88,6 +88,10 @@ STILL_VIDEO_FPS = 10.0
 EYE_HEIGHT_M = 1.5
 #: Viewer sphere radius for VR180 / 360 scenes.
 SPHERE_RADIUS_M = 20.0
+#: Highest frame rate of converted videos (faster clips are converted at this rate).
+MAX_VIDEO_FPS = 60.0
+#: Most Gaussians in an object / add-on splat (what a Quest 3 browser shows smoothly).
+MAX_OBJECT_SPLATS = 750_000
 WIGGLE_FRAMES = 12
 WIGGLE_MAX_PX = 640
 DEPTH_SCENE_PX = 1024
@@ -109,6 +113,7 @@ PARALLAX_OUTPUTS = ("flat", "sbs", "vr180")
 VIDEO_OUTPUTS = ("sbs", "half_sbs", "tb", "half_tb", "vr180")
 OBJECT_METHODS = ("billboard", *ADDON_METHODS)
 PLACEMENTS = ("hit-test", "front-floor")
+BACKS = ("diffuse", "mirror")
 QUEST_MODELS = ("quest3", "quest2", "pcvr")
 
 _MODEL_ALIASES = {
@@ -344,6 +349,40 @@ def fit_glb_height(src: Path, dst: Path, height_m: float) -> bool:
         return False
 
 
+# --------------------------------------------------------------------------- work folders
+#: Work folders older than this are left over from a crashed / killed app and are deleted.
+STALE_WORK_S = 2 * 24 * 3600.0
+_swept: set[str] = set()
+
+
+def _sweep_stale_work(root: Path, max_age_s: float = STALE_WORK_S) -> int:
+    """Delete ``job-*`` work folders older than ``max_age_s`` (once per folder and process).
+
+    Work folders are removed when a job ends, but a crash or a killed process leaves them
+    behind (a capture can leave gigabytes).  Returns the number of folders removed.
+    """
+    key = os.path.normcase(str(root))
+    if key in _swept:
+        return 0
+    _swept.add(key)
+    now = time.time()
+    removed = 0
+    try:
+        entries = list(root.glob("job-*"))
+    except OSError:
+        return 0
+    for d in entries:
+        try:
+            if d.is_dir() and now - d.stat().st_mtime > max_age_s:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        log.info("Removed %d stale work folder(s) from %s", removed, root)
+    return removed
+
+
 # --------------------------------------------------------------------------- run state
 @dataclass
 class _Item:
@@ -371,6 +410,7 @@ class _Photo:
     rgb: RGB
     scale: float
     exif_hfov: float | None
+    alpha: FloatMap | None = None  # the file's own transparency (only when asked for and present)
 
 
 @dataclass
@@ -433,6 +473,7 @@ class _Run:
         if item.work is None:
             root = Path(self.settings.cache_dir) / "work"
             root.mkdir(parents=True, exist_ok=True)
+            _sweep_stale_work(root)
             item.work = Path(tempfile.mkdtemp(prefix="job-", dir=root))
         return item.work
 
@@ -464,7 +505,9 @@ class _Run:
 
 
 # --------------------------------------------------------------------------- shared steps
-def _load_photo(run: _Run, item: _Item, rep: ProgressReporter) -> _Photo:
+def _load_photo(run: _Run, item: _Item, rep: ProgressReporter, *, with_alpha: bool = False) -> _Photo:
+    """Load + downscale (``max_process_px``) a photo.  ``with_alpha`` also returns the file's
+    transparency as ``_Photo.alpha`` when it has a real one (e.g. an iPhone "lift subject" PNG)."""
     from ..core.imaging import exif_hfov
 
     rep(0.0, f"Loading {item.path.name}")
@@ -473,11 +516,19 @@ def _load_photo(run: _Run, item: _Item, rep: ProgressReporter) -> _Photo:
             f"{item.path.name} is a video; this mode needs photos.",
             hint="Use 'Video to 3D' for videos.",
         )
-    rgb = load_image(item.path)
+    img = load_image(item.path, with_alpha=with_alpha)
     max_px = int(run.common.max_process_px or 0) or int(run.settings.max_process_px)
     if max_px < 256:
         raise InputError(f"Max processing size must be at least 256 px (got {max_px}).")
-    rgb, s = limit_long(rgb, max_px)
+    img, s = limit_long(img, max_px)
+    alpha: FloatMap | None = None
+    if img.ndim == 3 and img.shape[2] == 4:
+        a = img[..., 3].astype(np.float32) / 255.0
+        img = img[..., :3]
+        # only a real cut-out counts: some transparent AND some opaque pixels
+        if float((a < 0.5).mean()) > 0.01 and float((a >= 0.5).mean()) > 0.002:
+            alpha = a
+    rgb = img
     if s < 1.0:
         log.info(
             "%s downscaled by %.3f to %dx%d for processing", item.path.name, s, rgb.shape[1], rgb.shape[0]
@@ -488,7 +539,7 @@ def _load_photo(run: _Run, item: _Item, rep: ProgressReporter) -> _Photo:
         hf = None
     run.check()
     rep(1.0, "Photo loaded")
-    return _Photo(np.ascontiguousarray(rgb), s, hf)
+    return _Photo(np.ascontiguousarray(rgb), s, hf, alpha)
 
 
 def _depth_scale(run: _Run) -> DepthScale:
@@ -698,6 +749,14 @@ def _video_writer(run: _Run, path: Path, w: int, h: int, fps: float, preset: str
     return _call_opt(VideoWriter, path, w, h, fps, preset, encoder=encoder, **kw)
 
 
+def _close_video(run: _Run, vw: Any) -> Path:
+    """Finish a VideoWriter and pass its non-fatal problems (e.g. sound dropped) to the result."""
+    path = Path(vw.close())
+    for w in getattr(vw, "warnings", None) or []:
+        run.warn(str(w))
+    return path
+
+
 def _write_still_video(
     run: _Run,
     frame: RGB,
@@ -719,7 +778,7 @@ def _write_still_video(
             vw.write(frame)
             if i % 5 == 0:
                 rep(i / n, "Writing video")
-        out = Path(vw.close())
+        out = _close_video(run, vw)
     except BaseException:
         vw.abort()
         raise
@@ -813,7 +872,18 @@ def _outpaint(
     if not out or not Path(out).is_file():
         run.warn("AI outpainting returned no image; a soft blur was used instead.")
         return None
-    res = load_image(out)
+    try:
+        res = load_image(out)
+    except InputError as e:
+        run.warn(f"AI outpainting returned an unreadable image ({e}); a soft blur was used instead.")
+        return None
+    try:
+        manifest = _addon_manifest("sdxl360")
+    except AddonError:
+        manifest = None
+    if manifest is not None:
+        run.addon_notice(item, manifest)
+        _addon_warnings(run, manifest.title, outs)
     return _resize(res, img.shape[1], img.shape[0])
 
 
@@ -948,22 +1018,21 @@ def _mode_parallax(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     ipd = _positive(spec.ipd_m, "Eye distance (IPD)")
     preset = _video_preset(run, spec.encoder_preset)
     n_frames = max(1, int(round(duration * fps)))
+    path_args: dict[str, Any] = {
+        "n_frames": n_frames,
+        "amplitude_m": amp,
+        "fps": fps,
+        "loop": bool(spec.loop),
+        "keyframes": spec.keyframes,
+    }
+    _call_opt(make_path, spec.path, **path_args)  # bad path / keyframes fail before the slow steps
 
     photo = _load_photo(run, item, rep.sub(0.0, 0.03))
     d = _estimate_depth(run, item, photo, rep.sub(0.03, 0.2))
     max_b = 2.0 * amp + (ipd if output != "flat" else 0.0)
     li = _build_layers(run, item, photo, d, rep.sub(0.2, 0.3), max_baseline=max_b, look_behind=look)
     focus = _auto_focus(li)
-    path = _call_opt(
-        make_path,
-        spec.path,
-        n_frames=n_frames,
-        amplitude_m=amp,
-        fps=fps,
-        loop=bool(spec.loop),
-        keyframes=spec.keyframes,
-        focus_m=focus,
-    )
+    path = _call_opt(make_path, spec.path, **path_args, focus_m=focus)
     K = li.K
     if spec.width:
         w = int(spec.width)
@@ -1018,7 +1087,7 @@ def _mode_parallax(run: _Run, item: _Item, rep: ProgressReporter) -> None:
         if vw is None:
             raise InputError("The camera path produced no frames.")
         rep(0.97, "Finishing the video")
-        out = Path(vw.close())
+        out = _close_video(run, vw)
     except BaseException:
         if vw is not None:
             vw.abort()
@@ -1226,6 +1295,7 @@ def _mode_pano(run: _Run, item: _Item, rep: ProgressReporter) -> None:
                 ods_pair, eq, dist, ipd, inpainter=inp, progress=rep.sub(0.45, 0.88), cancel=run.cancel
             )
             run.check()
+            _note_inpainter(run, item, inp)
             frame = compose(left, right, "tb")
             kind, label, layout, stereo_meta = "360_tb", "360 stereo photo (top-bottom)", "tb", "tb"
             thumb = left
@@ -1238,7 +1308,7 @@ def _mode_pano(run: _Run, item: _Item, rep: ProgressReporter) -> None:
             depth_block = {
                 "depth": "depth.png",
                 "depth_near_m": scale.near_m,
-                "depth_far_m": min(scale.far_m, SPHERE_RADIUS_M),
+                "depth_far_m": scale.far_m,  # the viewer clamps to the sphere radius
             }
         eq_w, eq_h = eq.shape[1], eq.shape[0]
     else:
@@ -1384,17 +1454,34 @@ def _cutout_rgba(rgb: RGB, alpha: FloatMap, margin: float = 0.08) -> np.ndarray:
 
 
 def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
+    """Walk-around person / object.
+
+    The subject comes from the photo's own transparency when it has one (an already cut-out
+    PNG / HEIC), else from the segmenter.  ``billboard`` inflates it locally (GLB + optional
+    splat); the add-on methods get the RGBA cut-out (SHARP: the whole photo, its Gaussians are
+    then reduced to the subject) and their GLB is rescaled to ``height_m`` losslessly.
+    """
     from ..core.imaging import save_image
 
     spec: ObjectJob = run.spec  # type: ignore[assignment]
     method = _choice(spec.method, OBJECT_METHODS, "3D method")
     placement = _choice(spec.placement, PLACEMENTS, "placement")
     height = _positive(spec.height_m, "Height")
+    back = _choice(spec.back, BACKS, "back texture")
+    thickness = _positive(spec.thickness, "Thickness", allow_zero=True)
     manifest = None
     if method in ADDON_METHODS:
         manifest = _require_addon(ADDON_METHODS[method][0])  # fail fast, before any work
-    photo = _load_photo(run, item, rep.sub(0.0, 0.04))
-    alpha = _segment(run, item, photo.rgb, rep.sub(0.04, 0.25))
+    photo = _load_photo(run, item, rep.sub(0.0, 0.04), with_alpha=True)
+    if photo.alpha is not None:
+        from ..segment.matte import clean_matte
+
+        # an already cut-out photo (PNG/HEIC with transparency): use its own outline
+        log.info("%s has transparency; using it as the cut-out", item.path.name)
+        alpha = clean_matte(photo.alpha)
+        rep(0.25, "Using the photo's transparent background as the cut-out")
+    else:
+        alpha = _segment(run, item, photo.rgb, rep.sub(0.04, 0.25))
     if float((alpha > 0.5).mean()) < 0.002:
         raise InputError(
             f"No person or object could be found in {item.path.name}.",
@@ -1415,8 +1502,8 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
             d.result(),
             d.K,
             height_m=height,
-            thickness=float(spec.thickness),
-            back=str(spec.back),
+            thickness=thickness,
+            back=back,
             progress=rep.sub(0.55, 0.8),
             cancel=run.cancel,
         )
@@ -1437,6 +1524,10 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
 
             rep(0.85, "Making the splat version")
             sc = _concat_splats([splats_from_mesh(m) for m in meshes])
+            if len(sc) > MAX_OBJECT_SPLATS:
+                from ..geometry.splat import decimate_splats
+
+                sc = decimate_splats(sc, max_n=MAX_OBJECT_SPLATS)
             sp = run.out_path(item, "object", "splat")
             write_splats(sc, sp)
             run.add_output(item, "3D object (Gaussian splat)", sp)
@@ -1472,6 +1563,7 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     rep(0.3, f"Running {manifest.title}")
     outs = _run_addon(run, item, addon_id, task, {"image": str(image_in)}, params, rep.sub(0.3, 0.9))
     title = manifest.title
+    _addon_warnings(run, title, outs)
     glb_src = outs.get("glb")
     ply_src = outs.get("ply") or outs.get("splat")
     if glb_src and Path(glb_src).is_file():
@@ -1503,10 +1595,12 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
         rep(0.9, "Converting the splat")
         sc = read_splats(ply_src)
         if str(outs.get("frame", "")).lower() == "opencv":
+            if method == "sharp":  # SHARP models the whole photo: keep only the subject
+                sc = _subject_splats(run, sc, alpha, outs, params)
             sc = _splats_cv_to_gltf(sc)
         sc = crop_splats(sc, radius_pct=98.0)
         sc = normalize_orientation(sc)
-        sc = decimate_splats(sc, max_n=750_000)
+        sc = decimate_splats(sc, max_n=MAX_OBJECT_SPLATS)
         dst = run.out_path(item, f"_{method}", "splat")
         write_splats(sc, dst)
         run.add_output(item, f"3D object (Gaussian splat, {title})", dst)
@@ -1536,6 +1630,81 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     rep(1.0, "Done")
 
 
+def _addon_warnings(run: _Run, title: str, outs: dict[str, Any]) -> None:
+    """Pass an add-on worker's ``warning`` / ``warnings`` outputs on to the job result."""
+    msgs: list[Any] = []
+    for key in ("warning", "warnings"):
+        v = outs.get(key)
+        if isinstance(v, str):
+            msgs.append(v)
+        elif isinstance(v, list | tuple):
+            msgs.extend(v)
+    for m in msgs:
+        text = str(m).strip()
+        if text:
+            run.warn(f"{title}: {text}")
+
+
+def _subject_splats(run: _Run, sc: Any, alpha: FloatMap, outs: dict[str, Any], params: dict[str, Any]) -> Any:
+    """Keep the Gaussians of a whole-photo reconstruction (OpenCV camera frame) whose centres
+    project onto the subject's cut-out (slightly dilated) and are not far behind the subject,
+    i.e. drop the background.
+
+    Falls back to the full reconstruction (with a warning) when hardly anything is left,
+    e.g. if the add-on used another camera model than expected.
+    """
+    import cv2
+
+    h, w = alpha.shape
+    try:
+        out_w = float(outs.get("width") or w)
+        out_h = float(outs.get("height") or h)
+        f = float(outs.get("f_px") or 0.0)
+    except (TypeError, ValueError):
+        out_w, out_h, f = float(w), float(h), 0.0
+    if not (f > 0 and math.isfinite(f)):
+        hf = float(params.get("hfov_deg") or 65.0)
+        f = (out_w / 2.0) / math.tan(math.radians(hf) / 2.0)
+    P = np.asarray(sc.means, dtype=np.float64)
+    z = P[:, 2]
+    front = np.isfinite(P).all(axis=1) & (z > 1e-3)
+    zs = np.where(front, z, 1.0)
+    # pixel coordinates in the add-on's image, then in the matte's resolution
+    u = (f * P[:, 0] / zs + out_w / 2.0) * (w / out_w)
+    v = (f * P[:, 1] / zs + out_h / 2.0) * (h / out_h)
+    ui = np.clip(np.round(u - 0.5), 0, w - 1).astype(np.int64)  # SHARP's centre is at W/2
+    vi = np.clip(np.round(v - 0.5), 0, h - 1).astype(np.int64)
+    inside = front & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    r = max(2, int(round(0.01 * max(h, w))))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    matte = cv2.dilate((alpha > 0.5).astype(np.uint8), k) > 0
+    keep = inside & matte[vi, ui]
+    if int(keep.sum()) >= 50:
+        # drop what lies far behind the subject inside its outline (hidden background the
+        # add-on reconstructed): the visible front of the subject dominates the near depths,
+        # and a person / object is rarely deeper than half its distance from the camera
+        p5, p25 = (float(v) for v in np.percentile(z[keep], [5.0, 25.0]))
+        keep &= z <= 1.5 * p25 + 2.0 * (p25 - p5)
+    n_keep = int(keep.sum())
+    if n_keep < max(500, int(0.01 * len(P))):
+        run.warn(
+            "The subject could not be separated from the background in the add-on's 3D result, so the "
+            "whole scene was kept."
+        )
+        return sc
+    log.info("Kept %d of %d Gaussians on the subject", n_keep, len(P))
+    from ..core.types import SplatCloud
+
+    return SplatCloud(
+        means=np.asarray(sc.means)[keep],
+        scales=np.asarray(sc.scales)[keep],
+        quats=np.asarray(sc.quats)[keep],
+        colors=np.asarray(sc.colors)[keep],
+        opacity=np.asarray(sc.opacity)[keep],
+        sh_rest=None if getattr(sc, "sh_rest", None) is None else np.asarray(sc.sh_rest)[keep],
+    )
+
+
 def _first_frame(path: Path) -> RGB | None:
     try:
         if is_image(path):
@@ -1557,6 +1726,23 @@ def _first_frame(path: Path) -> RGB | None:
     except (VRPhotoError, OSError, StopIteration) as e:
         log.debug("No thumbnail from %s: %s", path, e)
     return None
+
+
+def _keep_capture_log(run: _Run, item: _Item, work: Path) -> Path | None:
+    """Copy a failed capture's log from the work folder to the output folder."""
+    try:
+        logs = sorted(work.glob("*capture.log"), key=lambda q: q.stat().st_mtime)
+    except OSError:
+        return None
+    if not logs:
+        return None
+    dst = run.out_path(item, "_capture_log", "txt")
+    try:
+        shutil.copyfile(logs[-1], dst)
+    except OSError as e:
+        log.info("Could not keep the capture log %s: %s", logs[-1], e)
+        return None
+    return dst
 
 
 def _mode_capture(run: _Run, items: list[_Item], rep: ProgressReporter) -> None:
@@ -1584,6 +1770,20 @@ def _mode_capture(run: _Run, items: list[_Item], rep: ProgressReporter) -> None:
         )  # fmt: skip
     except AddonNotInstalled as e:
         raise AddonNotInstalled(str(e), hint=e.hint or "Install it in Add-ons (Settings > Add-ons).") from e
+    except Cancelled:
+        raise
+    except VRPhotoError as e:
+        # the reconstruction log is written into the job's work folder, which is deleted
+        # at the end of the job: keep it next to the outputs so the user can look at it
+        kept = _keep_capture_log(run, item, work)
+        if kept is None:
+            raise
+        hint = f"{e.hint + ' ' if e.hint else ''}The reconstruction log was saved as {kept}."
+        try:
+            err: VRPhotoError = type(e)(str(e), hint=hint)
+        except TypeError:
+            err = VRPhotoError(str(e), hint=hint)
+        raise err from e
     run.check()
     splat = Path(splat)
     dst = run.out_path(item, "capture", "splat")
@@ -1617,6 +1817,12 @@ def _mode_capture(run: _Run, items: list[_Item], rep: ProgressReporter) -> None:
 
 
 def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
+    """Normal video -> 3D (flat stereo layouts) or VR180 video, frame by frame.
+
+    Frames are decoded at a constant rate (at most :data:`MAX_VIDEO_FPS`) so the copied sound
+    stays in sync; depth is smoothed over time (``temporal_smooth``) and so is the flat-mode
+    screen distance, so the 3D effect does not "breathe".
+    """
     from ..depth.post import temporal_align
     from ..geometry.camera import estimate_intrinsics
     from ..geometry.layers import build_layers
@@ -1647,9 +1853,22 @@ def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
             hint="Choose a start time within the video.",
         )
     span = (min(end, info.duration) if end else info.duration) - start if info.duration > 0 else 0.0
-    n_est = max(1, int(round(span * info.fps))) if span > 0 else max(1, info.n_frames)
+    # Decode at a constant frame rate: phone videos often have a variable one, and the output
+    # is written at a fixed rate, so passing frames through would drift from the sound.
+    # High-speed clips (120/240 fps) are converted at MAX_VIDEO_FPS: 3D needs a depth map per
+    # frame, and headsets cannot play 4K stereo at those rates anyway.
+    src_fps = float(info.fps or 0.0)
+    out_fps = min(src_fps, MAX_VIDEO_FPS) if src_fps > 0 and math.isfinite(src_fps) else 30.0
+    if src_fps > MAX_VIDEO_FPS:
+        log.info("%s has %.0f fps; converting at %.0f fps", item.path.name, src_fps, out_fps)
+    cfr = out_fps
+    n_est = (
+        max(1, int(round(span * out_fps)))
+        if span > 0
+        else max(1, int(round(info.n_frames * out_fps / max(src_fps, out_fps))))
+    )
     frames = _call_opt(
-        iter_frames, item.path, max_long=int(spec.max_long), start=start, end=end, cancel=run.cancel
+        iter_frames, item.path, max_long=int(spec.max_long), start=start, end=end, fps=cfr, cancel=run.cancel
     )
     est = run.ctx.estimator(run.common.depth_model, run.common.device)
     keep_audio = bool(spec.keep_audio) and info.has_audio
@@ -1711,7 +1930,7 @@ def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
                     out,
                     out_frame.shape[1],
                     out_frame.shape[0],
-                    info.fps,
+                    out_fps,
                     preset,
                     audio_from=item.path if keep_audio else None,
                     audio_start_s=start,
@@ -1721,7 +1940,7 @@ def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
         if vw is None:
             raise InputError(f"No video frames were found in {item.path.name} for the selected time range.")
         rep(0.97, "Finishing the video")
-        out = Path(vw.close())
+        out = _close_video(run, vw)
     except BaseException:
         if vw is not None:
             vw.abort()
@@ -1907,9 +2126,12 @@ def run_job(
             if failures and len(failures) == n:
                 first = failures[0][1]
                 if isinstance(first, VRPhotoError):
-                    raise type(first)(
-                        f"None of the {n} files could be processed. First error: {first}", hint=first.hint
-                    ) from first
+                    text = f"None of the {n} files could be processed. First error: {first}"
+                    try:
+                        err: VRPhotoError = type(first)(text, hint=first.hint)
+                    except TypeError:  # a subclass with another constructor
+                        err = VRPhotoError(text, hint=first.hint)
+                    raise err from first
                 raise first
     finally:
         for item in items:

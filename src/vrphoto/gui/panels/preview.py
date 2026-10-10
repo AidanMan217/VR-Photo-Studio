@@ -136,7 +136,12 @@ def _num(d: dict[str, Any], key: str, default: float | None) -> float | None:
 
 
 class PreviewPanel(QWidget):
-    """The preview tabs.  Feed it a path with :meth:`set_path` and an options provider."""
+    """The preview tabs.  Feed it a path with :meth:`set_path` and an options provider.
+
+    Each stage (depth -> layered image -> anaglyph / wiggle / parallax frame) records the
+    option signature it was computed for; results that no longer match the current input
+    or options are discarded and recomputed, and tasks that became pointless are cancelled.
+    """
 
     statusMessage = Signal(str)
 
@@ -146,10 +151,15 @@ class PreviewPanel(QWidget):
         *,
         engine: PreviewEngine | None = None,
         options_provider: Callable[[], dict[str, Any]] | None = None,
+        license_gate: Callable[[str], bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self.engine = engine or PreviewEngine()
         self.options_provider = options_provider or (lambda: {})
+        #: ``gate(depth_model) -> bool``: False if the model may not be used (e.g. its
+        #: non-commercial license was not accepted) - the preview then shows a message.
+        self.license_gate = license_gate
+        self._gating = False
         self.tasks = TaskRunner(self, max_threads=2)
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
@@ -270,9 +280,10 @@ class PreviewPanel(QWidget):
         if self._path is None:
             return
         depth_sig, layer_sig, stereo_sig, _ = self._sigs()
-        if self._depth is not None and depth_sig != self._depth_sig:
+        # ``_depth_sig`` / ``_layer_sig`` describe what is shown OR being computed
+        if self._depth_sig is not None and depth_sig != self._depth_sig:
             self._invalidate_depth()
-        elif self._li is not None and layer_sig != self._layer_sig:
+        elif self._layer_sig is not None and layer_sig != self._layer_sig:
             self._invalidate_layers()
         elif stereo_sig != self._anaglyph_sig or stereo_sig != self._wiggle_sig:
             self._invalidate_stereo()
@@ -288,13 +299,22 @@ class PreviewPanel(QWidget):
         self.views[TAB_ORIGINAL].set_pixmap(None)
         self._invalidate_depth()
 
+    def _forget(self, *keys: str) -> None:
+        """Cancel and forget running tasks whose results are no longer wanted."""
+        for key in keys:
+            w = self._running.pop(key, None)
+            if w is not None:
+                w.cancel()
+
     def _invalidate_depth(self) -> None:
+        self._forget("depth")
         self._depth = None
         self._depth_sig = None
         self.views[TAB_DEPTH].set_pixmap(None)
         self._invalidate_layers()
 
     def _invalidate_layers(self) -> None:
+        self._forget("layers")
         self._li = None
         self._layer_sig = None
         self.views[TAB_PARALLAX].set_pixmap(None)
@@ -302,6 +322,7 @@ class PreviewPanel(QWidget):
         self._invalidate_stereo()
 
     def _invalidate_stereo(self) -> None:
+        self._forget("anaglyph", "wiggle")
         self._anaglyph_sig = None
         self._wiggle_sig = None
         self._wiggle_frames = []
@@ -324,24 +345,35 @@ class PreviewPanel(QWidget):
         pass_progress: bool = True,
         **kwargs: Any,
     ) -> None:
+        """Run ``fn`` in the background unless a task for ``key`` is already running.
+
+        Callbacks only take effect while this task is still the one registered under
+        ``key`` (the input did not change and the task was not forgotten), so a stale
+        task can never overwrite a newer result or unregister a newer task.
+        """
         if key in self._running:
             return
         gen = self._gen
+        holder: dict[str, Any] = {}
+
+        def current() -> bool:
+            return gen == self._gen and self._running.get(key) is holder.get("w")
 
         def ok(value: Any) -> None:
-            if gen == self._gen:
+            if current():
+                self._running.pop(key, None)  # done: on_result may start a successor
                 on_result(value)
 
         def err(exc: BaseException) -> None:
-            if gen == self._gen:
+            if current():
                 self._failed(key, exc)
 
         def prog(frac: float, msg: str) -> None:
-            if gen == self._gen:
+            if current():
                 self._progress(key, frac, msg)
 
         def fin() -> None:
-            if gen == self._gen:
+            if current():
                 self._running.pop(key, None)
 
         w = self.tasks.start(
@@ -355,6 +387,7 @@ class PreviewPanel(QWidget):
             name=f"preview-{key}",
             **kwargs,
         )
+        holder["w"] = w
         self._running[key] = w
 
     def _dependent_views(self, key: str) -> list[int]:
@@ -402,10 +435,21 @@ class PreviewPanel(QWidget):
             return
         depth_sig, layer_sig, stereo_sig, _amp = self._sigs()
         if self._depth is None:
+            if "depth" in self._running:
+                return
             model, device = depth_sig
+            if not self._license_ok(model):
+                for i in (TAB_DEPTH, TAB_STEREO, TAB_WIGGLE, TAB_PARALLAX):
+                    self.views[i].set_message(
+                        "This depth model is for non-commercial use only and its license has not "
+                        "been accepted.\nChoose another depth model in 'Depth, AI models and output', "
+                        "or accept the license in Tools > AI models."
+                    )
+                return
             for i in (TAB_DEPTH, TAB_STEREO, TAB_WIGGLE, TAB_PARALLAX):
                 if self.views[i].pixmap() is None:
                     self.views[i].set_message("Estimating depth…")
+            self._depth_sig = depth_sig
             self._start(
                 "depth",
                 self.engine.depth,
@@ -418,10 +462,13 @@ class PreviewPanel(QWidget):
         if tab == TAB_DEPTH:
             return
         if self._li is None:
+            if "layers" in self._running:
+                return
             near, far, hfov, look = layer_sig
             for i in (TAB_STEREO, TAB_WIGGLE, TAB_PARALLAX):
                 if self.views[i].pixmap() is None:
                     self.views[i].set_message("Preparing 3D…")
+            self._layer_sig = layer_sig
             self._start(
                 "layers",
                 self.engine.layered,
@@ -431,7 +478,7 @@ class PreviewPanel(QWidget):
                 hfov_deg=hfov,
                 look_behind=look,
                 pass_progress=False,
-                on_result=lambda li, s=layer_sig: self._layers_done(li, s),
+                on_result=lambda li, s=layer_sig, dp=self._depth: self._layers_done(li, s, dp),
             )
             return
         params = PreviewEngine.stereo_params(self._opts())
@@ -443,7 +490,7 @@ class PreviewPanel(QWidget):
                 self._li,
                 params,
                 pass_progress=False,
-                on_result=lambda img, s=stereo_sig: self._anaglyph_done(img, s),
+                on_result=lambda img, s=stereo_sig, li=self._li: self._anaglyph_done(img, s, li),
             )
         elif tab == TAB_WIGGLE:
             if self._wiggle_sig != stereo_sig:
@@ -455,7 +502,7 @@ class PreviewPanel(QWidget):
                     params,
                     8,
                     pass_progress=False,
-                    on_result=lambda frames, s=stereo_sig: self._wiggle_done(frames, s),
+                    on_result=lambda frames, s=stereo_sig, li=self._li: self._wiggle_done(frames, s, li),
                 )
             elif self._wiggle_frames and not self.wiggle_timer.isActive():
                 self.wiggle_timer.start()
@@ -464,6 +511,21 @@ class PreviewPanel(QWidget):
                 self._request_parallax(*self._parallax_target)
             if not self.auto_timer.isActive():
                 self.auto_timer.start()
+
+    def _license_ok(self, model: str) -> bool:
+        """Ask the license gate (may show a prompt) whether ``model`` may be used."""
+        if self.license_gate is None:
+            return True
+        if self._gating:  # re-entered from the prompt's nested event loop: not decided yet
+            return False
+        self._gating = True
+        try:
+            return bool(self.license_gate(model))
+        except Exception:  # never let a broken gate break the preview
+            log.debug("License gate failed for %s", model, exc_info=True)
+            return True
+        finally:
+            self._gating = False
 
     def _source_done(self, img) -> None:  # noqa: ANN001
         v = self.views[TAB_ORIGINAL]
@@ -478,6 +540,10 @@ class PreviewPanel(QWidget):
                 self.views[i].set_message("")
 
     def _depth_done(self, dp, sig: tuple) -> None:  # noqa: ANN001
+        if sig != self._sigs()[0]:  # the depth model changed while this was computed
+            self._depth_sig = None
+            self._refresh()
+            return
         self._depth = dp
         self._depth_sig = sig
         v = self.views[TAB_DEPTH]
@@ -486,19 +552,29 @@ class PreviewPanel(QWidget):
         self._clear_pending_messages((TAB_STEREO, TAB_WIGGLE, TAB_PARALLAX))
         self._refresh()
 
-    def _layers_done(self, li, sig: tuple) -> None:  # noqa: ANN001
+    def _layers_done(self, li, sig: tuple, dp=None) -> None:  # noqa: ANN001
+        if (dp is not None and dp is not self._depth) or sig != self._sigs()[1]:
+            self._layer_sig = None  # made from an old depth map / old options
+            self._refresh()
+            return
         self._li = li
         self._layer_sig = sig
         self._clear_pending_messages((TAB_STEREO, TAB_WIGGLE, TAB_PARALLAX))
         self._refresh()
 
-    def _anaglyph_done(self, img, sig: tuple) -> None:  # noqa: ANN001
+    def _anaglyph_done(self, img, sig: tuple, li=None) -> None:  # noqa: ANN001
+        if (li is not None and li is not self._li) or sig != self._sigs()[2]:
+            self._refresh()  # stale: made for other options or another layered image
+            return
         self._anaglyph_sig = sig
         v = self.views[TAB_STEREO]
         v.set_image(img)
         v.set_message("")
 
-    def _wiggle_done(self, frames, sig: tuple) -> None:  # noqa: ANN001
+    def _wiggle_done(self, frames, sig: tuple, li=None) -> None:  # noqa: ANN001
+        if (li is not None and li is not self._li) or sig != self._sigs()[2]:
+            self._refresh()
+            return
         self._wiggle_sig = sig
         self._wiggle_frames = [np_to_pixmap(f) for f in frames]
         self._wiggle_i = 0
@@ -525,7 +601,9 @@ class PreviewPanel(QWidget):
 
     def _auto_tick(self) -> None:
         pv: ParallaxView = self.views[TAB_PARALLAX]  # type: ignore[assignment]
-        if pv.hovering or self._li is None or not self.isVisible():
+        # animate only while the user can see it (not minimised / in another app): the
+        # renders cost CPU that a running job could use
+        if pv.hovering or self._li is None or not self.isVisible() or not self.isActiveWindow():
             return
         t = time.monotonic() - self._parallax_t0
         a = 2 * math.pi * t / 4.0  # one slow circle every 4 s
@@ -541,11 +619,16 @@ class PreviewPanel(QWidget):
         target = (dx, dy)
         started = time.monotonic()
         gen = self._gen
+        li = self._li
 
         def done(img) -> None:  # noqa: ANN001
             if gen != self._gen:
                 return
             self._parallax_busy = False
+            if li is not self._li:  # the layered image changed meanwhile: render again
+                if self._li is not None:
+                    self._request_parallax(*self._parallax_target)
+                return
             self._parallax_drawn = target
             dt = max(1e-3, time.monotonic() - started)
             self.parallax_fps = 0.8 * self.parallax_fps + 0.2 * (1.0 / dt) if self.parallax_fps else 1.0 / dt
@@ -565,7 +648,7 @@ class PreviewPanel(QWidget):
 
         self.tasks.start(
             self.engine.parallax_frame,
-            self._li,
+            li,
             dx,
             dy,
             amp,

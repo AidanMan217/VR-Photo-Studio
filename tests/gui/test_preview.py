@@ -262,3 +262,133 @@ def test_image_view_message_and_rect(qtbot):
     v.show()
     v.repaint()
     assert v.message() == "Working"
+
+
+# --------------------------------------------------------------------------- review fixes
+class GatedEstimator(CountingEstimator):
+    """Heuristic depth that blocks until ``release`` is set (to change options mid-way)."""
+
+    def __init__(self, release: threading.Event):
+        super().__init__()
+        self.release = release
+
+    def estimate(self, img, *, progress=None, cancel=None):
+        while not self.release.wait(0.01):
+            if cancel is not None:
+                cancel.check()
+        return super().estimate(img, progress=progress, cancel=cancel)
+
+
+def test_depth_model_change_while_computing_never_shows_the_old_model(qtbot, media):
+    """Switching the depth model while depth runs must end with the NEW model's depth."""
+    release = threading.Event()
+    made: list[str] = []
+
+    def factory(name, device):
+        made.append(name)
+        return GatedEstimator(release) if name == "slow" else CountingEstimator()
+
+    opts = {"common": {"depth_model": "slow", "device": "auto"}}
+    p = PreviewPanel(engine=PreviewEngine(factory), options_provider=lambda: opts)
+    qtbot.addWidget(p)
+    p.show()
+    p.set_current_tab(TAB_DEPTH)
+    p.set_path(media["a"])
+    qtbot.waitUntil(lambda: "depth" in p._running, timeout=5000)
+    opts["common"]["depth_model"] = "fast"
+    p._apply_options()  # the slow task is forgotten (cancelled), the fast one starts
+    release.set()
+    qtbot.waitUntil(lambda: p._depth is not None, timeout=10000)
+    qtbot.waitUntil(lambda: not p.tasks.busy(), timeout=10000)
+    assert p._depth_sig[0] == "fast" and p._depth.model_id == "heuristic"
+    assert "fast" in made
+    p.shutdown()
+
+
+def test_late_result_of_an_old_depth_model_is_recomputed(qtbot, media):
+    """Even if a stale depth result arrives, it is discarded (signature check)."""
+    opts = {"common": {"depth_model": "a", "device": "auto"}}
+    p = PreviewPanel(engine=PreviewEngine(lambda n, d: CountingEstimator()), options_provider=lambda: opts)
+    qtbot.addWidget(p)
+    p.show()
+    p.set_current_tab(TAB_DEPTH)
+    p.set_path(media["a"])
+    qtbot.waitUntil(lambda: p._depth is not None, timeout=10000)
+    dp = p._depth
+    opts["common"]["depth_model"] = "b"
+    p._depth = None  # simulate: result of model "a" arriving after the switch
+    p._depth_done(dp, ("a", "auto"))
+    assert p._depth is None  # not accepted
+    qtbot.waitUntil(lambda: p._depth is not None and p._depth_sig[0] == "b", timeout=10000)
+    p.shutdown()
+
+
+def test_layers_of_an_old_depth_map_are_dropped(panel, media, qtbot):
+    panel.set_path(media["a"])
+    panel.set_current_tab(TAB_STEREO)
+    qtbot.waitUntil(lambda: panel.views[TAB_STEREO].pixmap() is not None, timeout=10000)
+    old_li = panel._li
+    stale_dp = object()  # a depth map that is no longer current
+    panel._invalidate_depth()
+    panel._layers_done(old_li, panel._sigs()[1], stale_dp)
+    assert panel._li is None  # not accepted; a fresh depth -> layers run is started
+    qtbot.waitUntil(lambda: panel._li is not None, timeout=10000)
+    qtbot.waitUntil(lambda: panel.views[TAB_STEREO].pixmap() is not None, timeout=10000)
+    shown = panel.views[TAB_STEREO].pixmap().cacheKey()
+    panel._anaglyph_done(np.zeros((4, 4, 3), np.uint8), panel._sigs()[2], object())  # stale render
+    assert panel.views[TAB_STEREO].pixmap().cacheKey() == shown  # the stale image was not shown
+
+
+def test_license_gate_blocks_depth_preview(qtbot, media):
+    est = CountingEstimator()
+    answers = {"nc-model": False}
+    asked: list[str] = []
+
+    def gate(model):
+        asked.append(model)
+        return answers.get(model, True)
+
+    opts = {"common": {"depth_model": "nc-model", "device": "auto"}}
+    p = PreviewPanel(engine=PreviewEngine(lambda n, d: est), options_provider=lambda: opts, license_gate=gate)
+    qtbot.addWidget(p)
+    p.show()
+    p.set_current_tab(TAB_DEPTH)
+    p.set_path(media["a"])
+    assert asked == ["nc-model"]
+    assert "non-commercial" in p.views[TAB_DEPTH].message()
+    qtbot.wait(100)
+    assert est.calls == 0 and "depth" not in p._running
+    answers["nc-model"] = True  # e.g. accepted in the AI models window
+    p.options_changed()
+    qtbot.waitUntil(lambda: p.views[TAB_DEPTH].pixmap() is not None, timeout=10000)
+    assert est.calls == 1
+    p.shutdown()
+
+
+def test_broken_license_gate_does_not_break_the_preview(qtbot, media, heuristic_engine):
+    def gate(model):
+        raise RuntimeError("boom")
+
+    p = PreviewPanel(engine=heuristic_engine, license_gate=gate)
+    qtbot.addWidget(p)
+    p.show()
+    p.set_current_tab(TAB_DEPTH)
+    p.set_path(media["a"])
+    qtbot.waitUntil(lambda: p.views[TAB_DEPTH].pixmap() is not None, timeout=10000)
+    p.shutdown()
+
+
+def test_parallax_render_of_old_layers_is_redone(panel, media, qtbot):
+    panel.set_path(media["a"])
+    panel.set_current_tab(TAB_PARALLAX)
+    qtbot.waitUntil(lambda: panel._parallax_drawn is not None, timeout=10000)
+    panel.auto_timer.stop()
+    qtbot.waitUntil(lambda: not panel._parallax_busy, timeout=5000)
+    panel.opts["common"]["near_m"] = 0.8  # new layer options -> a new layered image
+    panel._request_parallax(0.5, 0.0)
+    old_li = panel._li
+    panel._apply_options()  # options changed while the frame renders
+    assert panel._parallax_drawn is None or panel._li is not old_li
+    qtbot.waitUntil(lambda: panel._li is not None and panel._li is not old_li, timeout=10000)
+    qtbot.waitUntil(lambda: panel._parallax_drawn == (0.5, 0.0), timeout=10000)
+    assert panel._layer_sig[0] == 0.8

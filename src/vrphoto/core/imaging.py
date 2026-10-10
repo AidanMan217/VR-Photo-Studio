@@ -118,7 +118,13 @@ def save_image(path: str | Path, img: np.ndarray, quality: int = 92, xmp: bytes 
         kw = {"quality": quality, "subsampling": 0 if quality >= 90 else 2, "optimize": True}
         if xmp:
             kw["xmp"] = xmp
-        im.save(path, "JPEG", **kw)
+        try:
+            im.save(path, "JPEG", **kw)
+        except (OSError, ValueError):
+            # Pillow's optimize pass can fail on very detailed images ("Suspension not
+            # allowed here"); retry without it.
+            kw.pop("optimize", None)
+            im.save(path, "JPEG", **kw)
     elif ext == ".png":
         im.save(path, "PNG", compress_level=6)
     elif ext == ".webp":
@@ -150,8 +156,8 @@ def load_depth16(path: str | Path) -> np.ndarray:
 
 
 def resize_long(img: np.ndarray, long_side: int, interp: int = cv2.INTER_AREA) -> np.ndarray:
-    """Resize so the longer side equals ``long_side`` (only downsizes if already smaller? no:
-    always resizes exactly).  Use :func:`limit_long` to only downscale."""
+    """Resize so the longer side equals ``long_side`` exactly (up or down).
+    Use :func:`limit_long` to only downscale."""
     h, w = img.shape[:2]
     s = long_side / max(h, w)
     nw, nh = max(1, int(round(w * s))), max(1, int(round(h * s)))
@@ -197,4 +203,4 @@ def gpano_xmp(full_w: int, full_h: int, crop_w: int, crop_h: int, left: int, top
         f'GPano:CroppedAreaImageWidthPixels="{crop_w}" GPano:CroppedAreaImageHeightPixels="{crop_h}" '
         f'GPano:CroppedAreaLeftPixels="{left}" GPano:CroppedAreaTopPixels="{top}"/>'
         '</rdf:RDF></x:xmpmeta><?xpacket end="w"?>'
-    ).encode("utf-8")
+    ).encode()

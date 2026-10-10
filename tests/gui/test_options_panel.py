@@ -149,6 +149,7 @@ def test_custom_path_needs_keyframes(panel_factory):
 
 def test_invalid_json_raises_input_error(panel_factory):
     p = panel_factory("parallax")
+    p.form.set_values({"path": "custom"})
     ed = p.form.editors["keyframes"]
     ed.edit.setPlainText("[{oops")
     assert ed.edit.property("invalid") is True
@@ -324,9 +325,23 @@ def test_device_choices_never_block(monkeypatch):
     assert [v for v, _ in opt.dynamic_choices("devices")] == ["auto", "cpu", "0"]
 
 
+def test_invalid_greyed_out_field_does_not_block_jobs(panel_factory):
+    """Broken key frames left over from 'Custom' must not stop a 'Circle' job."""
+    p = panel_factory("parallax")
+    p.form.set_values({"path": "custom"})
+    p.form.editors["keyframes"].edit.setPlainText("[{broken")
+    with pytest.raises(InputError, match="JSON"):
+        p.build_spec(["x.jpg"])
+    p.form.set_values({"path": "circle"})
+    assert not p.form.editors["keyframes"].isEnabled()
+    spec = p.build_spec(["x.jpg"])
+    assert spec.path == "circle" and spec.keyframes is None
+
+
 def test_lenient_values_skip_invalid_entries(panel_factory):
     p = panel_factory("parallax")
     p.common.set_values({"depth_model": "moge2"})
+    p.form.set_values({"path": "custom"})
     p.form.editors["keyframes"].edit.setPlainText("[{broken")
     with pytest.raises(InputError):
         p.options_dict()

@@ -423,3 +423,53 @@ def test_default_runner_and_lazy_context(make_job, photo_png):
         assert rec.lifecycle(jid) == ["queued", "started", "finished"]
     finally:
         jq.shutdown()
+
+
+def test_vrphoto_error_after_cancel_counts_as_cancelled(q):
+    """E.g. an add-on worker killed by the cancel reports an AddonError: still a cancellation."""
+    from vrphoto.core.errors import AddonError
+
+    started = threading.Event()
+
+    def runner(sp, ctx, *, progress, cancel):
+        started.set()
+        while not cancel.cancelled:
+            time.sleep(0.01)
+        raise AddonError("The worker stopped unexpectedly (exit code 1).")
+
+    rec = Recorder()
+    jq = q(runner)
+    jq.subscribe(rec)
+    jid = jq.submit(spec())
+    started.wait(5)
+    jq.cancel(jid)
+    jq.wait(jid, TIMEOUT)
+    r = jq.get(jid)
+    assert r.status == "cancelled" and r.error is None
+    assert rec.lifecycle(jid)[-1] == "cancelled"
+
+
+def test_progress_after_cancel_keeps_saying_cancelling(q):
+    started = threading.Event()
+    go = threading.Event()
+
+    def runner(sp, ctx, *, progress, cancel):
+        started.set()
+        go.wait(5)
+        progress(0.5, "Rendering frame 12/180")
+        cancel.check()
+        return JobResult()
+
+    rec = Recorder()
+    jq = q(runner)
+    jq.subscribe(rec)
+    jid = jq.submit(spec())
+    started.wait(5)
+    jq.cancel(jid)
+    assert jq.get(jid).msg == "Cancelling..."
+    go.set()
+    jq.wait(jid, TIMEOUT)
+    with rec.lock:
+        msgs = [e.msg for e in rec.events if e.job_id == jid and e.type == "progress"]
+    assert msgs == ["Cancelling..."]
+    assert jq.get(jid).status == "cancelled"

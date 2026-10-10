@@ -14,6 +14,7 @@ a broken install); if that fails :attr:`QueueBridge.error` explains why and
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -169,8 +170,16 @@ class QueueBridge(QObject):
         r, q = self.counts()
         return r + q
 
-    def shutdown(self, wait: bool = False) -> None:
-        """Cancel all jobs, stop listening and shut the queue down.  Idempotent."""
+    def shutdown(self, wait: bool = False, *, wait_s: float = 0.0) -> None:
+        """Cancel all jobs, stop listening and shut the queue down.  Idempotent.
+
+        Args:
+            wait: join the queue's worker threads (may block for as long as a job ignores
+                cancellation - avoid on the UI thread).
+            wait_s: otherwise, wait at most this long for cancelled jobs to stop, so they
+                can terminate their subprocesses (add-on workers, ffmpeg) before the app
+                exits.  Daemon worker threads would simply be killed at exit.
+        """
         if self._closed:
             return
         self._closed = True
@@ -187,10 +196,40 @@ class QueueBridge(QObject):
             except Exception:  # pragma: no cover - defensive
                 pass
             self._unsubscribe = None
+        if not wait and wait_s > 0:
+            self._wait_idle(q, wait_s)
         try:
             q.shutdown(wait=wait)
         except Exception:
             log.debug("Queue shutdown failed", exc_info=True)
+
+    @staticmethod
+    def _wait_idle(q: Any, timeout: float) -> bool:
+        """Wait until no job of ``q`` is queued or running (at most ``timeout`` s)."""
+
+        def busy() -> bool:
+            try:
+                return any(getattr(r, "status", "") in ("queued", "running") for r in q.jobs())
+            except Exception:  # pragma: no cover - defensive
+                return False
+
+        if not busy():
+            return True
+        log.info("Waiting up to %.0f s for running jobs to stop", timeout)
+        deadline = time.monotonic() + timeout
+        wait_fn = getattr(q, "wait", None)  # pipeline.queue.JobQueue extension
+        if callable(wait_fn):
+            try:
+                if wait_fn(None, timeout=timeout):
+                    return True
+            except Exception:
+                log.debug("JobQueue.wait failed", exc_info=True)
+        while busy() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        idle = not busy()
+        if not idle:
+            log.warning("A job did not stop within %.0f s; exiting anyway", timeout)
+        return idle
 
     # ------------------------------------------------------------------ worker-thread side
     def _on_event_thread(self, ev: Any) -> None:

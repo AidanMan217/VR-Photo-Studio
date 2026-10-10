@@ -32,7 +32,8 @@ def test_selftest_passes_here(tmp_path):
     failed = {k: v.get("error") for k, v in report["checks"].items() if not v["ok"]}
     assert report["ok"] is True, failed
     assert set(report["checks"]) == EXPECTED
-    assert seen == list(report["checks"])
+    assert seen == list(report["checks"]) == st.check_names()
+    assert st.check_names(models=True) == [*st.check_names(), "models"]
     for c in report["checks"].values():
         assert c["seconds"] >= 0 and "detail" in c
     assert report["failed"] == [] and report["version"] and report["python"]

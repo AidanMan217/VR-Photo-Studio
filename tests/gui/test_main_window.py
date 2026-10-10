@@ -363,3 +363,177 @@ def test_dialogs_open_from_window(make_window, qtbot, monkeypatch):
         assert opener() is dlg  # single instance
         dlg.close()
         qtbot.waitUntil(lambda n=name: n not in w.dialogs, timeout=5000)
+
+
+# --------------------------------------------------------------------------- review fixes
+def test_preview_asks_for_noncommercial_license_once(make_window, media, prompts, settings, qtbot):
+    """The depth preview must not use a non-commercial model before its license is accepted."""
+    w, _ = make_window()
+    w.add_inputs([media["a"]])
+    w.modes.current_panel().common.set_values({"depth_model": "da2-large"})
+    prompts.license_answer = False
+    assert w._preview_license_ok("da2-large") is False
+    assert prompts.licenses == ["Depth Anything V2 Large"]
+    assert w._preview_license_ok("da2-large") is False  # declined: not asked again this session
+    assert len(prompts.licenses) == 1
+    assert w._preview_license_ok("auto") and w._preview_license_ok("heuristic")  # no prompt
+    assert len(prompts.licenses) == 1
+    # creating a job is an explicit action: it asks again, and accepting unlocks the preview
+    prompts.license_answer = True
+    assert len(w.create_jobs()) == 1
+    assert settings.license_accepted("da2-large")
+    assert w._preview_license_ok("da2-large") is True
+    assert len(prompts.licenses) == 2
+
+
+def test_preview_tab_respects_license_gate(make_window, media, prompts, qtbot):
+    from vrphoto.gui.panels.preview import TAB_DEPTH
+
+    w, _ = make_window()
+    w.add_inputs([media["a"]])
+    w.modes.current_panel().common.set_values({"depth_model": "da2-base"})
+    prompts.license_answer = False
+    w.preview.set_current_tab(TAB_DEPTH)
+    assert prompts.licenses == ["Depth Anything V2 Base"]
+    assert "non-commercial" in w.preview.views[TAB_DEPTH].message()
+    assert "depth" not in w.preview._running
+
+
+def test_output_name_is_not_remembered_across_sessions(make_window, isolated_home):
+    from vrphoto.gui.state import GuiState
+
+    w, _ = make_window()
+    w.modes.current_panel().common.set_values({"name": "beach", "near_m": 2.0})
+    w.close()
+    st = GuiState.load()
+    assert "name" not in st.options["stereo"]["common"]
+    assert st.options["stereo"]["common"]["near_m"] == pytest.approx(2.0)
+
+
+def test_options_are_saved_when_jobs_are_created(make_window, media, isolated_home):
+    from vrphoto.gui.state import GuiState
+
+    w, _ = make_window()
+    w.add_inputs([media["a"]])
+    w.modes.current_panel().form.set_values({"strength": 1.35})
+    assert w.create_jobs()
+    assert GuiState.load().options["stereo"]["strength"] == pytest.approx(1.35)  # before any exit
+
+
+def test_closing_waits_for_cancelled_jobs_to_stop(make_window, media, qtbot, prompts):
+    """On exit the running job is cancelled AND given time to clean up (subprocesses)."""
+    import threading
+    import time
+
+    from vrphoto.pipeline.jobs import JobResult
+
+    stopped = threading.Event()
+
+    def runner(spec, ctx=None, *, progress=None, cancel=None):
+        try:
+            while True:
+                cancel.check()
+                time.sleep(0.01)
+        finally:
+            time.sleep(0.2)  # e.g. killing an add-on worker process
+            stopped.set()
+        return JobResult()
+
+    w, q = make_window(runner)
+    w.add_inputs([media["a"]])
+    w.create_jobs()
+    qtbot.waitUntil(lambda: w.queue.active_count() == 1 and q.jobs()[0].status == "running", timeout=5000)
+    prompts.answer = True
+    w.close()
+    assert stopped.is_set()  # shutdown waited for the job's clean-up
+    assert q.jobs()[0].status == "cancelled"
+
+
+def test_bridge_shutdown_wait_is_bounded(qtbot):
+    import time
+
+    from gui_helpers import FakeJobQueue
+
+    from vrphoto.gui.bridge import QueueBridge
+    from vrphoto.pipeline.jobs import StereoJob
+
+    release = __import__("threading").Event()
+
+    def stubborn(spec, ctx=None, *, progress=None, cancel=None):
+        release.wait(10)  # ignores cancellation
+
+    q = FakeJobQueue(stubborn)
+    b = QueueBridge(q)
+    b.submit(StereoJob(inputs=["x.jpg"]))
+    qtbot.waitUntil(lambda: q.jobs()[0].status == "running", timeout=5000)
+    t0 = time.monotonic()
+    b.shutdown(wait_s=0.3)
+    assert time.monotonic() - t0 < 2.0
+    release.set()
+    q.shutdown(wait=True)
+
+
+def test_addons_experimental_toggle_updates_option_choices(make_window, qtbot, monkeypatch, settings):
+    from vrphoto.gui.dialogs import addons_dialog
+
+    monkeypatch.setattr(addons_dialog, "detect_gpu", lambda: {"name": None, "vram_mb": None, "nvidia": False})
+    w, _ = make_window()
+    w.modes.set_mode("object")
+    method = w.modes.current_panel().form.editors["method"]
+    assert "sharp" not in method.values()
+    dlg = w.open_addons()
+    dlg.exp_check.setChecked(True)
+    assert settings.show_experimental
+    assert "sharp" in method.values()  # the main window's option panels follow
+    dlg.close()
+
+
+def test_big_folder_notice(make_window, media, monkeypatch, qtbot):
+    from vrphoto.gui.panels import input_list
+
+    monkeypatch.setattr(input_list, "MAX_FILES", 2)
+    w, _ = make_window()
+    n = w.add_inputs([media["dir"]])
+    assert n == 2 and w.inputs.count() == 2 and w.inputs.last_truncated
+    assert "Stopped after 2 files" in w.statusBar().currentMessage()
+    assert w.add_inputs([media["a"]]) == 0
+    assert "list is full" in w.statusBar().currentMessage()
+
+
+def test_thumbnail_of_removed_item_is_ignored(make_window, media, qtbot):
+    w, _ = make_window()
+    w.add_inputs([media["a"], media["b"]])
+    w.inputs.clear()
+    w.add_inputs([media["b"]])
+    item = w.inputs.list.item(0)
+    first = item.icon().cacheKey()
+    qtbot.waitUntil(lambda: item.icon().cacheKey() != first, timeout=5000)
+    qtbot.waitUntil(lambda: not w.inputs.tasks.busy(), timeout=5000)
+    assert w.inputs.count() == 1 and len(w.inputs._items) == 1
+
+
+def test_broken_dialog_shows_one_friendly_error(make_window, prompts, monkeypatch):
+    from vrphoto.gui.dialogs import about_dialog
+
+    def broken(*a, **k):
+        raise RuntimeError("missing notices module")
+
+    monkeypatch.setattr(about_dialog, "AboutDialog", broken)
+    w, _ = make_window()
+    assert w.open_about() is None  # no exception escapes into the Qt event loop
+    assert len(prompts.errors) == 1 and "missing notices module" in prompts.errors[0]
+    assert "about" not in w.dialogs
+
+
+def test_typed_number_is_used_by_ctrl_enter(make_window, media, monkeypatch):
+    """A value typed into a spin box (not yet confirmed with Enter) is used by Create."""
+    from vrphoto.gui import main_window
+
+    w, q = make_window()
+    w.add_inputs([media["a"]])
+    spin = w.modes.current_panel().form.editors["strength"].spin
+    spin.lineEdit().setText("1.70 ×")  # typed, keyboard tracking off: not committed yet
+    assert spin.value() == pytest.approx(1.0)
+    monkeypatch.setattr(main_window.QApplication, "focusWidget", staticmethod(lambda: spin))
+    ids = w.create_jobs()
+    assert ids and q.submitted[-1].strength == pytest.approx(1.7)

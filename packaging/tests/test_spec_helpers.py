@@ -536,7 +536,8 @@ def _versioned_root(tmp_path: Path, init_version: str, project_version: str | No
 def test_repository_versions_agree():
     import vrphoto
 
-    assert H.read_pyproject_version(H.ROOT) == vrphoto.__version__
+    # pyproject uses a dynamic version read from vrphoto.__version__ (single source of truth)
+    assert H.read_pyproject_version(H.ROOT) in (None, vrphoto.__version__)
     assert H.checked_version() == vrphoto.__version__
 
 

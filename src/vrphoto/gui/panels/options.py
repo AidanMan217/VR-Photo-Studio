@@ -679,15 +679,9 @@ class OptionsForm(QWidget):
 
     def _update_enabled(self) -> None:
         for n, ed in self.editors.items():
-            cond = self.meta[n].enabled_if
-            if not cond:
+            if not self.meta[n].enabled_if:
                 continue
-            other, allowed = cond
-            src = self.editors.get(other)
-            try:
-                on = True if src is None else (src.value() in allowed)
-            except InputError:
-                on = True
+            on = self._applies(n)
             ed.setEnabled(on)
             self.labels[n].setEnabled(on)
 
@@ -695,18 +689,33 @@ class OptionsForm(QWidget):
     def values(self, *, strict: bool = True) -> dict[str, Any]:
         """Current values (stored units) for the edited fields.
 
-        With ``strict`` an invalid entry (e.g. malformed JSON) raises InputError; otherwise
-        such fields are left out (used for previews and for remembering options).
+        With ``strict`` an invalid entry (e.g. malformed JSON) raises InputError - unless
+        the field is greyed out (its ``enabled_if`` condition is not met), then its default
+        is used.  Without ``strict`` invalid fields are left out (used for previews and
+        for remembering options).
         """
-        if strict:
-            return {n: ed.value() for n, ed in self.editors.items()}
         out: dict[str, Any] = {}
         for n, ed in self.editors.items():
             try:
                 out[n] = ed.value()
             except InputError:
-                continue
+                if strict and self._applies(n):
+                    raise
+                if strict:  # greyed out (e.g. key frames of a stock movement): not used anyway
+                    out[n] = self.defaults.get(n)
         return out
+
+    def _applies(self, name: str) -> bool:
+        """False if field ``name`` is greyed out by its ``enabled_if`` condition."""
+        cond = self.meta[name].enabled_if
+        if not cond:
+            return True
+        other, allowed = cond
+        src = self.editors.get(other)
+        try:
+            return True if src is None else (src.value() in allowed)
+        except InputError:
+            return True
 
     def set_values(self, values: dict[str, Any]) -> None:
         for n, v in values.items():

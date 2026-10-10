@@ -208,13 +208,23 @@ class ModePanel(QWidget):
             self.optionsChanged.emit()
 
     # ---------------------------------------------------------------- options memory
+    #: Common options that belong to one batch of photos and are not carried over to the
+    #: next session (an output name would otherwise silently apply to every future job).
+    NOT_REMEMBERED_COMMON = ("name",)
+
     def remember_all(self) -> dict[str, dict[str, Any]]:
         """Snapshot of options of every mode that was opened (for GuiState)."""
         for kind, p in self.panels.items():
             try:
-                self.remembered[kind] = p.options_dict(strict=False)  # invalid entries are skipped
+                d = p.options_dict(strict=False)  # invalid entries are skipped
             except Exception as e:  # pragma: no cover - defensive: keep the previous snapshot
                 log.debug("Not remembering options of %s: %s", kind, e)
+                continue
+            common = d.get("common")
+            if isinstance(common, dict):
+                for k in self.NOT_REMEMBERED_COMMON:
+                    common.pop(k, None)
+            self.remembered[kind] = d
         return dict(self.remembered)
 
     def current_options(self) -> dict[str, Any]:

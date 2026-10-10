@@ -63,6 +63,8 @@ class Settings:
     theme: str = "system"
     last_open_dir: str = ""
     show_experimental: bool = False
+    gui_state: dict = field(default_factory=dict)  # window geometry, last options per mode, ...
+    depth_cache_mb: int = 1024
 
     # ---------------------------------------------------------------- derived paths
     @property

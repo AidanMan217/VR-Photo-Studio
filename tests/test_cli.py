@@ -555,6 +555,34 @@ def test_main_dispatch_gui_vs_cli(monkeypatch, photo):
     assert m.cli_entry(["version"]) == 0
 
 
+def test_windowed_exe_opens_the_window_for_missing_files(monkeypatch, photo):
+    """A stale file association must not run the invisible CLI in the windowed exe."""
+    import vrphoto.__main__ as m
+    import vrphoto.gui.app as app
+
+    calls = []
+    monkeypatch.setattr(app, "run_gui", lambda argv=None: calls.append(argv) or 0)
+    monkeypatch.setattr(m, "_windowed", lambda: True)
+    missing = str(photo) + ".moved"
+    assert m.main([missing]) == 0
+    assert calls[-1][1:] == [missing]
+    n = len(calls)
+    monkeypatch.setattr(m, "_ensure_streams", lambda: None)
+    assert m.main(["version"]) == 0 and len(calls) == n  # commands still run the CLI
+    assert m.main(["--selftest-not-a-flag"]) != 0 and len(calls) == n  # options too
+
+
+def test_choices_follow_the_runner():
+    from vrphoto.cli import _choices_table
+    from vrphoto.pipeline import run as R
+
+    t = _choices_table()
+    assert t[("video", "output")] == R.VIDEO_OUTPUTS and "half_tb" in t[("video", "output")]
+    assert t[("object", "back")] == R.BACKS
+    ns = cli.build_parser().parse_args(["video", "clip.mp4", "--output", "half_tb"])
+    assert ns.job__output == "half_tb"
+
+
 def test_main_without_stdout_does_not_crash(monkeypatch, isolated_home):
     import vrphoto.__main__ as m
 

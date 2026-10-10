@@ -40,15 +40,19 @@ def _friendly(exc: BaseException) -> tuple[str, str | None]:
 
 
 class ErrorReporter(QObject):
-    """Shows unhandled exceptions in a dialog (on the Qt thread), rate-limited."""
+    """Shows unhandled exceptions in a dialog (on the Qt thread), rate-limited: one dialog
+    at a time, and the same error (type + message) at most once per ``repeat_after_s`` so
+    an error that recurs (e.g. in a timer) cannot lock the user in a loop of dialogs."""
 
     _report = Signal(object)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(self, parent: QObject | None = None, *, repeat_after_s: float = 60.0) -> None:
         super().__init__(parent)
         self._showing = False
         self.count = 0
         self.last: BaseException | None = None
+        self.repeat_after_s = float(repeat_after_s)
+        self._last_shown: dict[tuple[str, str], float] = {}
         self._report.connect(self._show, Qt.ConnectionType.QueuedConnection)
 
     def report(self, exc_info: ExcInfo) -> None:
@@ -84,6 +88,15 @@ class ErrorReporter(QObject):
     def _show(self, exc_info: ExcInfo) -> None:
         if self._showing:  # one dialog at a time; the rest is in the log
             return
+        import time
+
+        etype, exc, _tb = exc_info
+        key = (getattr(etype, "__name__", str(etype)), str(exc))
+        now = time.monotonic()
+        last = self._last_shown.get(key)
+        if last is not None and now - last < self.repeat_after_s:
+            return  # the same error again: already shown (and logged every time)
+        self._last_shown[key] = now
         self._showing = True
         try:
             self.show_dialog(exc_info)
@@ -173,6 +186,24 @@ def _file_args(argv: Sequence[str]) -> list[Path]:
     return out
 
 
+def _claim_single_instance(files: Sequence[Path]) -> Any:
+    """Become the single running instance (returns the guard), or hand ``files`` to an
+    instance that is already running (returns False).  Returns None if the guard is not
+    available (then several instances may run, as before)."""
+    from .single_instance import ENV_MULTI, SingleInstance
+
+    if os.environ.get(ENV_MULTI) == "1":
+        return None
+    try:
+        guard = SingleInstance()
+        if guard.send_to_running([str(f) for f in files]):
+            return False
+        return guard if guard.listen() else None
+    except Exception:  # never let the guard stop the app from starting
+        log.debug("Single-instance guard failed", exc_info=True)
+        return None
+
+
 def run_gui(argv: Sequence[str] | None = None) -> int:
     """Start the desktop app; returns the exit code.
 
@@ -184,6 +215,11 @@ def run_gui(argv: Sequence[str] | None = None) -> int:
     log_path = setup_logging(logging.INFO)
     _set_windows_app_id()
     app = create_app(argv[:1])
+    files = _file_args(argv[1:])
+    guard = _claim_single_instance(files)
+    if guard is False:
+        log.info("%s is already running; handed %d file(s) over to it", APP_NAME, len(files))
+        return 0
     log.info("Starting %s %s (log: %s)", APP_NAME, __version__, log_path)
 
     from ..core.config import Settings, set_settings
@@ -195,9 +231,10 @@ def run_gui(argv: Sequence[str] | None = None) -> int:
         settings = Settings()
     set_settings(settings)
 
-    from .theme import apply_theme
+    from .theme import apply_theme, follow_system_theme
 
     apply_theme(app, getattr(settings, "theme", "system"))
+    stop_following = follow_system_theme(app, lambda: getattr(settings, "theme", "system"))
     reporter = ErrorReporter(app)
     restore = install_excepthook(reporter)
     try:
@@ -206,7 +243,9 @@ def run_gui(argv: Sequence[str] | None = None) -> int:
         win = MainWindow(settings)
         _main_window = win
         app.aboutToQuit.connect(win.shutdown)
-        files = _file_args(argv[1:])
+        if guard is not None:
+            win.instance_guard = guard  # closed when the window starts shutting down
+            guard.activated.connect(win.bring_to_front)
         if files:
             win.add_inputs(files)
         win.show()
@@ -223,6 +262,9 @@ def run_gui(argv: Sequence[str] | None = None) -> int:
         return 1
     finally:
         restore()
+        stop_following()
+        if guard is not None:
+            guard.close()
         win = _main_window
         _main_window = None
         if win is not None:

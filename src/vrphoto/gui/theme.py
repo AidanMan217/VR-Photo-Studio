@@ -7,6 +7,7 @@ Widgets opt into special looks with object names / dynamic properties, e.g.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from PySide6.QtCore import Qt
@@ -88,13 +89,15 @@ def colors(name: str | None) -> Colors:
 
 
 def _resource_url(name: str) -> str:
-    """``url(...)`` value for a bundled image (forward slashes work on Windows too)."""
+    """Quoted ``url(...)`` argument for a bundled image (forward slashes work on Windows
+    too; quoting keeps paths with spaces or parentheses, e.g. ``Program Files (x86)``,
+    intact)."""
     try:
         from ..core.config import resource_path
 
         p = resource_path("gui", "resources", name)
         if p.is_file():
-            return p.resolve().as_posix()
+            return '"' + p.resolve().as_posix().replace('"', '\\"') + '"'
     except Exception:  # pragma: no cover - defensive
         pass
     return ""
@@ -121,9 +124,26 @@ QComboBox::down-arrow {{ image: url({down}); width: 10px; height: 6px; }}
 """
 
 
+def _check_rules(c: Colors) -> str:
+    """Clearly visible check boxes (Fusion's default box is nearly invisible in the dark
+    theme); needs the bundled check-mark image, otherwise Fusion's own box is kept."""
+    check = _resource_url("check_light.png")
+    if not check:
+        return ""
+    return f"""
+QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {c.muted}; border-radius: 4px;
+    background: {c.panel_alt}; }}
+QCheckBox::indicator:hover {{ border-color: {c.accent_hover}; }}
+QCheckBox::indicator:checked {{ background: {c.accent}; border-color: {c.accent}; image: url({check}); }}
+QCheckBox::indicator:disabled {{ border-color: {c.border}; background: {c.panel}; }}
+QCheckBox::indicator:checked:disabled {{ background: {c.border}; border-color: {c.border}; }}
+"""
+
+
 def stylesheet(c: Colors) -> str:
     """The application QSS for a colour set."""
-    return f"""
+    return (
+        f"""
 QWidget {{ color: {c.text}; font-size: 10pt; }}
 QWidget:disabled {{ color: {c.muted}; }}
 QMainWindow, QDialog {{ background: {c.bg}; }}
@@ -209,7 +229,10 @@ QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QGroupBox {{ border: 1px solid {c.border}; border-radius: 8px; margin-top: 14px; padding-top: 8px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; font-weight: 600; }}
-""" + _arrow_rules(c)
+"""
+        + _arrow_rules(c)
+        + _check_rules(c)
+    )
 
 
 def palette(c: Colors) -> QPalette:
@@ -234,8 +257,54 @@ def palette(c: Colors) -> QPalette:
     return p
 
 
+def _set_color_scheme(name: str | None) -> None:
+    """Tell Qt (>= 6.8) which scheme the app uses, so e.g. the Windows title bars match the
+    theme; ``"system"`` follows the OS again."""
+    want = {"dark": Qt.ColorScheme.Dark, "light": Qt.ColorScheme.Light}.get(
+        (name or "system").lower(), Qt.ColorScheme.Unknown
+    )
+    try:
+        hints = QGuiApplication.styleHints()
+        if hints.colorScheme() != want or want == Qt.ColorScheme.Unknown:
+            hints.setColorScheme(want)
+    except Exception:  # older Qt / platform without support
+        log.debug("Cannot set the colour scheme", exc_info=True)
+
+
+def follow_system_theme(app: QApplication, theme_name: Callable[[], str | None]) -> Callable[[], None]:
+    """Re-apply the theme when the OS switches between dark and light mode while the
+    chosen theme (``theme_name()``, e.g. from Settings) is ``"system"``.
+
+    Returns a function that stops following.
+    """
+
+    def changed(*_: object) -> None:
+        try:
+            name = (theme_name() or "system").lower()
+        except Exception:  # pragma: no cover - defensive
+            return
+        if name == "system" and app.property("vrphoto_theme") != resolve_theme("system"):
+            apply_theme(app, "system")
+
+    hints = QGuiApplication.styleHints()
+    try:
+        hints.colorSchemeChanged.connect(changed)
+    except Exception:  # older Qt
+        log.debug("colorSchemeChanged not available", exc_info=True)
+        return lambda: None
+
+    def stop() -> None:
+        try:
+            hints.colorSchemeChanged.disconnect(changed)
+        except (RuntimeError, TypeError):
+            pass
+
+    return stop
+
+
 def apply_theme(app: QApplication, name: str | None = "system") -> str:
     """Apply a theme to the whole application.  Returns the resolved name ("dark"/"light")."""
+    _set_color_scheme(name)
     resolved = resolve_theme(name)
     c = LIGHT if resolved == "light" else DARK
     try:

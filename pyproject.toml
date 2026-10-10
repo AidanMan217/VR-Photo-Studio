@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vrphoto"
-version = "0.1.0"
+dynamic = ["version"]
 description = "VR Photo Studio - turn photos into VR content for Meta Quest"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -36,6 +36,7 @@ dev = [
     "trimesh>=4.0",
     "ruff>=0.5",
     "pyinstaller>=6.10",
+    "pyyaml>=6",
     "fast-simplification>=0.1.7",
 ]
 
@@ -44,6 +45,9 @@ vrphoto-cli = "vrphoto.__main__:cli_entry"
 
 [project.gui-scripts]
 vrphoto = "vrphoto.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "vrphoto.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -30,8 +30,9 @@ def _scene() -> np.ndarray:
 def test_real_estimator(name, monkeypatch):
     for var in ("VRPHOTO_MODEL_DA2_SMALL", "VRPHOTO_MODEL_MOGE2_VITL"):
         monkeypatch.delenv(var, raising=False)
-    if os.environ.get("VRPHOTO_TEST_MODELS_DIR"):
-        monkeypatch.setenv("VRPHOTO_HOME", os.environ["VRPHOTO_TEST_MODELS_DIR"])
+    cache = os.environ.get("VRPHOTO_REAL_MODELS_HOME") or os.environ.get("VRPHOTO_TEST_MODELS_DIR")
+    if cache:
+        monkeypatch.setenv("VRPHOTO_HOME", cache)
     from vrphoto.depth import get_estimator
 
     r = get_estimator(name, device="auto").estimate(_scene())

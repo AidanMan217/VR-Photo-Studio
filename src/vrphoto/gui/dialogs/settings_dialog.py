@@ -29,7 +29,7 @@ from ...core.log import get_logger
 from .. import options_meta as om
 from .. import util
 from ..panels.options import dynamic_choices
-from ..workers import TaskRunner
+from ..workers import DIALOG_CLOSE_WAIT_MS, TaskRunner
 from . import common as dc
 
 log = get_logger(__name__)
@@ -303,9 +303,15 @@ class SettingsDialog(QDialog):
         if v["https_port"] == v["http_port"]:
             return "The Wi-Fi and USB ports must be different."
         if v["output_dir"]:
-            p = Path(v["output_dir"])
+            p = Path(v["output_dir"]).expanduser()
             if p.exists() and not p.is_dir():
                 return f"The output folder {p} is a file, not a folder."
+            if not p.is_absolute():
+                return "Please choose the output folder with 'Browse…' (a full path such as C:\\Users\\…)."
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                return f"The output folder {p} cannot be created ({e.strerror or e}). Choose another folder."
         return None
 
     def save(self) -> bool:
@@ -332,5 +338,5 @@ class SettingsDialog(QDialog):
         return True
 
     def done(self, result: int) -> None:  # noqa: D401 - QDialog API
-        self.tasks.shutdown(2000)
+        self.tasks.shutdown(DIALOG_CLOSE_WAIT_MS)
         super().done(result)

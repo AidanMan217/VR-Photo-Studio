@@ -434,6 +434,7 @@ class _RedirectHandler(_QuietHandlerMixin, BaseHTTPRequestHandler):
     """Answers plain HTTP on the HTTPS port with a redirect to the https:// URL."""
 
     protocol_version = "HTTP/1.0"
+    default_request_version = "HTTP/1.0"
     timeout = 10
 
     def _redirect(self) -> None:
@@ -457,6 +458,9 @@ class _RedirectHandler(_QuietHandlerMixin, BaseHTTPRequestHandler):
 
 class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Malformed request lines would otherwise be answered HTTP/0.9-style (no status line)
+    # on some Python versions; always reply with a proper HTTP/1.x status line.
+    default_request_version = "HTTP/1.0"
     timeout = _REQUEST_TIMEOUT
     server: _HTTPServer
 

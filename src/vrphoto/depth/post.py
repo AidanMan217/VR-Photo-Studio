@@ -191,47 +191,126 @@ def refine(disparity: FloatMap, img: RGB, strength: float = 1.0) -> FloatMap:
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
-def temporal_align(prev: FloatMap | None, cur: FloatMap, ema: float = 0.6) -> FloatMap:
+#: Samples (block averages) used to fit the frame-to-frame scale + shift in temporal_align.
+TEMPORAL_FIT_SAMPLES = 4096
+#: Below this correlation between the previous and the current depth map the frames are
+#: treated as a scene cut: smoothing restarts from the current frame.
+SCENE_CUT_CORR = 0.5
+#: Default fraction by which temporal_align moves the result's robust (2-98 %) range toward
+#: the current frame's range on every call (time constant ~10 frames).
+TEMPORAL_RANGE_PULL = 0.1
+
+
+def _fit_samples(x: np.ndarray) -> np.ndarray:
+    """Block averages of a map on a grid of about :data:`TEMPORAL_FIT_SAMPLES` cells.
+
+    Averaging is linear, so an affine relation between two maps survives it, while the
+    per-pixel noise that biases a fitted slope toward zero (regression dilution) averages out.
+    """
+    a = np.asarray(x, dtype=np.float32)
+    h, w = a.shape
+    s = float(np.sqrt(h * w / TEMPORAL_FIT_SAMPLES))
+    if s > 1.0:  # (a non-finite pixel makes its cell non-finite; such cells are skipped)
+        gw, gh = max(1, int(round(w / s))), max(1, int(round(h / s)))
+        a = cv2.resize(a, (gw, gh), interpolation=cv2.INTER_AREA)
+    return a.astype(np.float64).ravel()
+
+
+def _paired_samples(c: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    cs, ps = _fit_samples(c), _fit_samples(p)
+    ok = np.isfinite(cs) & np.isfinite(ps)
+    return cs[ok], ps[ok]
+
+
+def _pixel_sample(x: np.ndarray, n: int = 65536) -> np.ndarray:
+    """A strided sample of about ``n`` finite pixels (for percentiles)."""
+    step = max(1, int(np.sqrt(x.size / n)))
+    v = np.asarray(x)[::step, ::step].ravel()
+    return v[np.isfinite(v)]
+
+
+def _correlation(cs: np.ndarray, ps: np.ndarray) -> float | None:
+    """Pearson correlation of two sample vectors (None if either is (nearly) constant)."""
+    if cs.size < 16 or cs.std() <= 1e-6 or ps.std() <= 1e-6:
+        return None
+    return float(np.corrcoef(cs, ps)[0, 1])
+
+
+def _matched(prev: FloatMap, cur: np.ndarray) -> np.ndarray:
+    p = np.asarray(prev, dtype=np.float32)
+    if p.shape != cur.shape:
+        p = cv2.resize(p, (cur.shape[1], cur.shape[0]), interpolation=cv2.INTER_LINEAR)
+    return p
+
+
+def scene_cut(prev: FloatMap | None, cur: FloatMap, thresh: float = SCENE_CUT_CORR) -> bool:
+    """True when ``cur`` shows a different shot than ``prev`` (a cut in an edited video).
+
+    Compares block averages of the two disparity maps; a correlation below ``thresh`` (or a
+    negative one) means the previous depth says nothing about the current frame.
+    """
+    if prev is None:
+        return False
+    c = np.asarray(cur, dtype=np.float32)
+    r = _correlation(*_paired_samples(c, _matched(prev, c)))
+    return r is not None and not r >= thresh
+
+
+def temporal_align(
+    prev: FloatMap | None, cur: FloatMap, ema: float = 0.6, *, range_pull: float = TEMPORAL_RANGE_PULL
+) -> FloatMap:
     """Stabilise per-frame relative disparity for video.
 
-    ``cur`` is mapped onto ``prev`` with a robust least-squares scale + shift (relative
-    depth models drift in scale/offset between frames), then blended with an
-    exponential moving average where ``ema`` is the weight of the previous frame.  The
-    blend weight falls off where the aligned frames disagree strongly (moving objects),
-    so motion does not leave trails.  Returns ``cur`` unchanged when ``prev`` is None.
+    ``cur`` is mapped onto ``prev`` with a robust scale + shift (relative depth models drift
+    in scale/offset between frames), then blended with an exponential moving average where
+    ``ema`` is the weight of the previous frame.  The blend weight falls off where the
+    aligned frames disagree strongly (moving objects), so motion does not leave trails.
+    Returns ``cur`` unchanged when ``prev`` is None or at a scene cut (:func:`scene_cut`).
+
+    The result is fed back as ``prev`` for the next frame, so any bias of the fit would
+    compound over a clip: the scale is a symmetric (reduced major axis) fit on block
+    averages, which has no attenuation toward zero from per-pixel noise, and on every call
+    the result's robust 2-98 % range moves by ``range_pull`` toward the current frame's
+    range (``0`` disables this), so the depth range of a long video cannot fade away.
     """
     c = np.asarray(cur, dtype=np.float32)
     if prev is None:
         return c.copy()
-    p = np.asarray(prev, dtype=np.float32)
-    if p.shape != c.shape:
-        p = cv2.resize(p, (c.shape[1], c.shape[0]), interpolation=cv2.INTER_LINEAR)
+    p = _matched(prev, c)
     ema = float(min(max(ema, 0.0), 0.99))
+    pull = float(min(max(range_pull, 0.0), 1.0))
 
-    step = max(1, int(np.sqrt(c.size / 65536)))
-    cs = c[::step, ::step].ravel().astype(np.float64)
-    ps = p[::step, ::step].ravel().astype(np.float64)
-    ok = np.isfinite(cs) & np.isfinite(ps)
-    cs, ps = cs[ok], ps[ok]
+    cs, ps = _paired_samples(c, p)
     a, b = 1.0, 0.0
-    if cs.size >= 16 and cs.std() > 1e-6:
+    r = _correlation(cs, ps)
+    if r is not None:
+        if not r >= SCENE_CUT_CORR:  # a different shot (or an inverted map): start over
+            return c.copy()
         sel = np.ones(cs.size, bool)
-        for _ in range(3):  # IRLS-style trimming of the worst 20% residuals
-            A = np.stack([cs[sel], np.ones(int(sel.sum()))], 1)
-            sol, *_ = np.linalg.lstsq(A, ps[sel], rcond=None)
-            a, b = float(sol[0]), float(sol[1])
+        for _ in range(3):  # trimming of the worst 20% residuals (moving objects)
+            x, y = cs[sel], ps[sel]
+            a = float(y.std() / max(x.std(), 1e-9))
+            b = float(y.mean() - a * x.mean())
             res = np.abs(a * cs + b - ps)
             sel = res <= np.quantile(res, 0.8)
-            if sel.sum() < 16:
+            if sel.sum() < 16 or cs[sel].std() <= 1e-6:
                 break
-        if not np.isfinite(a) or a <= 1e-3:  # degenerate / inverted fit: match moments instead
-            a = float(ps.std() / max(cs.std(), 1e-6))
-            b = float(ps.mean() - a * cs.mean())
+        if not (np.isfinite(a) and np.isfinite(b)) or a <= 1e-3:
+            a, b = 1.0, 0.0
     aligned = a * c + b
     diff = np.abs(aligned - p)
     w = ema * np.exp(-((diff / 0.1) ** 2))
-    out = w * p + (1.0 - w) * aligned
-    return np.clip(np.nan_to_num(out, nan=0.0), 0.0, 1.0).astype(np.float32)
+    out = np.nan_to_num(w * p + (1.0 - w) * aligned, nan=0.0)
+    if pull > 0.0:
+        so, sc = _pixel_sample(out), _pixel_sample(c)
+        if so.size >= 16 and sc.size >= 16:
+            lo_o, hi_o = (float(v) for v in np.percentile(so, [2.0, 98.0]))
+            lo_c, hi_c = (float(v) for v in np.percentile(sc, [2.0, 98.0]))
+            if hi_o - lo_o > 1e-6:
+                lo_t = lo_o + pull * (lo_c - lo_o)
+                hi_t = hi_o + pull * (hi_c - hi_o)
+                out = lo_t + (out - lo_o) * ((hi_t - lo_t) / (hi_o - lo_o))
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
 def depth_edges(inv_z: FloatMap, thresh: float) -> np.ndarray:
@@ -281,6 +360,7 @@ __all__ = [
     "guided_filter",
     "refine",
     "temporal_align",
+    "scene_cut",
     "depth_edges",
     "gray_guide",
     "upsample",

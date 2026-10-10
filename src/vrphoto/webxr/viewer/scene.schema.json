@@ -59,7 +59,8 @@
         "placement": { "enum": ["hit-test", "front-floor"] },
         "distance_m": { "type": "number", "exclusiveMinimum": 0 },
         "alt_assets": { "type": "array", "items": { "type": "string" } },
-        "up": { "enum": ["y", "-y", "z"], "description": "up axis of the asset; default y (glTF)" }
+        "up": { "enum": ["y", "-y", "z"], "description": "up axis of the asset; default y (glTF)" },
+        "scale": { "type": "number", "exclusiveMinimum": 0, "description": "metres per asset unit for an asset that is already real size (e.g. a capture the app scaled to metres): it is shown at this scale instead of being fitted to height_m, which then only names the subject's height" }
       }
     },
     "splat": {

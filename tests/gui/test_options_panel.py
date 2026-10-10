@@ -176,6 +176,31 @@ def test_enabled_if_greys_out_dependent_fields(panel_factory):
     assert p.form.editors["seed"].isEnabled()
 
 
+def test_seed_and_texture_follow_the_method(panel_factory):
+    """SHARP ignores the seed; 'Paint texture' only applies to Hunyuan3D."""
+    p = panel_factory("object", show_experimental=True)
+    for method, seed_on, texture_on in (
+        ("billboard", False, False),
+        ("sharp", False, False),
+        ("trellis", True, False),
+        ("trellis2", True, False),
+        ("hunyuan", True, True),
+    ):
+        p.form.set_values({"method": method})
+        assert p.form.editors["seed"].isEnabled() is seed_on, method
+        assert p.form.editors["hunyuan_texture"].isEnabled() is texture_on, method
+    p.form.set_values({"method": "hunyuan", "hunyuan_texture": True})
+    assert p.build_spec(["x.jpg"]).hunyuan_texture is True
+
+
+def test_capture_subject_height_shows_automatic(panel_factory):
+    p = panel_factory("capture")
+    ed = p.form.editors["subject_height_m"]
+    assert ed.spin.text() == "Automatic" and ed.value() == 0.0
+    p.form.set_values({"subject_height_m": 1.75})
+    assert p.build_spec(["a.jpg", "b.jpg"]).subject_height_m == pytest.approx(1.75)
+
+
 def test_experimental_choices_hidden_unless_enabled(panel_factory):
     p = panel_factory("object")
     vals = p.form.editors["method"].values()

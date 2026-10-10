@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -232,3 +233,153 @@ def test_taskkill_is_absolute_when_available(tmp_path, monkeypatch):
     monkeypatch.setenv("SystemRoot", str(tmp_path / "nope"))
     monkeypatch.delenv("windir", raising=False)
     assert addon_env._taskkill() == "taskkill"
+
+
+# ------------------------------------------------------------------ WIN-3: kill-on-close job object
+@pytest.mark.skipif(sys.maxsize <= 2**32, reason="layout check for 64-bit Windows")
+def test_job_structures_match_windows_x64_layout():
+    import ctypes
+
+    assert ctypes.sizeof(addon_env._JOBOBJECT_BASIC_LIMIT_INFORMATION) == 64
+    assert ctypes.sizeof(addon_env._IO_COUNTERS) == 48
+    assert ctypes.sizeof(addon_env._JOBOBJECT_EXTENDED_LIMIT_INFORMATION) == 144
+    assert addon_env._JOBOBJECT_BASIC_LIMIT_INFORMATION.LimitFlags.offset == 16
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="non-Windows behaviour")
+def test_assign_to_kill_job_is_noop_off_windows():
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        assert addon_env.assign_to_kill_job(p) is False
+    finally:
+        p.wait(10)
+
+
+class _FakeKernel32:
+    def __init__(self, *, create_ok=True, set_ok=True, assign_ok=True):
+        self.create_ok, self.set_ok, self.assign_ok = create_ok, set_ok, assign_ok
+        self.calls: list[tuple] = []
+
+    def CreateJobObjectW(self, attrs, name):  # noqa: N802
+        self.calls.append(("create", attrs, name))
+        return 1234 if self.create_ok else 0
+
+    def SetInformationJobObject(self, job, cls, info, size):  # noqa: N802
+        self.calls.append(("set", job, cls, info._obj.BasicLimitInformation.LimitFlags, size))
+        return 1 if self.set_ok else 0
+
+    def AssignProcessToJobObject(self, job, handle):  # noqa: N802
+        self.calls.append(("assign", job, handle))
+        return 1 if self.assign_ok else 0
+
+    def CloseHandle(self, h):  # noqa: N802
+        self.calls.append(("close", h))
+        return 1
+
+
+@pytest.fixture
+def fake_windows_job(monkeypatch):
+    import ctypes
+
+    def install(**kw):
+        k32 = _FakeKernel32(**kw)
+        monkeypatch.setattr(addon_env, "_IS_WINDOWS", True)
+        monkeypatch.setattr(addon_env, "_kernel32", lambda: k32)
+        monkeypatch.setattr(addon_env, "_kill_job", None)
+        monkeypatch.setattr(addon_env, "_kill_job_failed", False)
+        monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+        monkeypatch.setattr(ctypes, "WinError", lambda code=None: OSError(code, "fake"), raising=False)
+        return k32
+
+    return install
+
+
+def test_assign_to_kill_job_creates_one_kill_on_close_job(fake_windows_job):
+    import ctypes
+    from types import SimpleNamespace
+
+    k32 = fake_windows_job()
+    p1, p2 = SimpleNamespace(_handle=11, pid=1), SimpleNamespace(_handle=22, pid=2)
+    assert addon_env.assign_to_kill_job(p1) is True
+    assert addon_env.assign_to_kill_job(p2) is True
+    kinds = [c[0] for c in k32.calls]
+    assert kinds == ["create", "set", "assign", "assign"]  # one job for the whole app
+    _, job, cls, flags, size = k32.calls[1]
+    assert job == 1234 and cls == 9 and flags == addon_env.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0x2000
+    assert size == ctypes.sizeof(addon_env._JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+    assert k32.calls[2] == ("assign", 1234, 11) and k32.calls[3] == ("assign", 1234, 22)
+    assert "close" not in kinds  # the job handle lives as long as the app
+
+
+def test_assign_to_kill_job_failures_never_raise(fake_windows_job):
+    from types import SimpleNamespace
+
+    k32 = fake_windows_job(set_ok=False)
+    assert addon_env.assign_to_kill_job(SimpleNamespace(_handle=1, pid=1)) is False
+    assert ("close", 1234) in k32.calls  # half-made job is cleaned up
+    assert addon_env.assign_to_kill_job(SimpleNamespace(_handle=1, pid=1)) is False
+    assert [c[0] for c in k32.calls].count("create") == 1  # not retried for every process
+
+    k32 = fake_windows_job(assign_ok=False)
+    assert addon_env.assign_to_kill_job(SimpleNamespace(_handle=1, pid=1)) is False
+    assert addon_env.assign_to_kill_job(SimpleNamespace(pid=1)) is False  # no handle
+
+
+def test_spawned_add_on_processes_join_the_kill_job(monkeypatch, tmp_path):
+    from vrphoto.addons import runner
+
+    seen = []
+    monkeypatch.setattr(runner, "assign_to_kill_job", lambda proc: seen.append(proc.pid) or True)
+    res = runner.run_process([sys.executable, "-c", "print('hi')"], title="t")
+    assert res.ok and len(seen) == 1
+
+
+def _win_pid_alive(pid: int) -> bool:
+    import ctypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = k32.OpenProcess(0x00100000, 0, pid)  # SYNCHRONIZE
+    if not h:
+        return False
+    try:
+        return k32.WaitForSingleObject(h, 0) != 0  # WAIT_OBJECT_0 -> exited
+    finally:
+        k32.CloseHandle(h)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows job objects")
+def test_native_tool_dies_with_the_app_on_windows(tmp_path):
+    """Ending the app in Task Manager (TerminateProcess) must also end COLMAP / Brush."""
+    pid_file = tmp_path / "child.pid"
+    child = f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(120)"
+    app = tmp_path / "app.py"
+    app.write_text(
+        "import sys\n"
+        "from vrphoto.addons.runner import run_process\n"
+        f"run_process([sys.executable, '-c', {child!r}], title='tool')\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen([sys.executable, str(app)])
+    try:
+        deadline = time.monotonic() + 20
+        while not (pid_file.is_file() and pid_file.read_text().strip()):
+            assert time.monotonic() < deadline, "tool did not start"
+            assert proc.poll() is None, "app died early"
+            time.sleep(0.05)
+        pid = int(pid_file.read_text())
+        proc.kill()  # TerminateProcess, like Task Manager's "End task"
+        proc.wait(10)
+        deadline = time.monotonic() + 10
+        while _win_pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _win_pid_alive(pid), "the add-on tool kept running after the app died"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        if pid_file.is_file() and pid_file.read_text().strip():
+            with contextlib.suppress(OSError):
+                os.kill(int(pid_file.read_text()), 9)  # never leave the sleeper behind

@@ -8,6 +8,21 @@ import { disposeVideo, loadEyeTextures, loadVideo } from '../loaders.js';
 import { videoControls } from '../media.js';
 
 const SCREEN_Y = 1.6; // screen centre height; the head is recentered to this height
+// Tallest screen (m): centred at SCREEN_Y its bottom edge stays 0.5 m above the floor, so a
+// portrait photo or vertical phone video does not sink into the real floor in passthrough AR.
+export const MAX_SCREEN_HEIGHT = 2.2;
+
+/**
+ * Screen size for a manifest width and picture aspect (width / height): never taller than
+ * MAX_SCREEN_HEIGHT (the width shrinks to keep the aspect), never wider than ``width`` -
+ * the stereo pair's parallax was limited for that width, so a wider screen could make the
+ * background diverge.
+ */
+export function screenSize(width, aspect) {
+  const a = Number.isFinite(aspect) && aspect > 0 ? aspect : 16 / 9;
+  const height = Math.min(width / a, MAX_SCREEN_HEIGHT);
+  return { width: height * a, height };
+}
 
 /** Plane geometry whose UVs show [u0,u1] x [v0,v1] of a texture. */
 export function screenGeometry(width, height, u0 = 0, u1 = 1, v0 = 0, v1 = 1) {
@@ -43,7 +58,8 @@ export async function load(ctx, scene) {
   let leftGeo;
   let rightGeo;
 
-  const width = cfg.screen_width_m;
+  let width;
+  let height;
   if (cfg.kind === 'video') {
     ctx.progress(-1, 'Opening video…');
     const v = await loadVideo(ctx.asset(cfg.media), { signal: ctx.signal });
@@ -53,10 +69,10 @@ export async function load(ctx, scene) {
     const w = v.width || 16;
     const h = v.height || 9;
     eyeAspect = layout === 'sbs' ? w / 2 / h : layout === 'tb' ? w / (h / 2) : w / h;
-    const aspect = cfg.aspect || eyeAspect;
+    ({ width, height } = screenSize(cfg.screen_width_m, cfg.aspect || eyeAspect));
     const win = eyeWindows(layout);
-    leftGeo = screenGeometry(width, width / aspect, ...win.left);
-    rightGeo = stereo ? screenGeometry(width, width / aspect, ...win.right) : null;
+    leftGeo = screenGeometry(width, height, ...win.left);
+    rightGeo = stereo ? screenGeometry(width, height, ...win.right) : null;
     leftMat = new THREE.MeshBasicMaterial({ map: videoTex, toneMapped: false });
     rightMat = leftMat;
   } else {
@@ -65,16 +81,15 @@ export async function load(ctx, scene) {
       onProgress: (f) => ctx.progress(f < 0 ? -1 : f * 0.95, 'Loading 3D photo…'),
     });
     eyeAspect = tex.eyeWidth / tex.eyeHeight;
-    const aspect = cfg.aspect || eyeAspect;
-    leftGeo = screenGeometry(width, width / aspect);
-    rightGeo = stereo ? screenGeometry(width, width / aspect) : null;
+    ({ width, height } = screenSize(cfg.screen_width_m, cfg.aspect || eyeAspect));
+    leftGeo = screenGeometry(width, height);
+    rightGeo = stereo ? screenGeometry(width, height) : null;
     leftMat = new THREE.MeshBasicMaterial({ map: tex.left, toneMapped: false });
     rightMat = stereo ? new THREE.MeshBasicMaterial({ map: tex.right, toneMapped: false }) : leftMat;
   }
   ctx.checkAborted();
 
   const aspect = cfg.aspect || eyeAspect;
-  const height = width / aspect;
   const left = new THREE.Mesh(leftGeo, leftMat);
   left.name = 'screen-left';
   if (stereo) {

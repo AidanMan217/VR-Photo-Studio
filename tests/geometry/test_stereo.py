@@ -425,3 +425,67 @@ def test_stereo_on_three_layer_cleanplate_uses_visible_depth():
     np.testing.assert_allclose(v[100:, 10:50], 1 / 1.5, rtol=1e-6)  # table, not the band depth
     left, right = stereo_pair(li, StereoParams(convergence_m=4.0, max_parallax_pct=0.0))
     assert left.shape == img.shape and right.shape == img.shape
+
+
+def _portrait_scene() -> LayeredImage:
+    """Subject covering ~half of a portrait frame (near) in front of a far background."""
+    h, w = 400, 300
+    K = Intrinsics.from_hfov(w, h, 52.0)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    person = ((xx - 150) / 110) ** 2 + ((yy - 230) / 190) ** 2 <= 1.0
+    inv = np.full((h, w), 1.0 / 15.0, np.float32)
+    inv[person] = 1.0 / 1.4
+    img = np.full((h, w, 3), 128, np.uint8)
+    return LayeredImage([Layer(img, inv, np.ones((h, w), np.float32))], K)
+
+
+def test_background_never_needs_eye_divergence_on_the_virtual_screen():
+    """F5: auto convergence sits on a big subject, so the background gets uncrossed
+    parallax; on a 3 m wide virtual screen it must stay below the eye separation."""
+    li = _portrait_scene()
+    f, w = li.K.fx, li.K.width
+    p = StereoParams()  # 3 % clamp, viewer screen 3.0 m, IPD 63 mm
+    B, zc = resolve_stereo(li, p)
+    assert zc == pytest.approx(1.4, rel=1e-3)  # converged on the subject
+    far_px = f * B * (1 / zc - 1 / 15.0)
+    on_screen_m = far_px / w * p.screen_width_m
+    assert on_screen_m <= p.ipd_m * (1 + 1e-6)
+    assert far_px == pytest.approx(p.ipd_m / p.screen_width_m * w, rel=1e-4)  # limit is active
+    # a smaller screen allows the full percentage again; screen_width_m <= 0 disables the limit
+    B_small, _ = resolve_stereo(li, StereoParams(screen_width_m=1.5))
+    B_off, _ = resolve_stereo(li, StereoParams(screen_width_m=0.0))
+    assert f * B_small * (1 / zc - 1 / 15.0) == pytest.approx(0.03 * w, rel=1e-4)
+    assert B_off == pytest.approx(B_small)
+    assert B < B_small
+    with pytest.raises(InputError):
+        resolve_stereo(li, StereoParams(screen_width_m=float("nan")))
+
+
+def test_crossed_parallax_keeps_the_full_percentage():
+    """The divergence limit only applies behind the screen: content in front of the
+    convergence plane may still use max_parallax_pct."""
+    li = _blob_scene()
+    f, w = li.K.fx, li.K.width
+    p = StereoParams(ipd_m=0.063, strength=4.0, convergence_m=Z_FAR, max_parallax_pct=3.0, screen_width_m=6.0)
+    B, _ = resolve_stereo(li, p)
+    assert f * B * (1 / Z_NEAR - 1 / Z_FAR) == pytest.approx(0.03 * w, rel=1e-4)
+    # mixed: converged between the planes -> both limits checked, the stricter wins
+    p2 = StereoParams(ipd_m=0.063, strength=4.0, convergence_m=2.5, max_parallax_pct=3.0, screen_width_m=6.0)
+    B2, _ = resolve_stereo(li, p2)
+    near_px = f * B2 * (1 / Z_NEAR - 1 / 2.5)
+    far_px = f * B2 * (1 / 2.5 - 1 / Z_FAR)
+    assert near_px <= 0.03 * w * (1 + 1e-6) and far_px <= 0.063 / 6.0 * w * (1 + 1e-6)
+    assert max(near_px / (0.03 * w), far_px / (0.063 / 6.0 * w)) == pytest.approx(1.0, rel=1e-4)
+
+
+def test_wiggle_amplitude_ignores_the_divergence_limit(monkeypatch):
+    """A wiggle is not fused binocularly: its amplitude follows max_parallax_pct only."""
+    import vrphoto.geometry.stereo as st
+
+    li = _portrait_scene()
+    seen = []
+    real = st.resolve_stereo
+    monkeypatch.setattr(st, "resolve_stereo", lambda li_, p, K=None: seen.append(p) or real(li_, p, K))
+    monkeypatch.setattr(st, "render_filled", lambda li_, pose, K, cancel=None: np.zeros((4, 4, 3), np.uint8))
+    wiggle_frames(li, StereoParams(), n=2)
+    assert seen and seen[0].screen_width_m == 0.0 and seen[0].mode == "flat"

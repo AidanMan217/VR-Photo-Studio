@@ -12,8 +12,19 @@ Pipeline (:func:`capture_to_splat`):
    ``mapper``, ``image_undistorter`` -> ``images/`` + ``sparse/`` (the layout Brush reads).
 3. Brush: headless training (``--total-steps``, single export at the end).
 4. Post-processing with :mod:`vrphoto.geometry.splat`: crop floaters, orient so that the
-   average camera "up" becomes +y with the floor at y = 0, decimate, write ``.splat`` and
-   ``.ply``.
+   average camera "up" becomes +y with the floor at y = 0, give the splat a real-world
+   (metric) scale, decimate, write ``.splat`` and ``.ply`` plus ``<name>.capture.json``.
+
+Scale: photos alone cannot tell COLMAP how big the scene is, so its units are arbitrary
+(about 2 units per metre for a typical walk-around).  The splat is rescaled so the median
+registered camera is ``camera_height_m`` (1.45 m: a phone held at chest/eye height) above
+the floor; if the camera heights are unusable, so that the cameras orbit at about
+``ORBIT_RADIUS_M``.  With ``subject_height_m > 0`` the subject near the centre is made that
+tall instead.  ``<name>.capture.json`` records ``{"scale", "height_m", "method"}`` (plus
+``camera_height_m`` for diagnostics, and ``subject_height_m`` when the subject height was
+given) where ``height_m`` is the height of the written splat's bounding box (splat centres)
+in metres - exactly what the viewer's ``object.height_m`` fits, so the splat keeps its real
+size; it is NOT the subject's height.
 
 The tools come from the ``capture`` add-on (``manifests/capture.toml``); ``VRPHOTO_COLMAP`` /
 ``VRPHOTO_BRUSH`` override their paths (a ``.py`` path runs with the current Python -
@@ -23,6 +34,8 @@ used by the tests with fake tools).
 from __future__ import annotations
 
 import contextlib
+import json
+import math
 import os
 import re
 import shutil
@@ -30,13 +43,14 @@ import struct
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from ..core.errors import AddonError, AddonNotInstalled, InputError
+from ..core.fsutil import atomic_write_bytes
 from ..core.imaging import IMAGE_EXTS, VIDEO_EXTS, is_image, is_video
 from ..core.log import get_logger
 from ..core.types import CancelToken, ProgressReporter
@@ -49,6 +63,8 @@ CAPTURE_ID = "capture"
 MIN_IMAGES = 3
 EXHAUSTIVE_MAX = 100
 UNDISTORT_MAX_PX = 1600
+CAMERA_HEIGHT_M = 1.45  # typical height of a hand-held phone above the floor
+ORBIT_RADIUS_M = 2.0  # typical walk-around radius (User Guide: 1.5-3 m)
 
 
 # --------------------------------------------------------------------------- tools
@@ -438,6 +454,12 @@ def camera_up_vector(images_bin: str | os.PathLike[str]) -> np.ndarray | None:
     return (v / n) if n > 1e-6 else None
 
 
+def camera_centers(images_bin: str | os.PathLike[str]) -> np.ndarray:
+    """World positions (``Nx3``) of the registered cameras: ``C = -R^T t``."""
+    cs = [-_quat_to_R(q).T @ t for _name, q, t in read_images_bin(images_bin)]
+    return np.asarray(cs, dtype=np.float64).reshape(-1, 3)
+
+
 def _best_model(sparse: Path) -> tuple[Path | None, int]:
     best, best_n = None, 0
     if sparse.is_dir():
@@ -492,6 +514,118 @@ def _map_vector_to_cloud(raw_xyz: np.ndarray, cloud_means: np.ndarray, v: np.nda
     out = M[:3].T @ v
     nrm = np.linalg.norm(out)
     return out / nrm if nrm > 1e-9 else v
+
+
+def _fit_affine(src: np.ndarray, dst: np.ndarray, max_n: int = 4096) -> np.ndarray | None:
+    """4x3 matrix ``M`` with ``dst ~= [src, 1] @ M`` for corresponding rows, or None when the
+    rows do not correspond or the fit is ambiguous (degenerate point set)."""
+    src = np.asarray(src, dtype=np.float64).reshape(-1, 3)
+    dst = np.asarray(dst, dtype=np.float64).reshape(-1, 3)
+    n = min(len(src), len(dst))
+    if n < 4:
+        return None
+    idx = np.arange(n)
+    if n > max_n:
+        idx = np.random.default_rng(0).choice(n, max_n, replace=False)
+    a, b = src[idx], dst[idx]
+    ok = np.isfinite(a).all(axis=1) & np.isfinite(b).all(axis=1)
+    a, b = a[ok], b[ok]
+    if len(a) < 4:
+        return None
+    extent = float(np.ptp(b, axis=0).max()) if len(b) else 0.0
+    tol = 1e-4 * max(extent, 1e-9) + 1e-6
+    if np.abs(a - b).max() <= tol:
+        return np.vstack([np.eye(3), np.zeros((1, 3))])
+    A = np.hstack([a, np.ones((len(a), 1))])
+    M, _res, rank, _sv = np.linalg.lstsq(A, b, rcond=None)
+    if rank < 4 or not np.isfinite(M).all() or np.abs(A @ M - b).max() > tol * 10:
+        return None
+    return M
+
+
+def _apply_affine(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    pts = np.asarray(pts, dtype=np.float64).reshape(-1, 3)
+    return np.hstack([pts, np.ones((len(pts), 1))]) @ M
+
+
+def _orbit_radius(cams: np.ndarray) -> float:
+    """Median horizontal distance of the cameras from the subject (the origin after orientation)."""
+    return float(np.median(np.linalg.norm(cams[:, [0, 2]], axis=1)))
+
+
+def _subject_height(means: np.ndarray, cams: np.ndarray | None) -> float:
+    """Robust (2..98 percentile) height of the points in a vertical cylinder around the
+    centre: ``0.3 x`` the camera orbit radius, or the central 30 % of the points."""
+    xz = np.linalg.norm(means[:, [0, 2]], axis=1)
+    central = np.zeros(len(means), bool)
+    if cams is not None and len(cams):
+        central = xz <= 0.3 * _orbit_radius(cams)
+    if central.sum() < 20:
+        central = xz <= np.percentile(xz, 30)
+    if central.sum() < 2:
+        return 0.0
+    lo, hi = np.percentile(means[central, 1], [2, 98])
+    return float(hi - lo)
+
+
+def _valid_scale(s: float | None) -> bool:
+    return s is not None and math.isfinite(s) and 1e-4 < s < 1e4
+
+
+def metric_scale(
+    means: np.ndarray,
+    cams: np.ndarray | None,
+    *,
+    subject_height_m: float = 0.0,
+    camera_height_m: float = CAMERA_HEIGHT_M,
+) -> tuple[float, str]:
+    """Scale factor that makes an oriented capture (y up, floor at y = 0, subject on the
+    y axis) metric, and the method used: ``"subject"`` (subject made ``subject_height_m``
+    tall), ``"camera"`` (median camera ``camera_height_m`` above the floor), ``"radius"``
+    (cameras orbit at :data:`ORBIT_RADIUS_M`) or ``"none"`` (scale 1)."""
+    means = np.asarray(means, dtype=np.float64).reshape(-1, 3)
+    means = means[np.isfinite(means).all(axis=1)]
+    if cams is not None:
+        cams = np.asarray(cams, dtype=np.float64).reshape(-1, 3)
+        cams = cams[np.isfinite(cams).all(axis=1)]
+        if len(cams) < 2:
+            cams = None
+    if subject_height_m and subject_height_m > 0 and len(means) >= 2:
+        h = _subject_height(means, cams)
+        s = subject_height_m / h if h > 1e-9 else None
+        if _valid_scale(s):
+            return float(s), "subject"
+        log.warning("Could not measure the subject height (%.4g); using the camera height instead", h)
+    if cams is not None:
+        heights = cams[:, 1]
+        med_h = float(np.median(heights))
+        r = _orbit_radius(cams)
+        # usable when (nearly) all cameras are above the floor and not implausibly low
+        if med_h > 0 and float(np.mean(heights > 0)) >= 0.8 and med_h >= 0.1 * r:
+            s = camera_height_m / med_h
+            if _valid_scale(s):
+                return float(s), "camera"
+        if r > 1e-9:
+            s = ORBIT_RADIUS_M / r
+            if _valid_scale(s):
+                return float(s), "radius"
+    return 1.0, "none"
+
+
+def _scale_cloud(sc: Any, s: float) -> Any:
+    if s == 1.0:
+        return sc
+    return replace(
+        sc,
+        means=(np.asarray(sc.means, dtype=np.float64) * s).astype(np.float32),
+        scales=(np.asarray(sc.scales, dtype=np.float64) * s).astype(np.float32),
+    )
+
+
+def _bbox_height(sc: Any) -> float:
+    y = np.asarray(sc.means, dtype=np.float64)[:, 1] if len(sc) else np.zeros(1)
+    y = y[np.isfinite(y)]
+    return float(y.max() - y.min()) if len(y) else 0.0
 
 
 def _splat_api() -> Any:
@@ -605,15 +739,26 @@ def capture_to_splat(
     use_gpu: bool | None = None,
     keep_workdir: bool = False,
     timeout: float | None = None,
+    subject_height_m: float = 0.0,
+    camera_height_m: float = CAMERA_HEIGHT_M,
 ) -> Path:
     """Reconstruct a Gaussian splat from photos and/or videos.
 
-    Returns the ``.splat`` path; a ``.ply`` with the same stem is written next to it.
+    Returns the ``.splat`` path; a ``.ply`` with the same stem is written next to it, and
+    ``<name>.capture.json`` with the metric scale applied (see the module docstring).
+    ``subject_height_m`` (> 0) makes the subject near the centre that tall; otherwise the
+    scale comes from the camera heights (``camera_height_m`` above the floor).
     Long-running (minutes to an hour); honours ``cancel`` (kills COLMAP/Brush) and
     reports ``progress``.  Raises :class:`InputError` for unusable inputs and
     :class:`AddonError` (with hints) when reconstruction fails.
     """
     progress = progress or ProgressReporter.null()
+    subject_height_m = float(subject_height_m or 0.0)
+    camera_height_m = float(camera_height_m)
+    if not math.isfinite(subject_height_m) or subject_height_m < 0 or subject_height_m > 1000:
+        raise InputError(f"The subject height must be 0 (automatic) or a positive number of metres (got {subject_height_m}).")
+    if not math.isfinite(camera_height_m) or not 0.05 <= camera_height_m <= 100:
+        raise InputError(f"The camera height must be a positive number of metres (got {camera_height_m}).")
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     photos, videos = _expand_inputs(inputs)
@@ -774,8 +919,15 @@ def capture_to_splat(
         res = runner([*colmap, *colmap_undistort_args(images_dir, model, undist, info=info)], "COLMAP undistortion")
         if not res.ok or not (undist / "sparse").is_dir():
             raise _fail_colmap("image undistortion", res)
-        up_raw = camera_up_vector(undist / "sparse" / "images.bin") if (undist / "sparse" / "images.bin").is_file() \
-            else camera_up_vector(model / "images.bin")
+        images_bin = undist / "sparse" / "images.bin"
+        if not images_bin.is_file():
+            images_bin = model / "images.bin"
+        up_raw = camera_up_vector(images_bin)
+        try:
+            cams_raw: np.ndarray | None = camera_centers(images_bin)
+        except (OSError, struct.error, ValueError) as e:
+            log.debug("cannot read the camera positions (%s)", e)
+            cams_raw = None
         progress(0.60, "Training the splat (Brush)")
         if cancel is not None:
             cancel.check()
@@ -810,17 +962,45 @@ def capture_to_splat(
         if len(sc) == 0:
             raise AddonError("The trained splat is empty.", hint="Try more images or more training steps.")
         up = None
+        raw_xyz: np.ndarray | None = None
+        try:
+            raw_xyz = ply_xyz(ply)
+        except (AddonError, ValueError, KeyError, OSError) as e:
+            log.debug("cannot read the raw PLY positions (%s)", e)
         if up_raw is not None:
-            try:
-                up = _map_vector_to_cloud(ply_xyz(ply), np.asarray(sc.means), up_raw)
-            except (AddonError, ValueError, KeyError, OSError) as e:
-                log.debug("up-vector mapping failed (%s); using the raw vector", e)
-                up = up_raw
+            up = up_raw
+            if raw_xyz is not None:
+                try:
+                    up = _map_vector_to_cloud(raw_xyz, np.asarray(sc.means), up_raw)
+                except (ValueError, np.linalg.LinAlgError) as e:
+                    log.debug("up-vector mapping failed (%s); using the raw vector", e)
+        # camera positions: COLMAP world (= Brush's PLY frame) -> the reader's frame
+        cams: np.ndarray | None = None
+        if cams_raw is not None and len(cams_raw) and raw_xyz is not None:
+            raw_ok = raw_xyz[np.isfinite(raw_xyz).all(axis=1)]  # the reader drops non-finite rows
+            m_read = _fit_affine(raw_ok, np.asarray(sc.means)[: len(raw_ok)])
+            cams = _apply_affine(m_read, cams_raw) if m_read is not None else None
         sc = api.crop_splats(sc, radius_pct=float(crop_pct))
+        before = np.asarray(sc.means)
         sc = api.normalize_orientation(sc, up=up)
+        if cams is not None:  # follow the rotation + floor shift of the orientation step
+            m_orient = _fit_affine(before, np.asarray(sc.means)) if len(before) == len(sc) else None
+            cams = _apply_affine(m_orient, cams) if m_orient is not None else None
+        scale, method = metric_scale(np.asarray(sc.means), cams, subject_height_m=subject_height_m,
+                                     camera_height_m=camera_height_m)
+        sc = _scale_cloud(sc, scale)
         sc = api.decimate_splats(sc, max_n=int(max_splats))
         out_splat = Path(api.write_splats(sc, out_dir / f"{stem}.splat"))
         api.write_splats(sc, out_dir / f"{stem}.ply")
+        height = _bbox_height(sc)
+        info_scale: dict[str, Any] = {"scale": scale, "height_m": round(height, 4), "method": method}
+        if method == "subject":  # the viewer labels the object with its subject's real height
+            info_scale["subject_height_m"] = round(subject_height_m, 4)
+        if cams is not None and len(cams):
+            info_scale["camera_height_m"] = round(float(np.median(cams[:, 1])) * scale, 4)
+        atomic_write_bytes(out_dir / f"{stem}.capture.json", json.dumps(info_scale, indent=2).encode("utf-8"))
+        log.info("Capture scale x%.4g (%s): the splat is %.2f m tall", scale, method, height)
+        sink.write(f"metric scale x{scale:.6g} ({method}); bounding box height {height:.3f} m")
         progress(1.0, f"Splat ready ({len(sc):,} splats)")
         sink.write(f"wrote {out_splat} ({len(sc)} splats)")
         succeeded = True
@@ -857,7 +1037,8 @@ def run_task(
     paths = inputs.get("paths") or inputs.get("inputs") or []
     if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
-    allowed = {"video_fps", "max_images", "steps", "max_splats", "crop_pct", "name", "use_gpu", "keep_workdir"}
+    allowed = {"video_fps", "max_images", "steps", "max_splats", "crop_pct", "name", "use_gpu", "keep_workdir",
+               "subject_height_m", "camera_height_m"}
     unknown = set(params) - allowed
     if unknown:
         raise InputError(f"Unknown capture option(s): {', '.join(sorted(unknown))}")
@@ -869,6 +1050,7 @@ def run_task(
 __all__ = [
     "ColmapInfo",
     "brush_args",
+    "camera_centers",
     "camera_up_vector",
     "capture_to_splat",
     "colmap_feature_args",
@@ -880,6 +1062,7 @@ __all__ = [
     "extract_frames",
     "find_brush",
     "find_colmap",
+    "metric_scale",
     "ply_xyz",
     "read_images_bin",
     "run_task",

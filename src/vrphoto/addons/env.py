@@ -12,10 +12,12 @@ that keep add-on processes windowless and killable as a whole process tree.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import os
 import signal
 import subprocess
 import sys
+import threading
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -204,6 +206,124 @@ def popen_kwargs() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
+# --------------------------------------------------------------------------- Windows kill-on-close job
+# Add-on processes (COLMAP, Brush, Python workers) are put in one Windows Job object with
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.  The job handle is never closed, so when the app
+# process ends for any reason - including a crash or "End task" in Task Manager - Windows
+# closes it and kills every add-on process (and their children) instead of leaving them
+# running hidden on the GPU.  Only the children are assigned, never the app itself, so
+# players / folders opened with os.startfile are not affected.
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+
+
+class _IO_COUNTERS(ctypes.Structure):  # noqa: N801 - Windows SDK name
+    _fields_ = [
+        (name, ctypes.c_uint64)
+        for name in (
+            "ReadOperationCount",
+            "WriteOperationCount",
+            "OtherOperationCount",
+            "ReadTransferCount",
+            "WriteTransferCount",
+            "OtherTransferCount",
+        )
+    ]
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):  # noqa: N801 - Windows SDK name
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):  # noqa: N801 - Windows SDK name
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+_job_lock = threading.Lock()
+_kill_job: int | None = None
+_kill_job_failed = False
+
+
+def _kernel32() -> Any:
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    k32.CreateJobObjectW.restype = ctypes.c_void_p
+    k32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    k32.SetInformationJobObject.restype = ctypes.c_int
+    k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    k32.AssignProcessToJobObject.restype = ctypes.c_int
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    k32.CloseHandle.restype = ctypes.c_int
+    return k32
+
+
+def _get_kill_job() -> int | None:
+    """The process-lifetime kill-on-close job (created on first use), or None if unavailable."""
+    global _kill_job, _kill_job_failed
+    if not _IS_WINDOWS:
+        return None
+    with _job_lock:
+        if _kill_job is not None or _kill_job_failed:
+            return _kill_job
+        try:
+            k32 = _kernel32()
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+            info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not k32.SetInformationJobObject(
+                job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS, ctypes.byref(info), ctypes.sizeof(info)
+            ):
+                err = ctypes.get_last_error()  # type: ignore[attr-defined]
+                k32.CloseHandle(job)
+                raise ctypes.WinError(err)  # type: ignore[attr-defined]
+            _kill_job = int(job)  # deliberately never closed: it closes when the app exits
+        except Exception as e:
+            _kill_job_failed = True
+            log.debug("Cannot create the add-on kill-on-close job object: %s", e)
+        return _kill_job
+
+
+def assign_to_kill_job(proc: subprocess.Popen) -> bool:
+    """Windows: tie ``proc`` (and the processes it starts) to the app's lifetime.
+
+    Returns True when the process was assigned.  Never raises: failures (e.g. an old
+    Windows that forbids nested jobs) are only logged, the process keeps running normally.
+    No-op (False) on other platforms.
+    """
+    if not _IS_WINDOWS:
+        return False
+    handle = getattr(proc, "_handle", None)
+    job = _get_kill_job()
+    if job is None or handle is None:
+        return False
+    try:
+        if _kernel32().AssignProcessToJobObject(job, int(handle)):
+            return True
+        log.debug("AssignProcessToJobObject(%s) failed: WinError %s", proc.pid, ctypes.get_last_error())  # type: ignore[attr-defined]
+    except Exception as e:
+        log.debug("AssignProcessToJobObject(%s) failed: %s", proc.pid, e)
+    return False
+
+
 def kill_orphans(proc: subprocess.Popen) -> None:
     """POSIX: kill what is left of the process group of an exited ``proc`` (grandchildren
     that kept running).  The group id cannot be reused while members exist."""
@@ -299,6 +419,7 @@ def venv_python(venv: str | os.PathLike[str]) -> Path:
 
 __all__ = [
     "LEAKY_VARS",
+    "assign_to_kill_job",
     "clean_env",
     "kill_orphans",
     "kill_process_tree",

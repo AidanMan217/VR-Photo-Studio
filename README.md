@@ -18,7 +18,7 @@ photos are never uploaded anywhere.
 | Mode | What you get | Watch it with | Notes |
 |---|---|---|---|
 | **3D Photo** | A stereo (3D) picture: side-by-side, top-bottom or red/cyan anaglyph | Quest media players, the built-in live viewer, 3D TVs, anaglyph glasses | Fast; works with any photo |
-| **Living Photo** | A short looping video where a virtual camera moves through the photo (flat, 3D or VR180) | Any video player; Quest players for 3D/VR180 | Great for sharing on phones too |
+| **Living Photo** | A short looping video where a virtual camera moves through the photo (flat, 3D or VR180) | Any video player; Quest players for 3D/VR180 | Flat videos are H.264 - great for sharing on phones too |
 | **VR180** | An immersive 180° 3D photo (or short video) in front of you | Quest players, live viewer | The photo keeps its real size; edges can be filled by AI |
 | **360** | A full sphere around you - true 3D from a 360-camera photo, or a sphere built around a normal photo | Quest players, live viewer | 360-camera photos become stereo 3D |
 | **3D Scene** (6DoF) | A walk-in 3D photo: move your head and lean to look around foreground objects | Live viewer in the Quest Browser | "Look behind" uses AI to paint what was hidden |

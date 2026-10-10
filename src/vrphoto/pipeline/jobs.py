@@ -135,6 +135,7 @@ class ObjectJob(JobBase):
     export_splat: bool = True
     placement: str = "hit-test"  # hit-test | front-floor
     seed: int = 0
+    hunyuan_texture: bool = False  # Hunyuan3D add-on: also paint a texture (slower, more VRAM)
 
 
 @dataclass
@@ -148,6 +149,7 @@ class CaptureJob(JobBase):
     max_splats: int = 750_000
     crop_pct: float = 98.0
     as_object: bool = True  # True -> object mode (placed on floor); False -> splat scene
+    subject_height_m: float = 0.0  # 0 = automatic metric scale from the camera height (~1.45 m)
 
 
 @dataclass

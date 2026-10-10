@@ -136,3 +136,57 @@ def test_addon_choice_ids_match_manifests():
             for cands in fm.addon_choices.values():
                 refs.add(cands[0])
     assert refs <= known, f"Unknown add-on ids in options_meta: {sorted(refs - known)}"
+
+
+# --------------------------------------------------------------------------- review fixes
+def test_seed_is_not_offered_for_sharp():
+    """SHARP is deterministic and ignores the seed: 'Variation' must be greyed out for it."""
+    other, allowed = om.JOB_META["object"]["seed"].enabled_if
+    assert other == "method"
+    assert "sharp" not in allowed
+    assert set(allowed) == {"trellis", "trellis2", "hunyuan"}
+
+
+def test_hunyuan_texture_checkbox_only_for_hunyuan():
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    meta = om.JOB_META["object"]["hunyuan_texture"]
+    assert meta.kind == "check"
+    assert meta.enabled_if == ("method", ("hunyuan",))
+    assert meta.advanced  # experimental method: not a greyed-out row in the basic form
+    assert ObjectJob().hunyuan_texture is False  # opt-in: slower, more VRAM, extra download
+
+
+def test_flat_living_photo_is_not_forced_to_hevc():
+    """'Automatic' gives flat videos H.264; no preset may force a Quest HEVC preset onto the
+    default flat (phone / PC) output."""
+    from vrphoto.pipeline.jobs import ParallaxJob
+
+    assert ParallaxJob().output == "flat" and ParallaxJob().encoder_preset == "auto"
+    for name, values in om.PRESETS["parallax"].items():
+        assert "hevc" not in str(values.get("encoder_preset", "auto")), name
+    tip = om.JOB_META["parallax"]["encoder_preset"].tooltip
+    assert "H.264" in tip and "flat" in tip.lower()
+    assert "1920" in om.JOB_META["parallax"]["width"].tooltip
+
+
+def test_object_comfortable_preset_is_thinner_than_default():
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    presets = om.PRESETS["object"]
+    assert presets["Comfortable"]["thickness"] < ObjectJob().thickness < presets["Strong 3D"]["thickness"]
+
+
+def test_scene_detail_is_described_as_a_total():
+    """The 'Detail' budget covers the whole scene, not each layer."""
+    tip = om.JOB_META["scene"]["target_faces"].tooltip
+    assert "in total" in tip and "all layers" in tip
+
+
+def test_capture_subject_height_defaults_to_automatic():
+    from vrphoto.pipeline.jobs import CaptureJob
+
+    meta = om.JOB_META["capture"]["subject_height_m"]
+    assert CaptureJob().subject_height_m == 0.0
+    assert meta.kind == "spin" and meta.minimum == 0 and meta.zero_label == "Automatic"
+    assert meta.unit == "m" and meta.advanced

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import subprocess
 import sys
+import types
 from datetime import datetime
 from pathlib import Path
 
@@ -89,6 +91,8 @@ GOOD = [
     base(
         "object", {"asset": "thing.spz", "format": "spz"}, env={"prefer": "ar", "background": "passthrough"}
     ),
+    # a capture the app already scaled to metres: shown 1:1, height_m names the subject
+    base("object", {"asset": "capture.splat", "format": "splat", "scale": 1.0, "height_m": 1.7}),
     base("splat", {"asset": "room.ply", "format": "ply", "up": "-y", "scale": 0.5}),
     base(
         "splat",
@@ -126,7 +130,7 @@ P3 = GOOD[0]
 ST = GOOD[2]
 SP = GOOD[5]
 OB = GOOD[8]
-SL = GOOD[10]
+SL = GOOD[11]
 
 BAD = [
     bad("not an object", ["a"]),
@@ -170,6 +174,8 @@ BAD = [
     bad("object height negative", _with(OB, "object.height_m", -1.7)),
     bad("object alt not list", _with(OB, "object.alt_assets", "x.splat")),
     bad("object bad up", _with(OB, "object.up", "x")),
+    bad("object scale zero", _with(OB, "object.scale", 0)),
+    bad("object scale text", _with(OB, "object.scale", "1")),
     bad("splat glb format", _with(SL, "splat.format", "glb")),
     bad("splat bad up", _with(SL, "splat.up", "x")),
     bad("splat scale zero", _with(SL, "splat.scale", 0)),
@@ -383,6 +389,92 @@ def test_export_scene_same_source_and_destination(tmp_path):
     d = sc.export_scene(m, {"w.splat": b"abc"}, library=tmp_path)
     sc.export_scene(m, {"w.splat": d / "w.splat"}, library=tmp_path)
     assert (d / "w.splat").read_bytes() == b"abc"
+
+
+def test_export_scene_hard_links_assets_on_the_same_volume(tmp_path):
+    """E2E-5: the library must not silently keep a second full copy of every video."""
+    out = tmp_path / "out" / "clip_LR.mp4"
+    out.parent.mkdir()
+    out.write_bytes(b"video" * 1000)
+    m = {
+        "id": "clip",
+        "title": "C",
+        "mode": "stereo",
+        "stereo": {"media": "clip_LR.mp4", "kind": "video", "layout": "sbs"},
+    }
+    d = sc.export_scene(m, {"clip_LR.mp4": out}, library=tmp_path / "lib")
+    assert os.path.samefile(d / "clip_LR.mp4", out)
+    assert os.stat(out).st_nlink == 2
+    assert not [p for p in d.iterdir() if p.name.startswith(".")]
+    # deleting the output keeps the scene playable, and vice versa
+    out.unlink()
+    assert (d / "clip_LR.mp4").read_bytes() == b"video" * 1000
+    sc.delete_scene("clip", library=tmp_path / "lib")
+    assert not d.exists()
+
+
+def test_export_scene_copies_when_hard_links_fail(tmp_path, monkeypatch):
+    src = tmp_path / "w_src.splat"
+    src.write_bytes(b"splat")
+
+    def no_link(a, b):
+        Path(b).write_bytes(b"partial")  # a failing link must not leave a temp file behind
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(sc.os, "link", no_link)
+    m = {"id": "copy", "title": "C", "mode": "splat", "splat": {"asset": "w.splat", "format": "splat"}}
+    d = sc.export_scene(m, {"w.splat": src}, library=tmp_path / "lib")
+    assert (d / "w.splat").read_bytes() == b"splat"
+    assert not os.path.samefile(d / "w.splat", src)
+    assert not [p for p in d.iterdir() if p.name.startswith(".")]
+
+
+@pytest.mark.parametrize("how", ["env", "attribute"])
+def test_export_scene_never_hard_links_a_onedrive_output(tmp_path, monkeypatch, how):
+    """E2E-5: OneDrive (Pictures is often backed up there) cannot sync a file that has a
+    second hard link outside its folder, so outputs in a cloud-synced folder are copied."""
+    cloud = tmp_path / "OneDrive"
+    src = cloud / "Pictures" / "clip_LR.mp4"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"video")
+    monkeypatch.setattr(sc.sys, "platform", "win32")
+    for var in sc._ONEDRIVE_VARS:
+        monkeypatch.delenv(var, raising=False)
+    if how == "env":
+        monkeypatch.setenv("OneDrive", str(cloud))
+    else:  # e.g. Dropbox: the folders are cloud-files placeholders
+        monkeypatch.setattr(sc, "_cloud_marked", lambda p: Path(p) == cloud.resolve())
+    links: list = []
+    real_link = os.link
+    monkeypatch.setattr(sc.os, "link", lambda a, b: links.append((a, b)))
+    m = {"id": "od", "title": "C", "mode": "stereo", "stereo": {"media": "clip_LR.mp4", "kind": "video", "layout": "sbs"}}
+    d = sc.export_scene(m, {"clip_LR.mp4": src}, library=tmp_path / "lib")
+    assert links == []
+    assert (d / "clip_LR.mp4").read_bytes() == b"video"
+    assert not os.path.samefile(d / "clip_LR.mp4", src)
+    # an output outside the synced folder is still linked
+    other = tmp_path / "out" / "x_LR.mp4"
+    other.parent.mkdir()
+    other.write_bytes(b"other")
+    monkeypatch.setattr(sc.os, "link", real_link)
+    m2 = {**m, "id": "local", "stereo": {**m["stereo"], "media": "x_LR.mp4"}}
+    d2 = sc.export_scene(m2, {"x_LR.mp4": other}, library=tmp_path / "lib")
+    assert os.path.samefile(d2 / "x_LR.mp4", other)
+
+
+def test_cloud_marked_reads_windows_placeholder_attributes(monkeypatch):
+    def fake_stat(attrs=0, tag=0):
+        return lambda p, follow_symlinks=True: types.SimpleNamespace(st_file_attributes=attrs, st_reparse_tag=tag)
+
+    for attrs, tag, want in [
+        (0x10, 0, False),  # plain folder
+        (0x10 | 0x400, 0xA0000003, False),  # junction (mount point), not a cloud file
+        (0x10 | 0x400, 0x9000701A, True),  # IO_REPARSE_TAG_CLOUD_7
+        (0x20 | 0x400000, 0, True),  # RECALL_ON_DATA_ACCESS (online-only file)
+        (0x20 | 0x80000, 0, True),  # PINNED ("always keep on this device")
+    ]:
+        monkeypatch.setattr(sc, "os", types.SimpleNamespace(stat=fake_stat(attrs, tag)))
+        assert sc._cloud_marked(Path("x")) is want, (hex(attrs), hex(tag))
 
 
 @pytest.mark.parametrize(

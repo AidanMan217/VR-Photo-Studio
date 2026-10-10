@@ -205,3 +205,144 @@ def test_common_rejects_bad_requests(stdin, expect):
     msgs = [m for m in map(protocol.decode, lines) if m]
     assert res.returncode == 1
     assert msgs and msgs[-1]["type"] == "error" and expect in msgs[-1]["message"]
+
+
+# ------------------------------------------------------------------ trellis2: remote-code import check
+@pytest.fixture
+def t2(monkeypatch):
+    """trellis2_worker with a stand-in for transformers.dynamic_module_utils.check_imports
+    (same contract: raise ImportError for missing packages, return relative imports)."""
+    import types
+
+    monkeypatch.syspath_prepend(str(workers_dir()))
+    sys.modules.pop("trellis2_worker", None)
+
+    def check_imports(filename):
+        tree = ast.parse(Path(filename).read_text(encoding="utf-8"))
+        absolute, relative = [], []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                absolute += [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                (relative if node.level else absolute).append((node.module or "").split(".")[0])
+        missing = []
+        for mod in absolute:
+            try:
+                importlib.import_module(mod)
+            except ImportError:
+                missing.append(mod)
+        if missing:
+            raise ImportError(
+                "This modeling file requires the following packages that were not found in your "
+                f"environment: {', '.join(missing)}. Run `pip install {' '.join(missing)}`"
+            )
+        return relative
+
+    tf = types.ModuleType("transformers")
+    dmu = types.ModuleType("transformers.dynamic_module_utils")
+    dmu.check_imports = check_imports
+    tf.dynamic_module_utils = dmu
+    monkeypatch.setitem(sys.modules, "transformers", tf)
+    monkeypatch.setitem(sys.modules, "transformers.dynamic_module_utils", dmu)
+    return importlib.import_module("trellis2_worker")
+
+
+def _birefnet_folder(root: Path, config_import: str = "json") -> Path:
+    import json
+
+    d = root / "MODELS" / "RMBG-2.0"
+    d.mkdir(parents=True)
+    (d / "config.json").write_text(json.dumps({"auto_map": {
+        "AutoConfig": "BiRefNet_config.BiRefNetConfig",
+        "AutoModelForImageSegmentation": "birefnet.BiRefNet",
+    }}), encoding="utf-8")
+    (d / "birefnet.py").write_text("import os\nfrom .BiRefNet_config import BiRefNetConfig\n", encoding="utf-8")
+    (d / "BiRefNet_config.py").write_text(f"import {config_import}\nclass BiRefNetConfig: pass\n", encoding="utf-8")
+    (d / "handler.py").write_text("import not_needed_for_loading_xyz\n", encoding="utf-8")  # not in auto_map
+    return d
+
+
+def test_trellis2_remote_code_check_ok(t2, tmp_path):
+    assert t2.check_remote_code(_birefnet_folder(tmp_path)) is None
+    assert t2.check_remote_code(tmp_path / "nothing_downloaded") is None
+
+
+def test_trellis2_remote_code_check_reports_missing_package(t2, tmp_path):
+    """A package missing for the (relatively imported) model code fails the install check."""
+    msg = t2.check_remote_code(_birefnet_folder(tmp_path, config_import="einops_missing_for_test_xyz"))
+    assert msg and "einops_missing_for_test_xyz" in msg and "BiRefNet_config.py" in msg
+
+
+def test_trellis2_check_includes_remote_code(t2, tmp_path, monkeypatch):
+    assert "einops" in t2._IMPORTS
+    _birefnet_folder(tmp_path, config_import="einops_missing_for_test_xyz")
+    monkeypatch.setenv("VRPHOTO_ADDON_DIR", str(tmp_path))
+    monkeypatch.setattr(t2, "cuda_info", lambda require: {})
+    monkeypatch.setattr(t2, "_IMPORTS", ())
+    monkeypatch.setattr(t2, "_setup_path", lambda: tmp_path)
+    with pytest.raises(t2.WorkerError, match="BiRefNet.*einops_missing_for_test_xyz"):
+        t2.check(require_gpu=False)
+
+
+# ------------------------------------------------------------------ hunyuan: texture painting
+@pytest.fixture
+def hy(monkeypatch, tmp_path):
+    monkeypatch.syspath_prepend(str(workers_dir()))
+    monkeypatch.setenv("HY3DGEN_MODELS", str(tmp_path / "models"))
+    sys.modules.pop("hunyuan_worker", None)
+    return importlib.import_module("hunyuan_worker")
+
+
+class _Rec:
+    def __init__(self):
+        self.events = []
+
+    def __call__(self, frac, msg=""):
+        self.events.append((frac, msg))
+
+
+def test_hunyuan_texture_flag(hy):
+    assert hy.flag({}, "texture") is False
+    assert hy.flag({"texture": True}, "texture") is True
+    assert hy.flag({"texture": "false"}, "texture") is False  # bool("false") would be True
+    assert hy.flag({"texture": "1"}, "texture") is True
+    with pytest.raises(hy.WorkerError, match="Invalid value"):
+        hy.flag({"texture": "maybe"}, "texture")
+
+
+def test_hunyuan_paint_models_download_once_with_progress(hy, tmp_path):
+    calls = []
+
+    def fake_download(*, repo_id, allow_patterns, local_dir, max_workers):
+        calls.append((repo_id, tuple(allow_patterns)))
+        for sub in (hy.DELIGHT_SUBFOLDER, hy.PAINT_SUBFOLDER):
+            (Path(local_dir) / sub).mkdir(parents=True, exist_ok=True)
+            (Path(local_dir) / sub / "model.safetensors").write_bytes(b"x" * 10)
+
+    rec = _Rec()
+    local = hy.ensure_paint_models(rec, download=fake_download)
+    assert local == tmp_path / "models" / "tencent" / "Hunyuan3D-2"  # where from_pretrained looks first
+    assert calls == [("tencent/Hunyuan3D-2", ("hunyuan3d-delight-v2-0/*", "hunyuan3d-paint-v2-0-turbo/*"))]
+    assert rec.events and rec.events[-1][0] == 1.0
+    assert (local / hy.PAINT_COMPLETE).is_file()
+    assert hy.ensure_paint_models(rec, download=fake_download) == local
+    assert len(calls) == 1  # second textured run: no network
+
+
+def test_hunyuan_paint_models_download_failure(hy):
+    def offline(**kw):
+        raise OSError("Temporary failure in name resolution")
+
+    with pytest.raises(hy.WorkerError, match="could not be downloaded") as ei:
+        hy.ensure_paint_models(_Rec(), download=offline)
+    assert "internet" in ei.value.hint
+
+    with pytest.raises(hy.WorkerError, match="incomplete"):
+        hy.ensure_paint_models(_Rec(), download=lambda **kw: None)
+    assert not (hy.paint_models_dir() / hy.PAINT_COMPLETE).exists()
+
+
+def test_hunyuan_manifest_explains_texture_option():
+    m = load_manifest(manifests_dir() / "hunyuan.toml")
+    assert "Paint texture" in m.notes and "first textured run" in m.notes
+    assert any(s.get("optional") and "custom_rasterizer" in " ".join(s.get("packages", [])) for s in m.steps)

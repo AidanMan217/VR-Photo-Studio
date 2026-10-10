@@ -6,7 +6,10 @@
   distance ``Zc`` lands on the same pixel in both views and
   ``u_L - u_R = f*B*(1/Z - 1/Zc)`` (> 0 = crossed = in front of the screen).
   ``Zc`` defaults to the 35th-percentile depth; if the largest |parallax| exceeds
-  ``max_parallax_pct`` % of the width, ``B`` is scaled down.
+  ``max_parallax_pct`` % of the width, ``B`` is scaled down.  Uncrossed parallax (behind
+  the screen) is further limited to ``ipd_m / screen_width_m`` of the width: on a screen
+  ``screen_width_m`` wide, more than one eye separation of on-screen parallax would make
+  the eyes diverge (look "beyond infinity") to fuse the background.
 * VR mode: parallel eyes (``Zc = inf``) with ``B = ipd``.
 * Eyes are rendered as ``render_view(li, Pose.translate(-/+ B/2, 0, 0), K_eye)``
   (left eye at ``x = -B/2``).
@@ -117,7 +120,12 @@ def resolve_stereo(
     """Effective ``(baseline_m, convergence_m)`` for ``params`` (convergence inf in VR mode).
 
     Flat mode applies auto convergence and the parallax clamp (measured in pixels of
-    ``dst_K``, default ``li.K``).  ``max_parallax_pct <= 0`` disables the clamp.
+    ``dst_K``, default ``li.K``): crossed parallax (in front of the screen) is limited to
+    ``max_parallax_pct`` % of the width, uncrossed parallax (behind the screen) to
+    ``min(max_parallax_pct / 100, ipd_m / screen_width_m)`` of the width, so the
+    background never needs eye divergence on a ``screen_width_m`` wide virtual screen.
+    ``max_parallax_pct <= 0`` disables the clamp; ``screen_width_m <= 0`` disables only
+    the divergence limit.
     """
     if params.ipd_m <= 0 or not math.isfinite(params.ipd_m):
         raise InputError(f"Eye distance (IPD) must be positive (got {params.ipd_m} m).")
@@ -140,13 +148,39 @@ def resolve_stereo(
         v = _finite_positive(w)
         if v.size:
             inv_c = 0.0 if math.isinf(zc) else 1.0 / zc
-            span = max(abs(float(v.max()) - inv_c), abs(float(v.min()) - inv_c))
-            pmax = K.fx * B * span
+            crossed = K.fx * B * max(0.0, float(v.max()) - inv_c)  # nearest content, px
+            uncrossed = K.fx * B * max(0.0, inv_c - float(v.min()))  # farthest content, px
             limit = params.max_parallax_pct / 100.0 * K.width
-            if pmax > limit > 0:
-                log.debug("Parallax %.1f px exceeds %.1f px; scaling baseline down", pmax, limit)
-                B *= limit / pmax
+            far_limit = uncrossed_limit(params) * K.width
+            scale = 1.0
+            if crossed > limit > 0:
+                scale = limit / crossed
+            if uncrossed > far_limit > 0:
+                scale = min(scale, far_limit / uncrossed)
+            if scale < 1.0:
+                log.debug(
+                    "Parallax %.1f / -%.1f px exceeds %.1f / -%.1f px; scaling baseline by %.3f",
+                    crossed, uncrossed, limit, far_limit, scale,
+                )  # fmt: skip
+                B *= scale
     return B, zc
+
+
+def uncrossed_limit(params: StereoParams) -> float:
+    """Largest allowed uncrossed (behind-the-screen) parallax, as a fraction of the width.
+
+    ``min(max_parallax_pct / 100, ipd_m / screen_width_m)``: on a virtual screen
+    ``screen_width_m`` wide, a parallax wider than the eye separation would force the
+    eyes to diverge.  ``screen_width_m <= 0`` means "unknown screen" (only the
+    percentage applies).
+    """
+    frac = float(params.max_parallax_pct) / 100.0
+    sw = float(params.screen_width_m or 0.0)
+    if not math.isfinite(sw):
+        raise InputError(f"Screen width must be a finite number of metres (got {sw}).")
+    if sw > 0:
+        frac = min(frac, float(params.ipd_m) / sw)
+    return frac
 
 
 def _eye_K(K: Intrinsics, x_m: float, zc: float) -> Intrinsics:
@@ -312,13 +346,15 @@ def wiggle_frames(
     The camera follows ``x_i = -(B/2) cos(2 pi i / n)`` (starts at the left eye, reaches
     the right eye at ``i = n/2``) with the flat-mode convergence pivot, so the
     convergence plane stays still while nearer / farther content rocks.  Always uses
-    flat-mode baseline/convergence (a wiggle is viewed on a flat screen).
+    flat-mode baseline/convergence (a wiggle is viewed on a flat screen).  The divergence
+    limit of :func:`resolve_stereo` does not apply: a wiggle is watched with both eyes on
+    the same frame, never fused as a stereo pair.
     """
     if int(n) < 2:
         raise InputError("A wiggle animation needs at least 2 frames.")
     n = int(n)
     K = dst_K if dst_K is not None else li.K
-    flat = dataclasses.replace(params, mode="flat")
+    flat = dataclasses.replace(params, mode="flat", screen_width_m=0.0)
     B, zc = resolve_stereo(li, flat, K)
     frames: list[RGB] = []
     for i in range(n):
@@ -337,6 +373,7 @@ __all__ = [
     "compose",
     "wiggle_frames",
     "resolve_stereo",
+    "uncrossed_limit",
     "eye_views",
     "visible_inv_z",
     "layout_size",

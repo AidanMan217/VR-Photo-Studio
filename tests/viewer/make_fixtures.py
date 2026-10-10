@@ -7,8 +7,9 @@ Usage::
 Scenes are written with :func:`vrphoto.webxr.scene.export_scene`, so this also exercises the
 exporter.  Everything is synthetic and tiny (a few hundred KB): a two-layer photo3d GLB, SBS
 stereo image (+ a VP8 WebM video when ffmpeg has libvpx), VR180 SBS, 360 mono with a depth map,
-a box "object" as GLB and as .splat, and a small splat "room".  Those use an inline GLB writer
-(KHR_materials_unlit textured quads) and .splat writer, so they never depend on other modules.
+a box "object" as GLB and as .splat, a small splat "room" and a capture-like real-size splat
+object (person + floor + stray floaters).  Those use an inline GLB writer (KHR_materials_unlit
+textured quads) and .splat writer, so they never depend on other modules.
 
 Integration scenes (``fx-real-*``) are additionally built with the app's own geometry code -
 ``geometry.mesh.layered_meshes``, ``geometry.billboard.billboard``, ``geometry.gltf.write_glb``
@@ -48,6 +49,7 @@ SCENE_IDS = [
     "fx-object-glb",
     "fx-object-splat",
     "fx-splat",
+    "fx-capture-object",
 ]
 #: Scenes built with the app's geometry modules (see the module docstring).
 REAL_SCENE_IDS = ["fx-real-photo3d", "fx-real-object", "fx-real-splat-ply"]
@@ -269,6 +271,37 @@ def splat_room(n: int = 6000) -> bytes:
         .astype(np.uint8)
     )
     return splat_bytes(p, cols, 0.07, 0.95)
+
+
+def capture_object() -> bytes:
+    """What a capture looks like after the app scaled it to metres: a 1.7 m "person" at the
+    origin standing on a 1.5 m floor disc (floor at y = 0), plus a few stray floater splats far
+    away / below the floor that must not change its size, centre or floor."""
+    rng = np.random.default_rng(3)
+    n_person, n_floor = 3500, 4450
+    t = rng.uniform(0, 2 * math.pi, n_person)
+    y = rng.uniform(0.0, 1.7, n_person)
+    r = 0.16 + 0.04 * np.sin(y * 7)
+    person = np.stack([r * np.cos(t), y, r * np.sin(t)], 1)
+    rf = 1.5 * np.sqrt(rng.uniform(0, 1, n_floor))
+    tf = rng.uniform(0, 2 * math.pi, n_floor)
+    floor = np.stack([rf * np.cos(tf), rng.normal(0, 0.003, n_floor), rf * np.sin(tf)], 1)
+    floaters = np.array(
+        [[5.5, -1.0, 0.4], [6.0, 3.5, -0.5], [4.8, -0.9, 5.0], [6.2, -1.1, 4.4], [5.1, 3.9, 5.6]] * 6
+    )
+    pts = np.concatenate([person, floor, floaters])
+    cols = (
+        np.concatenate(
+            [
+                np.tile([[200, 90, 70]], (n_person, 1)) + rng.integers(0, 40, (n_person, 3)),
+                np.tile([[90, 100, 110]], (n_floor, 1)) + rng.integers(0, 30, (n_floor, 3)),
+                np.tile([[250, 250, 250]], (len(floaters), 1)),
+            ]
+        )
+        .clip(0, 255)
+        .astype(np.uint8)
+    )
+    return splat_bytes(pts.astype(np.float32), cols, 0.025, 0.95)
 
 
 # --------------------------------------------------------------------------- video
@@ -555,6 +588,27 @@ def build_library(out: Path, *, real: bool = True) -> list[str]:
         },
         {"room.splat": splat_room()},
         gradient(90, 160, (120, 100, 128), (180, 140, 160)),
+    )
+
+    export(
+        {
+            "id": "fx-capture-object",
+            "title": "Fixture: captured person (real size)",
+            "mode": "object",
+            # as the pipeline writes a capture: the splat is already in metres (scale 1) and
+            # height_m names the subject's height (here a person, plus floor and floaters)
+            "object": {
+                "asset": "capture.splat",
+                "format": "splat",
+                "pivot": "base",
+                "placement": "hit-test",
+                "scale": 1.0,
+                "height_m": 1.7,
+            },
+            "env": {"prefer": "ar", "background": "passthrough"},
+        },
+        {"capture.splat": capture_object()},
+        gradient(96, 64, (200, 90, 70), (90, 100, 110)),
     )
     if real:
         build_real_scenes(export)

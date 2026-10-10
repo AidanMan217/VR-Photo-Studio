@@ -379,3 +379,48 @@ def test_mirror_billboard_embeds_one_texture(person_alpha, tmp_path):
     doc, _, _ = parse_glb(write_glb(bb, tmp_path / "m.glb"))
     assert len(doc["images"]) == 1 and doc["images"][0]["mimeType"] == "image/png"
     assert [m["alphaMode"] for m in doc["materials"]] == ["MASK", "MASK"]
+
+
+def _flaky_replace(monkeypatch, fails: int = 2) -> list:
+    """os.replace that hits a Windows sharing violation ``fails`` times, then works."""
+    import os
+    import sys
+
+    from vrphoto.core import fsutil
+
+    real = os.replace
+    calls: list = []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) <= fails:
+            raise PermissionError(32, "The process cannot access the file", str(dst))
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(fsutil.time, "sleep", lambda s: None)
+    return calls
+
+
+def test_writers_wait_out_a_briefly_locked_file(scene_meshes, tmp_path, monkeypatch):
+    """WIN-2: antivirus / the Search indexer briefly lock fresh files on Windows; the
+    final rename retries instead of failing the job."""
+    calls = _flaky_replace(monkeypatch)
+    glb = write_glb(scene_meshes, tmp_path / "s.glb")
+    assert len(calls) == 3 and glb.is_file()
+    calls.clear()
+    obj = write_obj(scene_meshes, tmp_path / "s.obj")  # textures may be renamed into place too
+    assert len(calls) >= 3 and Path(calls[-1]).name == "s.obj" and obj.is_file()
+    monkeypatch.undo()
+    assert len(read_glb_meshes(glb)) == 2
+    assert not list(tmp_path.glob("*.part")) and not list(tmp_path.glob("*.tmp"))
+
+
+def test_writers_report_a_busy_file(scene_meshes, tmp_path, monkeypatch):
+    _flaky_replace(monkeypatch, fails=10_000)
+    with pytest.raises(GltfError) as ei:
+        write_glb(scene_meshes, tmp_path / "busy.glb")
+    assert "busy" in (ei.value.hint or "")
+    monkeypatch.undo()
+    assert not (tmp_path / "busy.glb").exists() and not list(tmp_path.glob("*.part"))

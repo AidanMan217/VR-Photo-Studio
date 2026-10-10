@@ -124,8 +124,11 @@ def estimate_intrinsics(
 
     Priority: explicit ``hfov_deg`` > ``depth.intrinsics`` (models that estimate the
     camera, e.g. MoGe; rescaled to the image size) > ``exif_hfov`` > ``default_hfov``.
-    An explicit but invalid ``hfov_deg`` raises :class:`InputError`; an implausible
-    EXIF value is ignored with a warning.
+    ``hfov_deg`` and ``exif_hfov`` are horizontal fields of view of the displayed image;
+    ``default_hfov`` applies to the LONG side (a typical camera is ~65 deg across its
+    long side whichever way the photo is held), so an EXIF-less portrait photo gets 65 deg
+    vertically, not horizontally.  An explicit but invalid ``hfov_deg`` raises
+    :class:`InputError`; an implausible EXIF value is ignored with a warning.
     """
     try:
         if len(img_shape) < 2:
@@ -161,7 +164,11 @@ def estimate_intrinsics(
     df = _as_float(default_hfov, "Default field of view")
     if not _valid_hfov(df):
         raise InputError(f"Default field of view {default_hfov} deg is not valid.")
-    return Intrinsics.from_hfov(w, h, df)
+    if w >= h:
+        return Intrinsics.from_hfov(w, h, df)
+    # portrait: the default spans the long (vertical) side; square pixels, centred
+    f = (h / 2.0) / math.tan(math.radians(df) / 2.0)
+    return Intrinsics(f, f, w / 2.0, h / 2.0, w, h)
 
 
 __all__ = ["unproject", "project", "cv_to_gltf", "gltf_to_cv", "estimate_intrinsics", "pixel_grid"]

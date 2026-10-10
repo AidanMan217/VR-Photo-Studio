@@ -103,7 +103,7 @@ def fake_tools(monkeypatch, tmp_path):
     monkeypatch.setenv("VRPHOTO_BRUSH", str(FAKES / "fake_brush.py"))
     monkeypatch.setenv("FAKE_TOOL_LOG", str(log))
     for k in ("FAKE_REG", "FAKE_GLOBAL_REG", "FAKE_NO_GLOBAL", "FAKE_GLOBAL_FAIL", "FAKE_GPU_FAIL", "FAKE_LEGACY",
-              "FAKE_BRUSH_SLEEP", "FAKE_BRUSH_FAIL"):
+              "FAKE_BRUSH_SLEEP", "FAKE_BRUSH_FAIL", "FAKE_CAMS", "FAKE_BRUSH_PLY"):
         monkeypatch.delenv(k, raising=False)
     capture._info_cache.clear()
     splat = FakeSplat()
@@ -509,3 +509,185 @@ def test_capture_unicode_photo_names_reach_colmap_as_ascii(fake_tools, tmp_path)
     work = next((tmp_path / "out").glob(".capture_work_*"))
     names = [f.name for f in (work / "images").rglob("*.jpg")]
     assert len(names) == 4 and all(n.isascii() for n in names)
+
+
+# ------------------------------------------------------------------ F2: metric scale
+def _rot_to_quat(R: np.ndarray) -> list[float]:
+    """Rotation matrix -> (w, x, y, z) (Shepperd), inverse of capture._quat_to_R."""
+    t = np.trace(R)
+    if t > 0:
+        w = np.sqrt(1 + t) / 2
+        q = [w, (R[2, 1] - R[1, 2]) / (4 * w), (R[0, 2] - R[2, 0]) / (4 * w), (R[1, 0] - R[0, 1]) / (4 * w)]
+    else:
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        r = np.sqrt(1 + R[i, i] - R[j, j] - R[k, k])
+        v = np.zeros(3)
+        v[i] = r / 2
+        v[j] = (R[j, i] + R[i, j]) / (2 * r)
+        v[k] = (R[k, i] + R[i, k]) / (2 * r)
+        q = [(R[k, j] - R[j, k]) / (2 * r), *v]
+    return [float(x) for x in q]
+
+
+def _yaw(deg: float) -> np.ndarray:
+    a = np.radians(deg)
+    return np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
+
+
+UNITS_PER_M = 2.2  # COLMAP's arbitrary scale in the synthetic capture
+PERSON_M = 1.7
+# metric "gravity" frame (y up, floor y=0) -> COLMAP world (up = -y, yawed, shifted, scaled)
+R_WG = np.diag([1.0, -1.0, -1.0]) @ _yaw(30)
+T_WG = np.array([1.0, 0.5, -2.0])
+
+
+def _to_world(p: np.ndarray) -> np.ndarray:
+    return UNITS_PER_M * (np.asarray(p, float) @ R_WG.T) + T_WG
+
+
+def _synthetic_capture(tmp_path: Path, monkeypatch) -> None:
+    """A person (1.7 m) on a floor with a wall behind, seen by 24 phones orbiting at 2 m and
+    1.2 / 1.7 m height (median 1.45 m), in COLMAP's arbitrary frame (2.2 units per metre)."""
+    rng = np.random.default_rng(3)
+    a, r = rng.uniform(0, 2 * np.pi, 6000), 3.0 * np.sqrt(rng.uniform(0, 1, 6000))
+    floor = np.stack([r * np.cos(a), np.zeros(6000), r * np.sin(a)], 1)
+    a2 = rng.uniform(0, 2 * np.pi, 4000)
+    person = np.stack([0.2 * np.cos(a2), rng.uniform(0, PERSON_M, 4000), 0.2 * np.sin(a2)], 1)
+    wall = np.stack([rng.uniform(-1.5, 1.5, 1500), rng.uniform(0, 2.5, 1500), np.full(1500, -2.6)], 1)
+    pts = _to_world(np.vstack([floor, person, wall])).astype(np.float32)
+    n = len(pts)
+    props = ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2",
+             "rot_0", "rot_1", "rot_2", "rot_3"]
+    rec = np.zeros(n, dtype=[(p, "<f4") for p in props])
+    rec["x"], rec["y"], rec["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
+    rec["opacity"], rec["rot_0"] = 3.0, 1.0
+    for k in ("scale_0", "scale_1", "scale_2"):
+        rec[k] = np.log(0.01 * UNITS_PER_M)
+    header = "ply\nformat binary_little_endian 1.0\n" + f"element vertex {n}\n"
+    header += "".join(f"property float {p}\n" for p in props) + "end_header\n"
+    ply = tmp_path / "scene.ply"
+    ply.write_bytes(header.encode("ascii") + rec.tobytes())
+    poses = []
+    for i in range(24):
+        th = 2 * np.pi * i / 24
+        h = 1.2 if i % 2 else 1.7
+        c_g = np.array([2.0 * np.cos(th), h, 2.0 * np.sin(th)])
+        f = np.array([-np.cos(th), 0.0, -np.sin(th)])
+        d = np.array([0.0, -1.0, 0.0])
+        R_cg = np.stack([np.cross(d, f), d, f])  # rows: camera x (right), y (down), z (forward)
+        R_cw = R_cg @ R_WG.T
+        c_w = _to_world(c_g)
+        poses.append([*_rot_to_quat(R_cw), *(-R_cw @ c_w)])
+    cams = tmp_path / "cams.json"
+    cams.write_text(json.dumps(poses), encoding="utf-8")
+    monkeypatch.setenv("FAKE_CAMS", str(cams))
+    monkeypatch.setenv("FAKE_BRUSH_PLY", str(ply))
+
+
+def test_rot_to_quat_roundtrip():
+    R = _yaw(40) @ np.diag([1.0, -1.0, -1.0])
+    np.testing.assert_allclose(capture._quat_to_R(np.array(_rot_to_quat(R))), R, atol=1e-12)
+
+
+def test_camera_centers(tmp_path):
+    p = tmp_path / "images.bin"
+    with open(p, "wb") as fh:
+        fh.write(struct.pack("<Q", 2))
+        for i, (q, t) in enumerate([((1, 0, 0, 0), (1.0, 2.0, 3.0)), ((0, 0, 0, 1), (1.0, 0.0, 0.0))]):
+            fh.write(struct.pack("<I7dI", i + 1, *q, *t, 1) + b"x\0" + struct.pack("<Q", 0))
+    np.testing.assert_allclose(capture.camera_centers(p), [[-1, -2, -3], [1, 0, 0]], atol=1e-12)
+
+
+def test_capture_gets_metric_scale_from_camera_height(fake_tools, photos, tmp_path, monkeypatch):
+    splat = pytest.importorskip("vrphoto.geometry.splat")
+    monkeypatch.setattr(capture, "_splat_api", lambda: splat)
+    _synthetic_capture(tmp_path, monkeypatch)
+    out = capture.capture_to_splat(photos, tmp_path / "out", steps=200, name="person")
+    info = json.loads((tmp_path / "out" / "person.capture.json").read_text(encoding="utf-8"))
+    assert info["method"] == "camera" and "subject_height_m" not in info
+    assert info["scale"] == pytest.approx(1 / UNITS_PER_M, rel=0.03)
+    assert info["camera_height_m"] == pytest.approx(1.45, rel=0.03)
+    sc = splat.read_splats(out)
+    m = np.asarray(sc.means, dtype=np.float64)
+    near = np.linalg.norm(m[:, [0, 2]], axis=1) < 0.3
+    assert m[near, 1].max() == pytest.approx(PERSON_M, rel=0.03)  # the person is 1.7 m tall again
+    assert np.median(np.asarray(sc.scales)) == pytest.approx(0.01, rel=0.05)  # splat sizes scaled too
+    assert info["height_m"] == pytest.approx(m[:, 1].max() - m[:, 1].min(), abs=1e-3)
+    assert PERSON_M + 0.3 < info["height_m"] <= 2.5 + 1e-3  # bounding box incl. the wall behind
+    ply = splat.read_splats(out.with_suffix(".ply"))
+    np.testing.assert_allclose(np.asarray(ply.means), m, atol=1e-4)
+
+
+def test_capture_subject_height_override(fake_tools, photos, tmp_path, monkeypatch):
+    splat = pytest.importorskip("vrphoto.geometry.splat")
+    monkeypatch.setattr(capture, "_splat_api", lambda: splat)
+    _synthetic_capture(tmp_path, monkeypatch)
+    res = capture.run_task("capture_to_splat", {"paths": [str(p) for p in photos]},
+                           {"steps": 200, "name": "tall", "subject_height_m": 1.8}, tmp_path / "out")
+    info = json.loads((tmp_path / "out" / "tall.capture.json").read_text(encoding="utf-8"))
+    assert info["method"] == "subject"
+    # height_m: the whole box; subject_height_m: the given height (the viewer's size label)
+    assert set(info) == {"scale", "height_m", "method", "camera_height_m", "subject_height_m"}
+    assert info["subject_height_m"] == pytest.approx(1.8)
+    assert info["height_m"] > 1.8
+    m = np.asarray(splat.read_splats(res["splat"]).means, dtype=np.float64)
+    near = np.linalg.norm(m[:, [0, 2]], axis=1) <= 0.6
+    lo, hi = np.percentile(m[near, 1], [2, 98])
+    assert hi - lo == pytest.approx(1.8, rel=0.02)
+
+
+def test_capture_scale_options_validated(fake_tools, photos, tmp_path):
+    with pytest.raises(InputError, match="subject height"):
+        capture.capture_to_splat(photos, tmp_path / "out", subject_height_m=-1)
+    with pytest.raises(InputError, match="camera height"):
+        capture.capture_to_splat(photos, tmp_path / "out", camera_height_m=0)
+
+
+def test_capture_without_usable_cameras_still_writes_scale_info(fake_tools, photos, tmp_path):
+    out = capture.capture_to_splat(photos, tmp_path / "out", steps=200, name="flat")
+    info = json.loads((tmp_path / "out" / "flat.capture.json").read_text(encoding="utf-8"))
+    assert set(info) >= {"scale", "height_m", "method"}
+    assert info["method"] in ("camera", "radius", "none") and info["scale"] > 0
+    assert out.is_file()
+
+
+def test_metric_scale_methods():
+    rng = np.random.default_rng(0)
+    pts = np.column_stack([rng.normal(0, 0.1, 500), rng.uniform(0, 3.0, 500), rng.normal(0, 0.1, 500)])
+    th = np.linspace(0, 2 * np.pi, 12, endpoint=False)
+    cams = np.column_stack([4 * np.cos(th), np.full(12, 2.9), 4 * np.sin(th)])
+    s, how = capture.metric_scale(pts, cams)
+    assert how == "camera" and s == pytest.approx(1.45 / 2.9)
+    s, how = capture.metric_scale(pts, cams, camera_height_m=1.6)
+    assert s == pytest.approx(1.6 / 2.9)
+    # cameras at floor level: camera-height method unusable -> orbit radius
+    flat = cams.copy()
+    flat[:, 1] = 0.0
+    s, how = capture.metric_scale(pts, flat)
+    assert how == "radius" and s == pytest.approx(capture.ORBIT_RADIUS_M / 4.0)
+    # no cameras at all
+    assert capture.metric_scale(pts, None) == (1.0, "none")
+    assert capture.metric_scale(pts, cams[:1]) == (1.0, "none")
+    # subject override: robust 2..98 percentile height of the central points
+    s, how = capture.metric_scale(pts, cams, subject_height_m=1.5)
+    lo, hi = np.percentile(pts[:, 1], [2, 98])
+    assert how == "subject" and s == pytest.approx(1.5 / (hi - lo), rel=1e-6)
+    # unusable subject (all points at one height) -> falls back to the cameras
+    s, how = capture.metric_scale(np.zeros((50, 3)), cams, subject_height_m=1.5)
+    assert how == "camera"
+
+
+def test_fit_affine():
+    rng = np.random.default_rng(1)
+    src = rng.normal(size=(300, 3))
+    R = _yaw(25)
+    dst = src @ R.T * 1.0 + [0.5, -1.0, 2.0]
+    M = capture._fit_affine(src, dst)
+    assert M is not None
+    np.testing.assert_allclose(capture._apply_affine(M, [[1.0, 2.0, 3.0]]), [R @ [1, 2, 3] + [0.5, -1, 2]], atol=1e-9)
+    np.testing.assert_allclose(capture._fit_affine(src, src), np.vstack([np.eye(3), np.zeros((1, 3))]))
+    assert capture._fit_affine(src, rng.normal(size=(300, 3))) is None  # rows do not correspond
+    line = np.column_stack([np.arange(10.0), np.zeros(10), np.zeros(10)])
+    assert capture._fit_affine(line, line * [1, -1, -1] + [0, 1, 0]) is None  # ambiguous
+    assert capture._fit_affine(src[:3], dst[:3]) is None

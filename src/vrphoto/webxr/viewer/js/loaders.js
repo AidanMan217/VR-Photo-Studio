@@ -169,9 +169,13 @@ export async function loadGrayscale(url, w, h, { signal } = {}) {
   return out;
 }
 
+const VIDEO_UNDECODABLE = 'The browser cannot decode this video format. Export it again with the "Compatible (H.264)" video format.';
+
 /**
  * Create a looping, initially muted video element and its texture.  Browsers (and WebXR) only
  * allow sound after a user gesture, so callers unmute on the first click / trigger press.
+ * A video whose picture cannot be decoded is reported even when its sound track plays (the
+ * browser then fires 'loadeddata' with a 0 x 0 picture instead of an error).
  */
 export async function loadVideo(url, { signal } = {}) {
   const video = document.createElement('video');
@@ -190,6 +194,14 @@ export async function loadVideo(url, { signal } = {}) {
     };
     const onLoaded = () => {
       cleanup();
+      if (!video.videoWidth || !video.videoHeight) {
+        // e.g. HEVC + AAC in a browser without HEVC: sound plays, the picture stays black.
+        disposeVideo(video, null);
+        reject(new FriendlyError('This video cannot be played here', VIDEO_UNDECODABLE, {
+          details: 'The video has no picture the browser can decode (0 x 0 after loading).',
+        }));
+        return;
+      }
       resolve();
     };
     const onError = async () => {
@@ -206,7 +218,7 @@ export async function loadVideo(url, { signal } = {}) {
       reject(new FriendlyError(
         'This video cannot be played here',
         code === 4 || code === 3
-          ? 'The browser cannot decode this video format. Export it again with the "H.264 (compatible)" preset.'
+          ? VIDEO_UNDECODABLE
           : 'The video could not be loaded. Try again, or export it again from the desktop app.',
         { details: `MediaError code ${code}: ${video.error?.message || ''}` },
       ));
@@ -298,15 +310,68 @@ export async function loadSplatMesh(url, fileType, { signal, onProgress } = {}) 
   return mesh;
 }
 
-/** Bounding box of a SplatMesh in its local space (empty box when unknown). */
-export function splatBounds(mesh) {
+/** Value at fraction ``q`` (0..1) of an ascending-sorted typed array. */
+function quantile(sorted, q) {
+  const i = Math.min(sorted.length - 1, Math.max(0, Math.round(q * (sorted.length - 1))));
+  return sorted[i];
+}
+
+/**
+ * Robust extent of a SplatMesh's centres in its local space: per axis the ``lo``..``hi``
+ * fractions (default 0.5 % .. 99.5 %) of up to ``maxSamples`` evenly picked centres, so a few
+ * stray "floater" splats (common in captures) neither inflate the size nor lift the object off
+ * the floor or push the start position outside a room.  ``median`` is the median centre (the
+ * app's splats are normalised to median x/z = 0, floor y = 0); ``full`` is the plain bounding
+ * box of all centres (what ``height_m`` describes - the capture add-on records exactly that).
+ * Empty boxes / null median when the splat has no centres.
+ */
+export function splatRobustBounds(mesh, { lo = 0.005, hi = 0.995, maxSamples = 200_000 } = {}) {
+  let total = 0;
   try {
-    const box = mesh.getBoundingBox(true);
-    if (box && !box.isEmpty()) return box;
+    total = mesh.packedSplats?.numSplats ?? mesh.splats?.numSplats ?? mesh.splats?.getNumSplats?.() ?? 0;
+  } catch {
+    total = 0;
+  }
+  const stride = total > maxSamples ? Math.ceil(total / maxSamples) : 1;
+  const cap = total > 0 ? Math.ceil(total / stride) : 1024;
+  let xs = new Float32Array(cap);
+  let ys = new Float32Array(cap);
+  let zs = new Float32Array(cap);
+  let n = 0;
+  const full = new THREE.Box3();
+  try {
+    mesh.forEachSplat((index, center) => {
+      if (!Number.isFinite(center.x) || !Number.isFinite(center.y) || !Number.isFinite(center.z)) return;
+      full.expandByPoint(center);
+      if (index % stride !== 0) return;
+      if (n === xs.length) {
+        const grow = (a) => {
+          const b = new Float32Array(a.length * 2);
+          b.set(a);
+          return b;
+        };
+        xs = grow(xs);
+        ys = grow(ys);
+        zs = grow(zs);
+      }
+      xs[n] = center.x;
+      ys[n] = center.y;
+      zs[n] = center.z;
+      n += 1;
+    });
   } catch (err) {
     log.warn('splat bounds', err);
   }
-  return new THREE.Box3();
+  if (n === 0) return { box: new THREE.Box3(), full, median: null, samples: 0 };
+  const sx = xs.subarray(0, n).sort();
+  const sy = ys.subarray(0, n).sort();
+  const sz = zs.subarray(0, n).sort();
+  const box = new THREE.Box3(
+    new THREE.Vector3(quantile(sx, lo), quantile(sy, lo), quantile(sz, lo)),
+    new THREE.Vector3(quantile(sx, hi), quantile(sy, hi), quantile(sz, hi)),
+  );
+  const median = new THREE.Vector3(quantile(sx, 0.5), quantile(sy, 0.5), quantile(sz, 0.5));
+  return { box, full, median, samples: n };
 }
 
 /** Rotation that turns a splat with the given "up" axis into y-up (glTF frame). */

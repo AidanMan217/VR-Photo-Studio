@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..core.config import get_settings, is_frozen
-from ..core.errors import AddonError, AddonNotInstalled, Cancelled
+from ..core.errors import UI_ADDONS, AddonError, AddonNotInstalled, Cancelled
 from ..core.log import get_logger
 from ..core.types import CancelToken, ProgressReporter
 from . import fetch
@@ -594,7 +594,7 @@ def run(
     if not _is_installed(m, d, _read_state(d)):
         raise AddonNotInstalled(
             f"The add-on '{m.title}' is not installed.",
-            hint="Install it in Settings > Add-ons (it is downloaded once).",
+            hint=f"Install it in the {UI_ADDONS}; it is downloaded once.",
         )
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -697,5 +697,5 @@ def resolve_binary(m: AddonManifest, name: str, *, base_dir: Path | None = None)
             return found
     raise AddonNotInstalled(
         f"{name} was not found.",
-        hint=f"Install the '{m.title}' add-on in Settings > Add-ons.",
+        hint=f"Install the '{m.title}' add-on in the {UI_ADDONS}.",
     )

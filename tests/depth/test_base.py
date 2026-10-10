@@ -176,3 +176,11 @@ def test_importing_depth_is_lightweight():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "ok"
+
+
+def test_heuristic_label_and_simple_alias():
+    """E2E-7: the GUI label says 'Heuristic' (as the User Guide does) and 'simple' still works."""
+    titles = dict(list_estimators())
+    assert titles["heuristic"].startswith("Heuristic") and "no AI" in titles["heuristic"]
+    assert isinstance(get_estimator("simple", device="cpu"), HeuristicEstimator)
+    assert isinstance(get_estimator("Simple", device="cpu"), HeuristicEstimator)

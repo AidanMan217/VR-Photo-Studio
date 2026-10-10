@@ -85,7 +85,8 @@ You do not need to be technical. If you are in a hurry, read [Quick start](#2-qu
   it in the live viewer.
 * **Preview:** the depth preview shows what the AI understood (bright = near). If the depth looks
   wrong, try another depth model (see [section 5](#5-settings-shared-by-all-modes)).
-* **Results:** files go to `Pictures\VR Photo Studio` (change it in Settings). File names end with
+* **Results:** files go to your output folder - **File → Open output folder** opens it (default
+  `Pictures\VR Photo Studio`; change it in Settings). File names end with
   tokens like `_LR` or `_180_LR` so Quest players show them correctly
   ([section 6](#file-name-endings-and-which-players-understand-them)).
 * **Viewer library:** scenes, objects and VR pictures are also added to the live viewer's
@@ -131,8 +132,8 @@ A short looping video where a virtual camera moves gently through your photo, li
 | Seamless loop | Makes the movement return to the start for a seamless loop. | On |
 | Look behind | AI fill behind edges (see above). | On |
 | Frames per second *(Advanced)* | Smoothness: 24 (cinematic), 30, or 60 (smoothest, bigger files). | 30 |
-| Width *(Advanced)* | Video width in pixels. *Auto* = same as the photo (limited by your headset). | Auto |
-| Video format *(Advanced)* | *Automatic* picks the best format for your headset; *Compatible (H.264)* plays everywhere; *Quick preview* is fast and small. | Automatic |
+| Width *(Advanced)* | Video width in pixels. *Auto* = same as the photo (limited by your headset; flat videos at most 1920 px on the long side so phones and PCs play them). | Auto |
+| Video format *(Advanced)* | *Automatic* saves flat videos as H.264 (plays on phones and PCs) and 3D/VR180 videos as HEVC sized for your headset; *Compatible (H.264)* plays everywhere; *Quick preview* is fast and small. | Automatic |
 | Eye distance (IPD) *(Advanced)* | For the 3D and VR180 outputs. | 63 mm |
 
 **Output:** `name_parallax.mp4`, `name_parallax_LR.mp4` or `name_parallax_180_LR.mp4`.
@@ -185,7 +186,7 @@ lean in, and look around the person or object in front - the AI paints what was 
 
 | Option | What it does | Recommended |
 |---|---|---|
-| Detail | How detailed the 3D mesh is, in thousands of triangles. More = sharper edges but slower to load. | 300 (150-500) |
+| Detail | How detailed the 3D scene is: about this many thousand triangles in total (all layers together). More = sharper edges but slower to load. | 300 (150-500) |
 | Look behind | *Band* (AI paints a strip behind every edge), *Clean plate* (removes the main subject from the background completely, so you can look all the way around it - best for one clear subject such as a portrait), *Off* (fastest) | Band; Clean plate for one clear subject |
 | Distance | How far in front of you the photo is placed. | 2 m |
 | Movement range | How far you can move your head before you see the edges of what was prepared. Bigger needs more AI painting. | 40 cm |
@@ -203,11 +204,12 @@ floor (Quest 3 passthrough) and walk around.
 |---|---|---|
 | Method | *Billboard* (instant, no add-on: a cut-out with a rounded 3D shape - looks great from the front and the sides, the back is approximated), *TRELLIS* (add-on: AI builds a full 3D model including the back), *SHARP* (experimental add-on: fast AI splat), *TRELLIS.2* / *Hunyuan3D* (experimental add-ons) | Billboard to start; TRELLIS for full 3D |
 | Real-world height | Height so it appears life-size: a person's height, or the object's size. | 1.70 m for adults |
-| Thickness | (Billboard) how deep the shape is, as a fraction of the height. | 0.17 |
+| Thickness | (Billboard) how deep the shape is, as a fraction of the height. | 0.11 |
 | Also save splat | Also saves a splat version for the viewer. | On |
 | Placement | *Point at the floor* (you aim at your floor or table and press the trigger), or *In front of me* (appears on the floor 1.5 m ahead). | Point at the floor |
 | Back side *(Advanced)* | (Billboard) *Soft colours from the outline* (subtle), or *Mirror of the front*. | Soft colours |
-| Variation *(Advanced)* | For AI methods: change the number to get a different version. | 0 |
+| Variation *(Advanced)* | For TRELLIS, TRELLIS.2 and Hunyuan3D: change the number to get a different version. (SHARP always gives the same result for the same photo.) | 0 |
+| Paint texture *(Advanced)* | (Hunyuan3D) also paints colours onto the model; without it you get a plain grey shape. Slower, needs more graphics memory, and downloads the painting models (about 8 GB) on the first textured run. Needs the add-on's optional texture-painting part (see [section 8](#8-add-ons)). | Off; on for colour |
 
 **Good photos:** the whole person/object visible (feet included), not cut off at the edges,
 clearly separated from the background, even light.
@@ -227,6 +229,7 @@ Add all photos (or the video) - they become **one** job.
 | Max photos | Upper limit; more photos = slower. | 200 |
 | Training steps | More = sharper but slower. ~7,000 is a quick test, 30,000 is best quality. | 15,000 |
 | Place as object (AR) | *On*: centred and placed on your floor for AR. *Off*: keep the whole surroundings as a scene for VR. | On for people/objects |
+| Subject height *(Advanced)* | Real height of the captured person or object, so it appears life-size. *Automatic* works out the size from how high you held the camera (about chest height, 1.45 m). | Automatic; the real height if the size looks wrong |
 | Max splats *(Advanced)* | Limits the size so it runs smoothly in the Quest Browser. | 750,000 |
 | Keep *(Advanced)* | Removes stray floating bits far from the centre (keeps this % of points). | 98 % |
 
@@ -250,7 +253,8 @@ Converts a normal video into a 3D (side-by-side) or VR180 video, frame by frame.
 
 A one-minute 1080p clip takes roughly 5-20 minutes on an RTX GPU. Try a 10-second piece first.
 
-**Output:** `name_LR.mp4`, `name_TB.mp4` or `name_180_LR.mp4` (with spatial metadata).
+**Output:** `name_LR.mp4`, `name_TB.mp4`, or `name_180_LR.mp4` (VR180, with spatial metadata so
+players show it around you).
 
 ### 4.9 Depth Map
 
@@ -268,7 +272,7 @@ the jobs you create next. Options marked *(More)* are in its folded **More** par
 
 | Option | What it does | Recommended |
 |---|---|---|
-| Depth model | Which AI estimates depth: *Auto* (Depth Anything V2 Small - fast, good, free for any use), *V2 Base/Large* (sharper, slower, **non-commercial**), *MoGe-2* (real-world distances and lens angle - great for 3D Scenes), *Depth Anything 3* (experimental), *Simple* (no AI, last resort) | Auto; MoGe-2 for 3D Scene/VR |
+| Depth model | Which AI estimates depth: *Auto* (Depth Anything V2 Small - fast, good, free for any use), *V2 Base/Large* (sharper, slower, **non-commercial**), *MoGe-2* (real-world distances and lens angle - great for 3D Scenes), *Depth Anything 3* (experimental), *Heuristic* (no AI model, instant - last resort) | Auto; MoGe-2 for 3D Scene/VR |
 | Look-behind model | AI that paints hidden areas: *Auto* (LaMa, best), *MI-GAN* (faster), *OpenCV* (no AI) | Auto |
 | Cut-out model | AI that separates people/objects: *Auto* (BiRefNet Lite), *BiRefNet Portrait* (people, hair), *IS-Net*, *U2-Net*, *GrabCut* (no AI) | Auto; Portrait for people |
 | Output folder | Where the results of this job go. | Empty (your Settings folder) |
@@ -364,9 +368,10 @@ format: open the player's format/3D menu and pick **Side-by-side 3D** / **180° 
 video* writes a short still video that plays everywhere. The [live viewer](#7-the-live-viewer-send-to-quest)
 shows every kind of picture without copying anything.
 
-**Video formats:** the *Automatic* video format uses HEVC (H.265) sized for your headset, which the
-Quest plays smoothly. If a video stutters or does not play, set *Video format* to *Meta Quest 2* or
-*Compatible (H.264)*, or use a smaller width.
+**Video formats:** the *Automatic* video format saves 3D and VR180 videos as HEVC (H.265) sized for
+your headset, which the Quest plays smoothly, and flat Living Photo videos as H.264 (at most 1920 px),
+which plays on phones and PCs too. If a video stutters or does not play, set *Video format* to
+*Meta Quest 2* or *Compatible (H.264)*, or use a smaller width.
 
 ---
 
@@ -440,6 +445,11 @@ the certificate warning. It needs a one-time setup:
 
 Do step 4 again after unplugging the cable or restarting the headset.
 
+If another program on your PC already uses port 8080, the *USB cable* tab tells you: the app then
+uses another free port for USB (the tab shows the address to use), or USB mode is unavailable. Wi-Fi
+works either way. For a fixed address choose another *USB (http) port* in **Settings** (for example
+8081).
+
 ---
 
 ## 8. Add-ons
@@ -457,7 +467,7 @@ Installing downloads PyTorch, NVIDIA CUDA libraries and the AI model (several GB
 | **AI outpainting for VR180 / 360** (Stable Diffusion XL) | AI-painted surroundings for VR180/360 (*Fill: AI outpaint*) | NVIDIA, 8 GB+ | ~17 GB | CreativeML Open RAIL++-M (use restrictions) |
 | **SHARP** (Apple, experimental) | One photo → 3D Gaussian splat in seconds (*Person / Object*, method *SHARP*) | NVIDIA, 6 GB+ | ~12 GB | Apple research model license: **non-commercial** |
 | **TRELLIS.2** (experimental) | Newer, more detailed photo-to-3D | NVIDIA, 12 GB+ (16-24 GB recommended) | ~36 GB | MIT + Meta DINOv3 license (needs a Hugging Face token) + **non-commercial** NVIDIA parts |
-| **Hunyuan3D-2** (experimental) | Alternative photo-to-3D by Tencent | NVIDIA, 6 GB+ (more for textures) | ~16 GB | Tencent community license - **not licensed in the EU, the UK and South Korea** |
+| **Hunyuan3D-2** (experimental) | Alternative photo-to-3D by Tencent; a grey shape, or coloured with *Paint texture* | NVIDIA, 6 GB+ (more for textures) | ~16 GB | Tencent community license - **not licensed in the EU, the UK and South Korea** |
 
 The numbers are guides; the Add-ons window shows each add-on's exact requirements and checks your
 GPU. Experimental add-ons appear when *Show experimental add-ons* (in the Add-ons window) or *Show
@@ -468,6 +478,11 @@ experimental features* (Settings) is on, and may not always work.
 * **Hugging Face token:** a few models require a free account at <https://huggingface.co>. Log in,
   open the model page linked in the Add-ons window, accept its terms, create a *Read* token under
   *Settings → Access Tokens*, and paste it into VR Photo Studio's Settings.
+* **Hunyuan3D colours:** the *Paint texture* option (Person / Object, under *Advanced*) needs the add-on's optional
+  texture-painting part, which **Install** can only build when the NVIDIA CUDA Toolkit and the Visual
+  Studio C++ build tools are on your PC (otherwise Install reports that the optional texture-painting
+  step failed, and you get the grey shape). The painting models (about 8 GB) download on the first
+  textured run.
 * Keep your **NVIDIA driver up to date** (NVIDIA App / GeForce Experience) - the add-ons use CUDA 12.
 
 ---
@@ -527,7 +542,8 @@ Then choose **Capture**, add all the photos (or the video) as one job, and click
   file, add the VR Photo Studio folder as an exception, and please report it.
 * **The app does not start:** run `vrphoto-cli.exe --selftest` from the install folder
   (`%LOCALAPPDATA%\Programs\VR Photo Studio`) in a Command Prompt and look at the report; also see the
-  log `%LOCALAPPDATA%\VRPhotoStudio\logs\vrphoto.log`.
+  log `%LOCALAPPDATA%\VRPhotoStudio\logs\vrphoto.log` (the command-line tool writes `cli.log` in the
+  same folder).
 
 ### Speed and memory
 
@@ -567,8 +583,9 @@ Then choose **Capture**, add all the photos (or the video) as one job, and click
   3. **Firewall:** click **Allow through firewall** in the *Send to Quest* window and then **Check again**.
      (Or: *Windows Security → Firewall & network protection → Allow an app through firewall* and tick
      *Private* for VR Photo Studio, or reinstall choosing *Install for all users* and tick *Allow Quest
-     headset to connect*.) The ports are TCP 8443 and 8080. If you once clicked *Cancel* on the Windows
-     Firewall question, Windows blocks the app until you do one of these.
+     headset to connect*.) The port is TCP 8443 (the USB port 8080 is only used inside this PC and needs no
+     firewall rule). If you once clicked *Cancel* on the Windows Firewall question, Windows blocks the app
+     until you do one of these.
   4. Turn off VPN software on the PC.
   5. Test on the PC: click **Open on this PC**, or open the same `https://...:8443/` address in your PC's
      browser.
@@ -603,6 +620,7 @@ When asking for help, attach `vrphoto.log` and the output of `vrphoto-cli.exe --
 * All processing happens **on your PC**. Photos are never uploaded. The app only connects to the
   internet to download models and add-ons (Hugging Face, GitHub, PyPI).
 * The live viewer is only reachable on your home network while it is running (*Send to Quest →
-  Start viewer* / *Stop viewer*).
+  Start viewer* / *Stop viewer*). It shares only the viewer page and the scenes in its library (the
+  *Your scenes* tab) - not your output folder or any other files on your PC.
 * VR Photo Studio is MIT-licensed. Some models and add-ons are **non-commercial only** - they are marked
   in the app and listed in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).

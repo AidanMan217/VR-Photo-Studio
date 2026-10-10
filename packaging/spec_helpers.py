@@ -338,6 +338,7 @@ EXPLICIT_HIDDEN_IMPORTS: tuple[str, ...] = (
     "numpy",
     "cv2",
     "PIL.Image",
+    "PIL.ImageCms",
     "pillow_heif",
     "onnxruntime",
     "imageio_ffmpeg",
@@ -592,7 +593,7 @@ vrphoto-cli.exe is the command-line version (for scripting and troubleshooting):
 Your settings, downloaded AI models and add-ons are stored in
 %LOCALAPPDATA%\\VRPhotoStudio  (they can grow to many GB; delete the folder to reset).
 
-User guide: https://github.com/AidanMan217/VR-Photo-Studio/blob/main/docs/USER_GUIDE.md
+User guide: https://github.com/AidanMan217/VR-Photo-Studio/blob/HEAD/docs/USER_GUIDE.md
 Licences: LICENSE.txt and THIRD_PARTY_NOTICES.txt in this folder.
 """
 

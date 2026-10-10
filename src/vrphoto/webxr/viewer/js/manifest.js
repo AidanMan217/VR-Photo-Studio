@@ -20,7 +20,7 @@ export const DEFAULTS = {
   photo3d: { anchor_distance_m: 2.0, eye_height_m: 1.5 },
   stereo: { kind: 'image', layout: 'sbs', aspect: null, screen_width_m: 3.0, distance_m: 4.0 },
   sphere: { kind: 'image', coverage: 180, layout: 'mono', depth: null, radius_m: 20, depth_near_m: 1.5, depth_far_m: null },
-  object: { height_m: null, pivot: 'base', placement: 'hit-test', distance_m: 1.5, up: 'y' },
+  object: { height_m: null, scale: null, pivot: 'base', placement: 'hit-test', distance_m: 1.5, up: 'y' },
   splat: { up: 'y', scale: 1.0 },
 };
 
@@ -49,7 +49,7 @@ const POSITIVE = {
   photo3d: ['anchor_distance_m'],
   stereo: ['aspect', 'screen_width_m', 'distance_m'],
   sphere: ['radius_m', 'depth_near_m', 'depth_far_m'],
-  object: ['height_m', 'distance_m'],
+  object: ['height_m', 'scale', 'distance_m'],
   splat: ['scale'],
 };
 const FILE_FIELDS = { stereo: ['media'], sphere: ['media', 'depth'], object: ['asset'], splat: ['asset'] };

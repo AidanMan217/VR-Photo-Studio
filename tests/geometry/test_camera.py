@@ -176,3 +176,21 @@ def test_estimate_intrinsics_rejects_non_numbers():
     # numpy scalars and shapes are fine
     k = estimate_intrinsics(np.zeros((48, 64, 3)).shape, hfov_deg=np.float32(70.0))
     assert (k.width, k.height) == (64, 48) and k.hfov_deg == pytest.approx(70.0, abs=1e-4)
+
+
+def test_default_fov_applies_to_the_long_side_for_portrait_photos():
+    """R7: an EXIF-less portrait photo is ~65 deg TALL (like the same camera held
+    sideways), not 65 deg wide x 87 deg tall."""
+    land = estimate_intrinsics((800, 1200, 3))
+    port = estimate_intrinsics((1200, 800, 3))
+    assert land.hfov_deg == pytest.approx(65.0)
+    assert port.vfov_deg == pytest.approx(65.0)
+    assert port.hfov_deg == pytest.approx(land.vfov_deg)  # rotated landscape camera
+    assert port.fx == port.fy == pytest.approx(land.fx)  # same focal length in pixels
+    assert (port.cx, port.cy, port.width, port.height) == (400.0, 600.0, 800, 1200)
+    sq = estimate_intrinsics((500, 500))
+    assert sq.hfov_deg == pytest.approx(65.0) and sq.vfov_deg == pytest.approx(65.0)
+    # explicit and EXIF values stay horizontal fields of view of the displayed image
+    assert estimate_intrinsics((1200, 800), hfov_deg=50.0).hfov_deg == pytest.approx(50.0)
+    assert estimate_intrinsics((1200, 800), exif_hfov=50.0).hfov_deg == pytest.approx(50.0)
+    assert estimate_intrinsics((1200, 800), default_hfov=55.0).vfov_deg == pytest.approx(55.0)

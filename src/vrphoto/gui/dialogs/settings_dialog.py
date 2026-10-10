@@ -185,11 +185,18 @@ class SettingsDialog(QDialog):
         self.https_port = QSpinBox()
         self.https_port.setRange(1024, 65535)
         self.https_port.setValue(int(s.https_port))
-        self.https_port.setToolTip("Port of the secure (https) viewer address used over Wi-Fi. Default 8443.")
+        self.https_port.setToolTip(
+            "Port of the secure (https) viewer address used over Wi-Fi. Default 8443. While the viewer "
+            "runs, devices on your network can open the viewer and the scenes in its library - "
+            "nothing else on this PC (not your output folder)."
+        )
         self.http_port = QSpinBox()
         self.http_port.setRange(1024, 65535)
         self.http_port.setValue(int(s.http_port))
-        self.http_port.setToolTip("Port of the local viewer address used over a USB cable. Default 8080.")
+        self.http_port.setToolTip(
+            "Port of the local viewer address used over a USB cable and by 'Open on this PC' "
+            "(only reachable from this PC). Default 8080; change it if another program uses it."
+        )
         g4 = QGroupBox("Live viewer (Send to Quest)")
         f4 = QFormLayout(g4)
         f4.addRow("Wi-Fi (https) port", self.https_port)

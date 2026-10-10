@@ -26,7 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..core.errors import Cancelled, VRPhotoError
+from ..core.errors import UI_LOG, Cancelled, VRPhotoError
 from ..core.log import get_logger
 from ..core.types import CancelToken, ProgressReporter
 from .jobs import JobBase, JobResult
@@ -81,10 +81,16 @@ def error_message(exc: BaseException) -> str:
         return f"{msg} {hint}" if hint and hint not in msg else msg
     if isinstance(exc, MemoryError):
         return "Not enough memory to finish this job. Lower 'Max processing size' or close other programs."
+    if isinstance(exc, OSError):  # e.g. disk full / folder not writable outside the job's own checks
+        from .run import _friendly
+
+        friendly = _friendly(exc)
+        if friendly is not None:
+            return error_message(friendly)
     detail = str(exc).strip()
     return (
         f"Unexpected error ({type(exc).__name__}{': ' + detail if detail else ''}). "
-        "Details are in the log file (Help > Open log folder)."
+        f"Details are in the log ({UI_LOG})."
     )
 
 

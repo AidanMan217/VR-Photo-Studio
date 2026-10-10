@@ -277,6 +277,88 @@ def test_thumbnails_and_sources(media):
         assert max(load_thumbnail(media["video"], 32).shape[:2]) <= 32
 
 
+def _jpeg_with_header_size(path, width: int, height: int):
+    """A tiny JPEG whose SOF0 header claims ``width`` x ``height`` (Pillow checks the pixel
+    limit from the header when opening, so no huge file is needed)."""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 16), (120, 80, 40)).save(buf, "JPEG", quality=90)
+    data = bytearray(buf.getvalue())
+    i = data.index(b"\xff\xc0")  # baseline SOF0: length(2) precision(1) height(2) width(2)
+    data[i + 5 : i + 7] = height.to_bytes(2, "big")
+    data[i + 7 : i + 9] = width.to_bytes(2, "big")
+    path.write_bytes(bytes(data))
+    return path
+
+
+def test_thumbnail_opens_200_megapixel_photos(tmp_path, monkeypatch):
+    """R1: 16320x12240 (Samsung 200 MP mode) is above Pillow's default bomb limit; the
+    thumbnail loader must open it (decoding at reduced size), not reject it."""
+    from PIL import Image
+
+    import vrphoto.core.imaging  # noqa: F401 - import first, so the reset below sticks
+    from vrphoto.gui import util
+
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 89_478_485)  # Pillow's default
+    big = _jpeg_with_header_size(tmp_path / "s200.jpg", 16320, 12240)
+    im = util._open_pil_fast(big, 192)  # raised DecompressionBombError before the fix
+    assert max(im.size) <= 16320 // 8 + 1  # JPEG draft: decoded at 1/8 scale
+    assert Image.MAX_IMAGE_PIXELS >= util.MAX_IMAGE_PIXELS
+
+
+def test_preview_source_decodes_big_photos_at_reduced_size(tmp_path, monkeypatch):
+    """The preview asks the loader for its target size, so a 200 MP JPEG is not fully decoded."""
+    from vrphoto.gui import util
+
+    seen: dict = {}
+
+    def fake_load_image(path, with_alpha=False, *, max_px=None):
+        seen["max_px"] = max_px
+        return np.zeros((3000, 4000, 3), np.uint8)
+
+    monkeypatch.setattr("vrphoto.core.imaging.load_image", fake_load_image)
+    img = util.load_preview_source(tmp_path / "big.jpg", max_long=1600)
+    assert seen["max_px"] == 1600 and max(img.shape[:2]) == 1600
+
+
+def test_too_large_photo_gets_a_plain_message(tmp_path, monkeypatch, media):
+    """Anything still above the limit is reported in plain words, not as a 'DOS attack'."""
+    from PIL import Image
+
+    from vrphoto.core.errors import InputError
+    from vrphoto.gui import util
+
+    monkeypatch.setattr(util, "MAX_IMAGE_PIXELS", 1000)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    with pytest.raises(InputError) as err:
+        util.load_thumbnail(media["a"], 48)  # 320x240 > 2 x 1000 pixels
+    msg, hint = util.error_text(err.value)
+    assert "too large" in msg and "a.jpg" in msg and "attack" not in msg.lower()
+    assert hint and "smaller copy" in hint
+    raw = Image.DecompressionBombError(
+        "Image size (199756800 pixels) exceeds limit of 178956970 pixels, "
+        "could be decompression bomb DOS attack."
+    )
+    msg, hint = util.error_text(raw)
+    assert msg == "This photo is too large (200 MP)." and "smaller copy" in hint
+
+
+def test_help_links_follow_the_default_branch():
+    """E2E-8: the repository has no 'main' branch; links must not point at blob/main."""
+    import inspect
+
+    from vrphoto.gui import util
+    from vrphoto.gui.dialogs import about_dialog
+
+    assert util.USER_GUIDE_URL == f"{util.PROJECT_URL}/blob/HEAD/docs/USER_GUIDE.md"
+    for mod in (util, about_dialog):
+        assert "/blob/main/" not in inspect.getsource(mod), mod.__name__
+    assert "/blob/HEAD/THIRD_PARTY_NOTICES.md" in about_dialog.NOTICES_FALLBACK
+
+
 def test_human_formatting_and_output_folder(tmp_path):
     from vrphoto.gui.util import human_duration, human_size_mb, output_folder_of
 

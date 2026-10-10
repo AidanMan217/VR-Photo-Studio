@@ -118,12 +118,13 @@ _IMAGE_FORMAT = FieldMeta(
 
 _ENCODER_PRESET = FieldMeta(
     "Video format",
-    "'Automatic' picks the best format for your headset (HEVC sized for Quest 3 or Quest 2). "
-    "Choose 'Compatible (H.264)' if a video does not play somewhere, or 'Quick preview' for "
-    "a small, fast test file.",
+    "'Automatic' picks the right format for where the video is watched: flat videos are saved "
+    "as H.264, which plays on phones and PCs; 3D and VR180 videos use HEVC sized for your "
+    "headset (Quest 3 or Quest 2). Choose 'Compatible (H.264)' if a video does not play "
+    "somewhere, or 'Quick preview' for a small, fast test file.",
     "combo",
     choices=(
-        ("auto", "Automatic (best for your headset)"),
+        ("auto", "Automatic (recommended)"),
         ("quest3_hevc", "Meta Quest 3 (HEVC, high quality)"),
         ("quest2_hevc", "Meta Quest 2 (HEVC)"),
         ("h264_compat", "Compatible (H.264, plays everywhere)"),
@@ -442,7 +443,8 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         ),
         "width": FieldMeta(
             "Width",
-            "Video width in pixels. 'Auto' uses the photo's size, limited to what your headset plays smoothly.",
+            "Video width in pixels. 'Auto' uses the photo's size, limited to what your headset plays "
+            "smoothly; flat videos are at most 1920 px on the long side so phones and PCs play them.",
             "spin",
             minimum=480,
             maximum=8192,
@@ -549,8 +551,9 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
     "scene": {
         "target_faces": FieldMeta(
             "Detail",
-            "How detailed the 3D mesh is (thousands of triangles). More gives sharper edges but "
-            "loads more slowly in the headset. 150-500 k is a good range.",
+            "How detailed the 3D scene is: about this many thousand triangles in total (all "
+            "layers together). More gives sharper edges but loads more slowly in the headset. "
+            "150-500 k is a good range.",
             "slider",
             minimum=50,
             maximum=1000,
@@ -669,13 +672,27 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         ),
         "seed": FieldMeta(
             "Variation",
-            "AI methods only: change this number to get a different version of the 3D model.",
+            "TRELLIS, TRELLIS.2 and Hunyuan3D only: change this number to get a different version "
+            "of the 3D model. (SHARP always gives the same result for the same photo.)",
             "spin",
             minimum=0,
             maximum=999999,
             step=1,
             advanced=True,
-            enabled_if=("method", ("trellis", "sharp", "trellis2", "hunyuan")),
+            # SHARP is deterministic and takes no seed
+            enabled_if=("method", ("trellis", "trellis2", "hunyuan")),
+        ),
+        "hunyuan_texture": FieldMeta(
+            "Paint texture",
+            "Hunyuan3D only: also paint colours onto the 3D model; without it the model is a plain "
+            "grey shape. Slower and needs more graphics memory. The painting models (about 8 GB) "
+            "are downloaded on the first textured run, and painting needs the add-on's optional "
+            "texture-painting part (see the Add-ons window) - without it you get the grey shape.",
+            "check",
+            # advanced: Hunyuan3D is an experimental (normally hidden) method, so in the basic
+            # form this would be a checkbox that is almost always greyed out
+            advanced=True,
+            enabled_if=("method", ("hunyuan",)),
         ),
     },
     "capture": {
@@ -723,6 +740,19 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             step=0.5,
             decimals=1,
             unit="%",
+            advanced=True,
+        ),
+        "subject_height_m": FieldMeta(
+            "Subject height",
+            "Real height of the captured person or object, so it appears life-size. 'Automatic' "
+            "works out the size from how high you held the camera (about chest height, 1.45 m).",
+            "spin",
+            minimum=0,
+            maximum=5,
+            step=0.05,
+            decimals=2,
+            unit="m",
+            zero_label="Automatic",
             advanced=True,
         ),
         "as_object": FieldMeta(
@@ -903,11 +933,12 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
     "parallax": {
         "Comfortable": {"path": "circle", "amplitude_m": 0.04, "duration_s": 8.0},
         "Strong 3D": {"path": "swing", "amplitude_m": 0.09},
+        # no encoder_preset: 'auto' already uses HEVC for the headset outputs and keeps the
+        # default flat (phone / PC) video playable everywhere
         "Max quality": {
             "fps": 60.0,
             "look_behind": "band",
             "common.inpaint_model": "lama",
-            "encoder_preset": "quest3_hevc",
         },
     },
     "vr180": {
@@ -935,7 +966,7 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
         },
     },
     "object": {
-        "Comfortable": {"thickness": 0.14},
+        "Comfortable": {"thickness": 0.08},
         "Strong 3D": {"thickness": 0.24},
         "Max quality": {"common.segment_model": "birefnet-portrait", "export_splat": True},
     },

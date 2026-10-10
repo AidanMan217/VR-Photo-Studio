@@ -30,7 +30,7 @@ NOTICES_FALLBACK = """# Third-party notices
 
 The full list of third-party components and their licenses is in the file
 THIRD_PARTY_NOTICES.txt next to the program (VRPhotoStudio.exe), and online at
-{url}/blob/main/THIRD_PARTY_NOTICES.md
+{url}/blob/HEAD/THIRD_PARTY_NOTICES.md
 
 VR Photo Studio is built with Python, Qt for Python (PySide6, LGPL-3.0), NumPy, OpenCV,
 Pillow, ONNX Runtime, FFmpeg (via imageio-ffmpeg), three.js, Spark and other open-source

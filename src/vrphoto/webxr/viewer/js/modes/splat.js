@@ -1,10 +1,14 @@
 // splat: a full Gaussian-splat scene (e.g. a room captured with the COLMAP + Brush add-on)
 // rendered with Spark.  You start at the scene origin looking down -z (or outside the scene
 // when it is small) and can walk physically, use the left stick, snap turn and arc teleport.
+// Units are metres with the floor at y = 0 (captures are scaled to real size by the app); the
+// room / object decision uses robust bounds so stray "floater" splats do not count.
 
 import * as THREE from 'three';
 import { backgroundColor } from '../manifest.js';
-import { createSparkRenderer, loadSplatMesh, splatBounds, upAxisQuaternion } from '../loaders.js';
+import { createSparkRenderer, loadSplatMesh, splatRobustBounds, upAxisQuaternion } from '../loaders.js';
+
+const ROOM_EXTENT_M = 4; // wider than this (and around the origin): a room you stand in
 
 export async function load(ctx, scene) {
   const cfg = scene.splat;
@@ -25,12 +29,12 @@ export async function load(ctx, scene) {
   ctx.root.add(holder);
   holder.updateMatrix();
 
-  const box = splatBounds(mesh).clone().applyMatrix4(holder.matrix);
+  const box = splatRobustBounds(mesh).box.clone().applyMatrix4(holder.matrix);
   const size = box.isEmpty() ? new THREE.Vector3(4, 3, 4) : box.getSize(new THREE.Vector3());
   const center = box.isEmpty() ? new THREE.Vector3(0, 1, 0) : box.getCenter(new THREE.Vector3());
   const extent = Math.max(size.x, size.z);
   // A captured room surrounds the origin; a small capture is something to look at from outside.
-  const inside = !box.isEmpty() && extent > 4 && box.containsPoint(new THREE.Vector3(0, Math.min(1.2, box.max.y - 0.1), 0));
+  const inside = !box.isEmpty() && extent > ROOM_EXTENT_M && box.containsPoint(new THREE.Vector3(0, Math.min(1.2, box.max.y - 0.1), 0));
   const start = inside ? new THREE.Vector3(0, 1.6, 0) : new THREE.Vector3(center.x, 1.6, center.z + Math.max(1.5, extent * 1.2));
 
   return {

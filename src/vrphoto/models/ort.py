@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from ..core.config import get_settings
-from ..core.errors import Cancelled, DownloadError, InferenceError, ModelUnavailable
+from ..core.errors import UI_MODELS, Cancelled, DownloadError, InferenceError, ModelUnavailable
 from ..core.log import get_logger
 from ..core.types import CancelToken, ProgressReporter
 
@@ -248,7 +248,7 @@ class OrtModel:
         if not self.path.is_file():
             raise ModelUnavailable(
                 f"Model file not found: {self.path}",
-                hint="Download the model again from Settings > Models.",
+                hint=f"Download the model again in the {UI_MODELS}.",
             )
         self.device = device
         self.fp16 = fp16
@@ -321,7 +321,7 @@ class OrtModel:
         except Exception as e:
             raise ModelUnavailable(
                 f"Cannot load the {self.title} model ({self.path.name}): {e}",
-                hint="The file may be corrupt or incomplete; delete the model in Settings > Models "
+                hint=f"The file may be corrupt or incomplete; delete the model in the {UI_MODELS} "
                 "so it is downloaded again.",
             ) from e
         self._install(sess)

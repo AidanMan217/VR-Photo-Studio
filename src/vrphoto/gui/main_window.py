@@ -662,7 +662,8 @@ class MainWindow(QMainWindow):
             defaults = self._common_defaults()
             self.modes.apply_common_defaults(defaults, changed & common)
             self.preview.options_changed()
-        if changed & {"https_port", "http_port", "output_dir"} and self.server.running:
+        # the output folder is not served by the viewer, so only port changes need a restart
+        if changed & {"https_port", "http_port"} and self.server.running:
             self.server.restart()
         if "device" in changed:
             self._gpu_detected(getattr(self, "gpu_info", {}) or {})

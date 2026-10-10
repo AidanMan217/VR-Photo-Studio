@@ -41,7 +41,9 @@ Pipeline (docs/CONTRACTS.md, algorithm H):
 restricted to the hallucinated region (where the background layer differs from the
 front layer, plus where the front layer is transparent) and a coarse backdrop at 4x the
 stride, pushed back 1 %, whose vertex depths are the farthest depth of the adjacent
-cells so it lies behind every real surface (see :func:`layered_meshes`).
+cells so it lies behind every real surface (see :func:`layered_meshes`).  Its
+``target_faces`` is the budget of the whole scene (all layers together), split by the
+area each layer covers.
 
 :func:`decimate` reduces an arbitrary glTF-frame :class:`Mesh`; UVs of the new vertices
 come from a projective camera fitted to the input (exact for depth meshes and
@@ -71,6 +73,10 @@ BACKDROP_PUSH = 1.01  # backdrop pushed back 1 % along the viewing rays
 DETAIL_PUSH = 1.002  # background detail pushed back 0.2 % (no z-fighting with the front)
 _OVERSAMPLE = 2  # per-axis grid oversampling before quadric simplification
 _ANCHOR_WINDOW = 0.05  # half-size of the central window used for the anchor depth (fraction)
+#: Face density of background detail meshes relative to the front mesh (they are only
+#: seen in the slivers revealed by head movement, and show inpainted, smooth content).
+BACKGROUND_DENSITY = 0.5
+_BACKDROP_SHARE = 16  # backdrop budget: target_faces / 16 (4x the stride of a full-frame grid)
 _MIN_INV_Z = 1e-6
 _RGB_DIFF = 12  # colour difference (0-255) that marks an inpainted background pixel
 
@@ -377,12 +383,19 @@ def _front_screen_mesh(
     ref_baseline_m: float,
     rep: ProgressReporter,
     cancel: CancelToken | None,
+    density: int | None = None,
 ) -> _ScreenMesh | None:
-    """Cut grid mesh of a full layer, adaptively simplified when possible."""
+    """Cut grid mesh of a full layer, adaptively simplified when possible.
+
+    ``density`` is the full-frame face count of the grid (default ``target_faces``); the
+    result has at most ~``target_faces`` faces (a matte covering part of the frame at
+    ``density`` gives ``density * coverage`` faces before simplification).
+    """
     width, height = K.width, K.height
+    dens = int(target_faces if density is None else max(2, int(density)))
     over = float(_OVERSAMPLE) if _fast_simplification() is not None else 1.0
-    grid = _make_grid(width, height, target_faces, over)
-    if over > 1.0 and 2 * (grid.nx - 1) * (grid.ny - 1) <= target_faces * 1.05:
+    grid = _make_grid(width, height, dens, over)
+    if over > 1.0 and 2 * (grid.nx - 1) * (grid.ny - 1) <= dens * 1.05:
         over = 1.0  # image too small to oversample meaningfully
     rep(0.05, "Sampling depth")
     w_v, valid = _vertex_samples(inv_z, alpha, grid)
@@ -391,7 +404,7 @@ def _front_screen_mesh(
     thr = cut_px / dscale
     rep(0.2, "Building mesh")
     grid_faces = 2 * (grid.nx - 1) * (grid.ny - 1)
-    sm = _grid_mesh(w_v, valid, grid, thr, min_faces=_min_component_faces(target_faces, over, grid_faces))
+    sm = _grid_mesh(w_v, valid, grid, thr, min_faces=_min_component_faces(dens, over, grid_faces))
     _check(cancel)
     if sm is None:
         return None
@@ -568,16 +581,81 @@ def _backdrop_screen_mesh(
 
 def _anchor_depth(front: Layer, K: Intrinsics) -> float:
     """Median depth (z) of the central window of the front layer (opaque pixels)."""
-    h, w = front.inv_z.shape
+    return _window_depth(front.inv_z, front.alpha)
+
+
+def _window_depth(inv_z: np.ndarray, alpha: np.ndarray | None) -> float:
+    h, w = inv_z.shape
     r = max(1, int(round(_ANCHOR_WINDOW * min(w, h))))
     cy, cx = (h - 1) // 2, (w - 1) // 2
     sl = (slice(max(0, cy - r), min(h, cy + r + 1)), slice(max(0, cx - r), min(w, cx + r + 1)))
     for region in (sl, (slice(None), slice(None))):
-        z = np.asarray(front.inv_z[region], dtype=np.float64)
-        ok = np.isfinite(z) & (z > _MIN_INV_Z) & (np.asarray(front.alpha[region]) >= 0.5)
+        z = np.asarray(inv_z[region], dtype=np.float64)
+        ok = np.isfinite(z) & (z > _MIN_INV_Z)
+        if alpha is not None:
+            ok &= np.asarray(alpha[region]) >= 0.5
         if ok.any():
             return float(np.median(1.0 / z[ok]))
     raise MeshError("The front layer has no valid depth to anchor the scene.")
+
+
+def anchor_scale(
+    inv_z: FloatMap, K: Intrinsics, anchor_distance_m: float, *, alpha: FloatMap | None = None
+) -> float:
+    """The scale ``s`` that :func:`layered_meshes` applies for ``anchor_distance_m``.
+
+    ``inv_z`` / ``alpha`` are those of the FRONT layer (for :func:`geometry.layers.build_layers`
+    output: the photo's inverse depth, and the subject matte in clean-plate mode).  The
+    scene is scaled by ``s`` about the eye, so a real head movement ``d`` produces the
+    parallax of ``d / s`` in the depth units of ``inv_z``: look-behind content prepared
+    for a movement range ``m`` must be built for ``build_layers(max_baseline_m=m / s)``.
+    """
+    ok = isinstance(anchor_distance_m, (int, float, np.number)) and not isinstance(anchor_distance_m, bool)
+    if not (ok and math.isfinite(anchor_distance_m) and anchor_distance_m > 0):
+        raise InputError(f"anchor_distance_m must be a positive distance (got {anchor_distance_m!r}).")
+    z = np.asarray(inv_z)
+    if z.ndim != 2 or z.shape != (K.height, K.width):
+        raise InputError(f"inv_z must be {K.height}x{K.width} (got shape {z.shape}).")
+    a = None if alpha is None else np.asarray(alpha)
+    if a is not None and a.shape != z.shape:
+        raise InputError(f"alpha must have the shape of inv_z {z.shape} (got {a.shape}).")
+    return float(anchor_distance_m) / _window_depth(z, a)
+
+
+def _cell_region(diff: np.ndarray, grid: _Grid) -> np.ndarray:
+    """Grid cells holding any ``diff`` pixel, dilated by one cell."""
+    region = _pool_any(diff, grid)
+    if region.any():
+        region = cv2.dilate(region.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    return region
+
+
+def _opaque_fraction(layer: Layer) -> float:
+    """Share of pixels a layer can mesh (opaque, valid depth); subsampled for speed."""
+    h, w = layer.inv_z.shape
+    st = max(1, int(math.sqrt(h * w / 1_000_000)))
+    z = np.asarray(layer.inv_z[::st, ::st], dtype=np.float32)
+    with np.errstate(invalid="ignore"):
+        ok = np.isfinite(z) & (z > _MIN_INV_Z) & (np.asarray(layer.alpha[::st, ::st]) >= 0.5)
+    return float(ok.mean()) if ok.size else 0.0
+
+
+def _split_budget(target: int, front_cover: float, back_cover: list[float]) -> tuple[int, int, int, int]:
+    """Faces for ``(front, front grid density, background grid density, backdrop)``.
+
+    The backdrop takes ``target / 16``; the rest is shared so the front and the
+    background detail meshes (at :data:`BACKGROUND_DENSITY` of the front's density)
+    together use about the remaining budget for the areas they cover.  Densities are
+    full-frame face counts and never exceed ``target`` (the old per-layer budget).
+    """
+    backdrop = max(2, target // _BACKDROP_SHARE)
+    rest = max(2, target - backdrop)
+    weight = max(front_cover, 0.0) + BACKGROUND_DENSITY * sum(max(c, 0.0) for c in back_cover)
+    d_front = rest / max(weight, 1e-6)
+    front_faces = int(max(2, min(rest, round(d_front * max(front_cover, 0.0)))))
+    front_density = int(max(2, min(target, round(d_front))))
+    back_density = int(max(2, min(target, round(BACKGROUND_DENSITY * d_front))))
+    return front_faces, front_density, back_density, backdrop
 
 
 def _merge_parts(
@@ -606,16 +684,21 @@ def layered_meshes(
 ) -> list[Mesh]:
     """Meshes for a layered depth image, ordered back -> front, in the glTF frame.
 
-    * **Front layer**: :func:`depth_mesh`-style cut mesh with ``target_faces`` faces
-      (RGBA + MASK texture when the layer has a matte).
-    * **Background layer** (``"background"``): a detail mesh at the same grid density
-      restricted to the cells where the background differs from the front (inpainted
-      colour or pushed-back depth, i.e. the hallucinated region) or the front is
-      transparent, dilated by one cell and pushed back 0.2 % (avoids z-fighting where it
-      coincides with the front); plus an uncut backdrop at 4x the stride
-      (``target_faces/16`` faces for a full frame) whose vertex depths are the farthest
-      depth of the adjacent cells, pushed back 1 %, so revealed areas show stretched
-      background instead of holes.  Further middle layers get detail meshes only.
+    ``target_faces`` is the budget of the whole result (all meshes together, about
+    ``target_faces`` triangles), shared as follows:
+
+    * **Backdrop**: ``target_faces/16`` (4x the stride of a full-frame grid).
+    * **Front layer**: :func:`depth_mesh`-style cut mesh (RGBA + MASK texture when the
+      layer has a matte).
+    * **Background layer** (``"background"``): a detail mesh restricted to the cells
+      where the background differs from the front (inpainted colour or pushed-back
+      depth, i.e. the hallucinated region) or the front is transparent, dilated by one
+      cell and pushed back 0.2 % (avoids z-fighting where it coincides with the front);
+      plus the uncut backdrop whose vertex depths are the farthest depth of the adjacent
+      cells, pushed back 1 %, so revealed areas show stretched background instead of
+      holes.  Further middle layers get detail meshes only.
+    * The front and the detail meshes share the rest by the area they cover, the detail
+      meshes at :data:`BACKGROUND_DENSITY` times the front's face density.
     * A single-layer image yields ``[backdrop, foreground]`` (the backdrop built from
       the only layer).
 
@@ -629,6 +712,8 @@ def layered_meshes(
     side), so the image centre lands at ``(0, eye_height_m, -anchor_distance_m)`` (exact
     when the principal point is the image centre; the optical axis maps to -z, the
     horizon is not re-levelled).  Without an anchor ``s = 1`` (depth units as given).
+    :func:`anchor_scale` computes ``s`` up front (to size the look-behind layers for a
+    real head-movement range before they are built).
     """
     rep = _as_reporter(progress)
     _validate_params(target_faces, cut_px, ref_baseline_m)
@@ -648,10 +733,21 @@ def layered_meshes(
 
     scale = 1.0
     if anchor_distance_m is not None:
-        if not (math.isfinite(anchor_distance_m) and anchor_distance_m > 0):
-            raise InputError(f"anchor_distance_m must be a positive distance (got {anchor_distance_m!r}).")
-        scale = float(anchor_distance_m) / _anchor_depth(front, K)
+        scale = anchor_scale(front.inv_z, K, anchor_distance_m, alpha=front.alpha)
     offset = np.array([0.0, float(eye_height_m), 0.0])
+
+    # Face budget: total ~ target over all meshes (E2E-6: was ~2x with a full look-behind band).
+    diffs = [_differs(layer, front) for layer in layers[:-1]]
+    _check(cancel)
+    probe = _make_grid(K.width, K.height, max(2, int(target * BACKGROUND_DENSITY)), 1.0)
+    back_cover = [float(_cell_region(d, probe).mean()) for d in diffs]
+    front_faces, front_density, back_density, backdrop_faces = _split_budget(
+        target, _opaque_fraction(front), back_cover
+    )
+    log.debug(
+        "Mesh budget %d: front %d faces (grid %d), background grid %d (covers %s), backdrop %d",
+        target, front_faces, front_density, back_density, [round(c, 3) for c in back_cover], backdrop_faces,
+    )  # fmt: skip
 
     def to_scene(p: np.ndarray) -> np.ndarray:
         return (cv_to_gltf(p) * scale + offset).astype(np.float32)
@@ -662,10 +758,9 @@ def layered_meshes(
         _check(cancel)
         rep(0.5 * i / n_back, "Meshing background")
         parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        grid = _make_grid(K.width, K.height, target, 1.0)
-        region = _pool_any(_differs(layer, front), grid)
+        grid = _make_grid(K.width, K.height, back_density, 1.0)
+        region = _cell_region(diffs[i], grid)
         if region.any():
-            region = cv2.dilate(region.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
             w_v, valid = _vertex_samples(layer.inv_z, layer.alpha, grid)
             det = _grid_mesh(w_v, valid, grid, thr, region=region, min_faces=_MIN_COMPONENT_FLOOR)
             if det is not None:
@@ -673,7 +768,7 @@ def layered_meshes(
                 parts.append((p, uv, det.faces))
         _check(cancel)
         if i == 0:
-            bd = _backdrop_screen_mesh(layer.inv_z, layer.alpha, K, max(2, target // 16))
+            bd = _backdrop_screen_mesh(layer.inv_z, layer.alpha, K, backdrop_faces)
             if bd is not None:
                 p, uv = _finalize(bd, K, BACKDROP_PUSH)
                 parts.append((p, uv, bd.faces))
@@ -687,7 +782,7 @@ def layered_meshes(
         )
 
     if len(layers) == 1:
-        bd = _backdrop_screen_mesh(front.inv_z, front.alpha, K, max(2, target // 16))
+        bd = _backdrop_screen_mesh(front.inv_z, front.alpha, K, backdrop_faces)
         if bd is not None:
             p, uv = _finalize(bd, K, BACKDROP_PUSH)
             tex, mode = _layer_texture(front.rgb, front.alpha)
@@ -696,7 +791,15 @@ def layered_meshes(
     _check(cancel)
     rep(0.5, "Meshing foreground")
     sm = _front_screen_mesh(
-        front.inv_z, front.alpha, K, target, float(cut_px), float(ref_baseline_m), rep.sub(0.5, 0.98), cancel
+        front.inv_z,
+        front.alpha,
+        K,
+        front_faces,
+        float(cut_px),
+        float(ref_baseline_m),
+        rep.sub(0.5, 0.98),
+        cancel,
+        density=front_density,
     )
     if sm is None:
         raise MeshError("Nothing is left to mesh in the front layer (empty matte or invalid depth).")
@@ -829,6 +932,8 @@ def decimate(
 __all__ = [
     "depth_mesh",
     "layered_meshes",
+    "anchor_scale",
+    "BACKGROUND_DENSITY",
     "decimate",
     "vertex_normals",
     "MeshError",

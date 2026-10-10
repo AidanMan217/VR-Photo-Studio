@@ -364,6 +364,13 @@ GOOD = [
     },
     {
         "schema": "vrphoto.scene/1",
+        "id": "c",
+        "title": "C",
+        "mode": "object",
+        "object": {"asset": "capture.splat", "format": "splat", "scale": 1.0, "height_m": 1.7},
+    },
+    {
+        "schema": "vrphoto.scene/1",
         "id": "w",
         "title": "W",
         "mode": "splat",
@@ -408,6 +415,13 @@ BAD_FOR_VIEWER = [
         "title": "B",
         "mode": "stereo",
         "stereo": {"media": "x.jpg", "kind": "image", "layout": "sbs", "distance_m": -1},
+    },
+    {
+        "schema": "vrphoto.scene/1",
+        "id": "b",
+        "title": "B",
+        "mode": "object",
+        "object": {"asset": "c.splat", "format": "splat", "scale": 0},
     },
 ]
 

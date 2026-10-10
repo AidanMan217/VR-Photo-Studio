@@ -102,6 +102,7 @@ class QuestDialog(QDialog):
         self.adb_path: str | None = None
         self.devices: list[str] = []
         self._usb_after_start = False  # "Set up USB" was clicked while the viewer was stopped
+        self._http_problem_text = ""  # last "USB (http) port busy" message shown in the USB tab
         self._long_tasks: set[str] = set()  # "copy" / "install" while running (asked on close)
 
         self.tabs = QTabWidget()
@@ -259,9 +260,25 @@ class QuestDialog(QDialog):
         self._update_focus()
         self.check_firewall()
         self.usb_steps.setText(USB_STEPS.format(port=self._http_port()))
+        self._show_http_problem()
         if self._usb_after_start:
             self._usb_after_start = False
             self.setup_usb()
+
+    def _show_http_problem(self) -> str:
+        """Tell the USB tab when the configured http port was busy (Wi-Fi still works).
+
+        Returns the problem text only when USB mode is unavailable (no http listener at all);
+        a note about a substitute port is shown but does not block USB mode.
+        """
+        problem = self.ctl.http_problem()
+        text = problem or self.ctl.http_note()
+        if text:
+            self.usb_result.setText(text)
+        elif self.usb_result.text() == self._http_problem_text:
+            self.usb_result.setText("")
+        self._http_problem_text = text
+        return problem
 
     def _update_focus(self) -> None:
         url = self.current_url()
@@ -395,7 +412,10 @@ class QuestDialog(QDialog):
         if self.net is None:
             return
         self.fw_label.setText("Waiting for Windows to ask for permission…")
-        ports = [self._https_port(), self._http_port()]
+        # Only the Wi-Fi (https) port: the USB (http) listener is bound to 127.0.0.1 (desktop
+        # browser and adb reverse), which the firewall never filters.  Opening it would expose
+        # whatever other program listens on that port to the whole network.
+        ports = [self._https_port()]
         self.tasks.start(
             self.net.add_firewall_rule,
             ports,
@@ -571,6 +591,8 @@ class QuestDialog(QDialog):
             self._usb_after_start = True
             self.usb_result.setText("Starting the live viewer first…")
             self.start_server()
+            return
+        if self._show_http_problem():  # the http (USB) listener did not start
             return
         port = self._http_port()
         q = self.quest

@@ -483,7 +483,9 @@ def test_quest_dialog_wifi(qtbot, settings, controller, fake_quest, library_scen
     assert "10.0.0.2" in dlg.other_urls.text()
     qtbot.waitUntil(lambda: "BLOCKED" in dlg.fw_label.text(), timeout=5000)
     dlg.fw_button.click()
-    qtbot.waitUntil(lambda: ("fw", (8443, 8080)) in fake_quest, timeout=5000)
+    # only the Wi-Fi (https) port: the http listener is localhost-only (SEC-3)
+    qtbot.waitUntil(lambda: ("fw", (8443,)) in fake_quest, timeout=5000)
+    assert not any(c[0] == "fw" and 8080 in c[1] for c in fake_quest)
     dlg.copy_url()
     from PySide6.QtGui import QGuiApplication
 
@@ -627,6 +629,192 @@ def test_server_controller_real_server(qtbot, settings, tmp_path):
     assert not ctl.running
 
 
+def test_server_controller_does_not_share_the_output_folder(qtbot, settings, monkeypatch):
+    """SEC-1: the viewer serves only the viewer app and the scene library - never the
+    output folder (which may be Documents, the user profile or a whole drive)."""
+    from vrphoto.gui.server_ctl import ServerController
+    from vrphoto.webxr import server as srv_mod
+
+    made: list[tuple[tuple, dict]] = []
+
+    class Recorder:
+        def __init__(self, *args, **kwargs):
+            made.append((args, kwargs))
+
+    monkeypatch.setattr(srv_mod, "ViewerServer", Recorder)
+    ServerController(settings)._make()
+    ((args, kwargs),) = made
+    assert Path(args[0]) == Path(settings.library_dir)
+    assert "files_dir" not in kwargs
+    assert kwargs["https_port"] == int(settings.https_port) and kwargs["http_port"] == int(settings.http_port)
+
+
+def test_server_controller_real_server_hides_output_files(qtbot, settings):
+    """With the real server, a file in the output folder cannot be downloaded."""
+    pytest.importorskip("vrphoto.webxr.server")
+    import urllib.error
+    import urllib.request
+
+    from vrphoto.gui.server_ctl import ServerController
+
+    secret = Path(settings.outputs_dir) / "notes.txt"
+    secret.write_text("secret notes", encoding="utf-8")
+    settings.https_port = 0
+    settings.http_port = 0
+    ctl = ServerController(settings)
+    with qtbot.waitSignals([ctl.started], timeout=30000, raising=False) as blocker:
+        ctl.start()
+    if not blocker.signal_triggered:
+        pytest.skip(f"viewer server could not start here: {ctl.last_error}")
+    try:
+        assert getattr(ctl.server, "files_dir", None) is None
+        base = ctl.local_url()
+        assert base.startswith("http://localhost:")
+        base = base.replace("localhost", "127.0.0.1")
+        for path in ("files/notes.txt", "api/files"):
+            with pytest.raises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(base + path, timeout=10).read()
+            assert err.value.code == 404, path
+    finally:
+        ctl.shutdown()
+
+
+class _NoHttpServer:
+    """A viewer whose localhost http listener could not bind (port busy): https only."""
+
+    def __init__(self, settings=None):
+        self.running = False
+        self.https_port = 8443
+        self.http_port = None
+
+    def start(self):
+        self.running = True
+
+    def stop(self):
+        self.running = False
+
+    def urls(self):
+        return {"https": "https://192.168.1.5:8443/"}
+
+
+def test_server_controller_reports_busy_http_port(qtbot, settings):
+    """E2E-2: Wi-Fi keeps working when the USB (http) port is busy; the controller explains it."""
+    from vrphoto.gui.server_ctl import ServerController
+
+    ctl = ServerController(settings, server_factory=_NoHttpServer)
+    try:
+        assert ctl.http_problem() == ""  # not running yet
+        with qtbot.waitSignal(ctl.started, timeout=5000):
+            ctl.start()
+        assert ctl.https_url() == "https://192.168.1.5:8443/" and ctl.local_url() == ""
+        problem = ctl.http_problem()
+        assert str(settings.http_port) in problem and "USB (http) port" in problem
+        assert "Settings" in problem and "Wi-Fi works" in problem
+    finally:
+        ctl.shutdown()
+
+
+def test_server_controller_no_http_problem_when_local_url_exists(qtbot, settings, fake_server_factory):
+    from vrphoto.gui.server_ctl import ServerController
+
+    ctl = ServerController(settings, server_factory=fake_server_factory)
+    try:
+        with qtbot.waitSignal(ctl.started, timeout=5000):
+            ctl.start()
+        assert ctl.local_url() and ctl.http_problem() == ""
+    finally:
+        ctl.shutdown()
+
+
+class _SubstituteHttpServer(_NoHttpServer):
+    """The configured http port was busy; the server fell back to another free port."""
+
+    http_error = RuntimeError("Port 18080 is already in use or reserved")
+
+    def urls(self):
+        return {"https": "https://192.168.1.5:8443/", "local": "http://localhost:51234/"}
+
+
+def test_server_controller_notes_substitute_http_port(qtbot, settings):
+    from vrphoto.gui.server_ctl import ServerController
+
+    ctl = ServerController(settings, server_factory=_SubstituteHttpServer)
+    try:
+        with qtbot.waitSignal(ctl.started, timeout=5000):
+            ctl.start()
+        assert ctl.http_problem() == ""  # USB mode still works, on the other port
+        note = ctl.http_note()
+        assert str(settings.http_port) in note and "51234" in note and "Settings" in note
+    finally:
+        ctl.shutdown()
+
+
+def test_server_controller_real_server_survives_busy_http_port(qtbot, settings):
+    """E2E-2 end to end: a program holding the USB (http) port does not stop the Wi-Fi viewer."""
+    pytest.importorskip("vrphoto.webxr.server")
+    import socket
+
+    from vrphoto.gui.server_ctl import ServerController
+
+    blocker_sock = socket.socket()
+    try:
+        blocker_sock.bind(("127.0.0.1", 0))
+        blocker_sock.listen()
+        settings.https_port = 0
+        settings.http_port = blocker_sock.getsockname()[1]
+        ctl = ServerController(settings)
+        ctl.start()
+        try:
+            qtbot.waitUntil(lambda: not ctl.busy and (ctl.running or ctl.last_error), timeout=30000)
+        except Exception:
+            ctl.shutdown()
+            pytest.skip("viewer server did not start in time here")
+        if not ctl.running:
+            if "HTTPS" in (ctl.last_error or "") or "certificate" in (ctl.last_error or ""):
+                pytest.skip(f"viewer server could not start here: {ctl.last_error}")
+            raise AssertionError(f"Wi-Fi viewer did not start: {ctl.last_error}")
+        try:
+            assert ctl.https_url().startswith("https://")
+            local = ctl.local_url()
+            assert f":{settings.http_port}/" not in local
+            assert ctl.http_problem() or ctl.http_note()  # the user is told either way
+        finally:
+            ctl.shutdown()
+    finally:
+        blocker_sock.close()
+
+
+def test_quest_dialog_usb_tab_explains_busy_http_port(qtbot, settings, fake_quest):
+    """The USB tab says the http port is busy and does not set up adb reverse to it; Open on
+    this PC falls back to the https address."""
+    from vrphoto.gui import util
+    from vrphoto.gui.dialogs.quest_dialog import QuestDialog
+    from vrphoto.gui.server_ctl import ServerController
+
+    ctl = ServerController(settings, server_factory=_NoHttpServer)
+    opened: list[str] = []
+    try:
+        dlg = QuestDialog(controller=ctl, settings=settings)
+        qtbot.addWidget(dlg)
+        dlg.show()
+        qtbot.waitUntil(lambda: dlg.url_label.text() == "https://192.168.1.5:8443/", timeout=5000)
+        assert "USB (http) port" in dlg.usb_result.text()
+        dlg.usb_result.setText("")
+        dlg.setup_usb()
+        assert "USB (http) port" in dlg.usb_result.text()
+        assert not any(c[0] in ("reverse", "open") for c in fake_quest)
+        orig = util.open_url
+        util.open_url = lambda url: opened.append(url) or True
+        try:
+            dlg.open_on_pc()
+        finally:
+            util.open_url = orig
+        assert opened == ["https://192.168.1.5:8443/"]
+        dlg.close()
+    finally:
+        ctl.shutdown()
+
+
 # =========================================================================== Settings
 def test_settings_dialog_saves(qtbot, settings, isolated_home):
     from vrphoto.core.config import Settings, get_settings
@@ -680,6 +868,18 @@ def test_settings_dialog_validation(qtbot, settings):
     assert not dlg.save()
     assert "different" in dlg.error_label.text()
     assert dlg.isVisible()
+    dlg.reject()
+
+
+def test_settings_dialog_explains_what_the_viewer_shares(qtbot, settings):
+    """SEC-1: the viewer shares the viewer and its scene library only, never the output folder."""
+    from vrphoto.gui.dialogs.settings_dialog import SettingsDialog
+
+    dlg = SettingsDialog(settings=settings)
+    qtbot.addWidget(dlg)
+    tip = dlg.https_port.toolTip()
+    assert "scenes in its library" in tip and "not your output folder" in tip
+    assert "only reachable from this PC" in dlg.http_port.toolTip()
     dlg.reject()
 
 

@@ -35,8 +35,10 @@
 #define AppURL "https://github.com/AidanMan217/VR-Photo-Studio"
 ; Must match vrphoto.core.config.data_root() on Windows: %LOCALAPPDATA%\VRPhotoStudio
 #define DataDirName "VRPhotoStudio"
-; Inbound ports used by the WebXR viewer server (HTTPS for the Quest, HTTP for localhost/USB)
-#define ViewerPorts "8443,8080"
+; Inbound port of the WebXR viewer server: only the HTTPS (Wi-Fi) port.  The HTTP port (8080) is
+; bound to 127.0.0.1 for the desktop browser and USB (adb reverse), which the firewall never
+; filters - opening it would expose any other program listening on 8080 to the network.
+#define ViewerPorts "8443"
 ; Same name as vrphoto.webxr.net.FIREWALL_RULE_NAME, so the uninstaller also removes a rule the app added
 #define FirewallRuleName "VR Photo Studio"
 
@@ -128,7 +130,9 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 ; Windows creates per-program *block* rules when someone dismisses its "allow access" prompt, and
 ; block rules win over allow rules - remove any left over from an earlier install (as the app does).
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=all dir=in program=""{app}\{#AppExe}"""; Flags: runhidden waituntilterminated; Tasks: firewall
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRuleName}"" dir=in action=allow protocol=TCP localport={#ViewerPorts} profile=private,domain description=""Lets your Meta Quest open the VR Photo Studio viewer over Wi-Fi"""; StatusMsg: "{cm:FirewallStatus}"; Flags: runhidden waituntilterminated; Tasks: firewall
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=all dir=in program=""{app}\{#CliExe}"""; Flags: runhidden waituntilterminated; Tasks: firewall
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRuleName}"" dir=in action=allow protocol=TCP localport={#ViewerPorts} profile=private,domain program=""{app}\{#AppExe}"" description=""Lets your Meta Quest open the VR Photo Studio viewer over Wi-Fi"""; StatusMsg: "{cm:FirewallStatus}"; Flags: runhidden waituntilterminated; Tasks: firewall
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#FirewallRuleName}"" dir=in action=allow protocol=TCP localport={#ViewerPorts} profile=private,domain program=""{app}\{#CliExe}"" description=""Lets your Meta Quest open the VR Photo Studio viewer over Wi-Fi"""; Flags: runhidden waituntilterminated; Tasks: firewall
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]

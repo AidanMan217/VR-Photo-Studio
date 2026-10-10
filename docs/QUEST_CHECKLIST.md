@@ -31,7 +31,7 @@ issue).
 | A2 | Choose **Install for me only** (default). Click through (license page shows MIT + third-party notices) | Installs without asking for an administrator password; into `%LOCALAPPDATA%\Programs\VR Photo Studio` | | |
 | A3 | Finish with "Launch VR Photo Studio" ticked | The app window opens within ~15 s | | |
 | A4 | Start menu: search "VR Photo Studio" | Shortcut exists and starts the app | | |
-| A5 | (Optional) Run the installer again and choose **Install for all users**; tick **Allow Quest headset to connect** | Windows asks for permission; install completes; a firewall rule named "VR Photo Studio" exists (*Windows Defender Firewall → Advanced settings → Inbound Rules*) | | |
+| A5 | (Optional) Run the installer again and choose **Install for all users**; tick **Allow Quest headset to connect** | Windows asks for permission; install completes; a firewall rule named "VR Photo Studio" for TCP port **8443** exists (*Windows Defender Firewall → Advanced settings → Inbound Rules*) | | |
 | A6 | Open a Command Prompt in the install folder and run `vrphoto-cli.exe --selftest` | Prints a health report ending in OK | | paste the output in the report |
 
 ## B. First start
@@ -40,7 +40,7 @@ issue).
 |---|---|---|---|---|
 | B1 | Open **Settings** (toolbar) | *Device* lists your NVIDIA GPU; *Headset* can be set to **Meta Quest 3 / 3S** | | GPU name: |
 | B2 | Drag **P2** into the window | The photo appears; a preview/thumbnail is shown | | |
-| B3 | Mode **Depth Map**, click **Create Depth Map** | First time: model download progress (~100 MB), then a depth preview (near = bright) and files in `Pictures\VR Photo Studio` | | time: |
+| B3 | Mode **Depth Map**, click **Create Depth Map** | First time: model download progress (~100 MB), then a depth preview (near = bright); **File → Open output folder** shows the files (default `Pictures\VR Photo Studio`) | | time: |
 | B4 | Drag **P3** (HEIC) in and make a depth map | HEIC opens correctly (not rotated, correct colours) | | |
 | B5 | Close and reopen the app | Settings are kept; no new model download | | |
 
@@ -52,7 +52,7 @@ For each, use the default settings first. Write the processing time.
 |---|---|---|---|---|
 | C1 | **3D Photo** with P2, layout side-by-side | `..._LR.jpg` created; two slightly different images side by side | | |
 | C2 | **3D Photo** with P2, layout *Anaglyph* (if you have red/cyan glasses) | Red/cyan image with visible depth through the glasses | | |
-| C3 | **Living Photo** with P2, camera movement *Circle*, output *Flat video* | `..._parallax.mp4` plays on the PC (double-click); smooth loop, no big smears | | |
+| C3 | **Living Photo** with P2, camera movement *Circle*, output *Flat video* | `..._parallax.mp4` (H.264, at most 1920 px wide) plays on the PC when double-clicked (Windows' own player); smooth loop, no big smears | | |
 | C4 | **Living Photo** with P2, output *VR180 3D video* | `..._parallax_180_LR.mp4` created | | |
 | C5 | **VR180** with P1 | `..._180_LR.jpg` created; edges filled with a soft blur | | |
 | C6 | **360** with P4 (if available) | `..._360_TB.jpg` created (two 360 images on top of each other) | | |
@@ -82,7 +82,7 @@ For each, use the default settings first. Write the processing time.
 | ID | Steps | Expected | Result | Notes |
 |---|---|---|---|---|
 | E1 | Click **Send to Quest** | The viewer starts; address `https://<PC address>:8443/` and a QR code are shown; Windows may ask about the firewall → allow on **Private** networks. The *Firewall* line says the port is open (if not: click **Allow through firewall**) | | address: |
-| E2 | Click **Open on this PC** (or type the address into your PC's browser) | Certificate warning, then the gallery appears | | |
+| E2 | Click **Open on this PC** | The gallery opens in your PC's browser (no warning - it uses the local `http://localhost:8080/` address). If you type the `https://` address into the PC's browser instead, accept the certificate warning first | | |
 | E3 | In the **Quest Browser** type the address | "Your connection is not private" → **Advanced → Proceed** → gallery with thumbnails | | |
 | E4 | Open the C8 **3D Scene**, press **Enter VR** | The photo appears as 3D in front of you; leaning left/right/forward shows depth; background behind the foreground is filled (no big holes) | | comfort 1-5: |
 | E5 | Open the C10 **Person / Object** (billboard), press **Enter AR (passthrough)** | Your room is visible; the person can be placed on the floor at life size (aim at the floor, pull the trigger); you can walk around it | | |
@@ -119,7 +119,7 @@ For each, use the default settings first. Write the processing time.
 | ID | Steps | Expected | Result | Notes |
 |---|---|---|---|---|
 | H1 | *Settings → Apps → VR Photo Studio → Uninstall* | Program removed; you are **asked** whether to delete models/add-ons/settings (answer **No** the first time) | | |
-| H2 | Check `%LOCALAPPDATA%\VRPhotoStudio` and `Pictures\VR Photo Studio` | Both still exist (your creations are never deleted) | | |
+| H2 | Check `%LOCALAPPDATA%\VRPhotoStudio` and your output folder (default `Pictures\VR Photo Studio`) | Both still exist (your creations are never deleted) | | |
 | H3 | Reinstall | Works; models are not downloaded again | | |
 
 ---

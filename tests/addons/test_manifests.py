@@ -245,3 +245,14 @@ def test_release_checksums_match_the_published_digests():
     got = {s["url"].rsplit("/", 1)[-1]: s.get("sha256") for s in manager.get_manifest("capture").steps
            if s["type"] == "archive"}
     assert got == want
+
+
+def test_trellis2_birefnet_dependencies_and_pin():
+    """ADDON-TRELLIS2-EINOPS: BiRefNet's executed model code needs einops, and that code
+    must be a fixed commit (trust_remote_code)."""
+    m = load_manifest(manifests_dir() / "trellis2.toml")
+    pkgs = [p for s in m.steps if s["type"] == "pip" for p in s.get("packages", [])]
+    assert any(re.fullmatch(r"einops==[\d.]+", p) for p in pkgs)
+    rembg = [s for s in m.steps if s["type"] == "hf_download" and s.get("local_dir") == "MODELS/RMBG-2.0"]
+    assert len(rembg) == 1 and rembg[0]["repo"] == "ZhengPeng7/BiRefNet"
+    assert re.fullmatch(r"[0-9a-f]{40}", rembg[0]["revision"])

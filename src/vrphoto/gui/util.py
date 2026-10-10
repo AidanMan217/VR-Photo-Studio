@@ -23,9 +23,10 @@ from ..core.log import get_logger
 
 log = get_logger(__name__)
 
-#: Repository / documentation links shown in Help menus and dialogs.
+#: Repository / documentation links shown in Help menus and dialogs.  ``blob/HEAD`` always
+#: follows the repository's default branch (whatever it is called).
 PROJECT_URL = "https://github.com/AidanMan217/VR-Photo-Studio"
-USER_GUIDE_URL = f"{PROJECT_URL}/blob/main/docs/USER_GUIDE.md"
+USER_GUIDE_URL = f"{PROJECT_URL}/blob/HEAD/docs/USER_GUIDE.md"
 ISSUES_URL = f"{PROJECT_URL}/issues"
 
 
@@ -113,6 +114,37 @@ def file_dialog_filter() -> str:
 
 
 # --------------------------------------------------------------------------- image loading (worker threads)
+#: Inputs are the user's own photos: allow very large ones (200 MP phone modes are ~200 M px,
+#: above Pillow's default "decompression bomb" limit of ~179 M px).  Thumbnails decode JPEGs
+#: at reduced size (``draft``), so a big limit costs no memory there.
+MAX_IMAGE_PIXELS = 1_000_000_000
+
+
+def _allow_large_images() -> None:
+    """Raise Pillow's pixel limit to :data:`MAX_IMAGE_PIXELS` (never lowers it)."""
+    from PIL import Image
+
+    cur = Image.MAX_IMAGE_PIXELS
+    if cur is not None and cur < MAX_IMAGE_PIXELS:
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+
+def _too_large_error(path: Path | None, exc: BaseException):
+    """A friendly :class:`InputError` for Pillow's DecompressionBombError (instead of its
+    "could be decompression bomb DOS attack" text, which reads like a security alert)."""
+    import re
+
+    from ..core.errors import InputError
+
+    m = re.search(r"\((\d+) pixels\)", str(exc))
+    size = f" ({int(m.group(1)) / 1e6:.0f} MP)" if m else ""
+    what = f"The photo {path.name}" if path is not None else "This photo"
+    return InputError(
+        f"{what} is too large{size}.",
+        hint="Save a smaller copy of the photo (for example 50 megapixels or less) and use that.",
+    )
+
+
 def _open_pil_fast(path: Path, size: int):
     """Open an image with Pillow, decoding JPEGs at reduced size (``draft``) for speed."""
     from PIL import Image, ImageOps
@@ -122,7 +154,11 @@ def _open_pil_fast(path: Path, size: int):
     reg = getattr(imaging, "_register_heif", None)
     if callable(reg):
         reg()
-    im = Image.open(path)
+    _allow_large_images()
+    try:
+        im = Image.open(path)
+    except Image.DecompressionBombError as e:
+        raise _too_large_error(Path(path), e) from e
     try:
         im.draft("RGB", (size, size))
     except Exception:  # draft is a no-op / unsupported for many formats
@@ -131,6 +167,12 @@ def _open_pil_fast(path: Path, size: int):
         im = ImageOps.exif_transpose(im)
     except Exception:
         pass
+    to_srgb = getattr(imaging, "to_srgb", None)
+    if callable(to_srgb):  # match the colours the pipeline uses (ICC profiles -> sRGB)
+        try:
+            im = to_srgb(im)
+        except Exception:
+            pass
     return im
 
 
@@ -188,7 +230,7 @@ def load_preview_source(path: str | Path, max_long: int = 1600) -> np.ndarray:
     p = Path(path)
     if is_video_path(p):
         return video_first_frame(p, max_long=max_long)
-    img = load_image(p)
+    img = load_image(p, max_px=max_long)  # big JPEGs decode at reduced scale (fast, little RAM)
     return np.ascontiguousarray(limit_long(img, max_long)[0])
 
 
@@ -261,6 +303,11 @@ def error_text(exc: BaseException | str) -> tuple[str, str | None]:
 
     if isinstance(exc, VRPhotoError):
         return str(exc) or type(exc).__name__, getattr(exc, "hint", None)
+    from PIL import Image
+
+    if isinstance(exc, Image.DecompressionBombError):
+        err = _too_large_error(None, exc)
+        return str(err), err.hint
     if isinstance(exc, MemoryError):
         return (
             "The computer ran out of memory.",

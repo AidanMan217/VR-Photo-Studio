@@ -31,9 +31,12 @@ First public version.
   first use: Depth Anything V2 (Small/Base/Large), MoGe-2, Depth Anything 3 (experimental), LaMa,
   MI-GAN, BiRefNet, IS-Net, U2-Net. Non-commercial models are clearly marked.
 - **Live WebXR viewer** served from the PC to the Quest Browser over self-signed HTTPS (Wi-Fi) or
-  USB (adb reverse): gallery, Enter VR / Enter AR, meshes, splats, VR180/360 and 3D photos.
+  USB (adb reverse): gallery, Enter VR / Enter AR, meshes, splats, VR180/360 and 3D photos. It shares
+  only the viewer and its scene library (never the output folder); the firewall rule opens only the
+  HTTPS port.
 - Quest-friendly output names (`_LR`, `_TB`, `_180_LR`, `_360_TB`, `_360`), spatial video metadata
-  and GPano photo metadata; HEVC/H.264 presets for Quest 3 and Quest 2 (NVENC when available).
+  and GPano photo metadata; HEVC presets for Quest 3 and Quest 2 (NVENC when available) and H.264 for
+  flat videos that play on phones and PCs.
 - Add-on manager that installs heavy PyTorch/CUDA tools into private uv environments: Capture to 3D
   (COLMAP + Brush), TRELLIS, AI outpainting for VR180/360 (SDXL), and the experimental SHARP,
   TRELLIS.2 and Hunyuan3D-2.

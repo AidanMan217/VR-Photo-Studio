@@ -451,6 +451,12 @@ def test_write_dist_extras(tmp_path):
     assert "9.8.7" in (dist / "README.txt").read_text(encoding="utf-8")
 
 
+def test_dist_readme_links_follow_the_default_branch():
+    """The repository has no 'main' branch: blob/HEAD follows the default branch."""
+    assert "/blob/main/" not in H.DIST_README
+    assert "/blob/HEAD/docs/USER_GUIDE.md" in H.DIST_README
+
+
 def test_write_dist_extras_missing_dir(tmp_path):
     with pytest.raises(H.BuildError, match="does not exist"):
         H.write_dist_extras(tmp_path / "nope", root=_fake_root(tmp_path))

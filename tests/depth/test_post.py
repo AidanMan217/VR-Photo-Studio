@@ -122,8 +122,11 @@ def test_temporal_align_recovers_scale_shift():
     rng = np.random.default_rng(4)
     prev = rng.random((60, 80)).astype(np.float32) * 0.8 + 0.1
     cur = (prev - 0.1) / 2.0  # same scene, model drifted in scale + offset
-    out = temporal_align(prev, cur, ema=0.0)
+    out = temporal_align(prev, cur, ema=0.0, range_pull=0.0)
     np.testing.assert_allclose(out, prev, atol=1e-3)
+    # by default the range only moves a little toward the current frame's (no jump)
+    soft = temporal_align(prev, cur, ema=0.0)
+    assert np.abs(soft - prev).max() < 0.2 * np.abs(cur - prev).max()
     assert temporal_align(None, cur) is not cur
     np.testing.assert_array_equal(temporal_align(None, cur), cur)
 
@@ -150,6 +153,7 @@ def test_temporal_align_shape_mismatch_and_degenerate():
     assert out.shape == (20, 20) and np.isfinite(out).all()
     inverted = temporal_align(prev, 1.0 - prev, ema=0.0)  # inverted fit is rejected
     assert inverted.shape == prev.shape and np.isfinite(inverted).all()
+    np.testing.assert_array_equal(inverted, 1.0 - prev)  # treated as a new shot
 
 
 def test_depth_edges():

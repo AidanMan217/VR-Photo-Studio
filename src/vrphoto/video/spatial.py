@@ -12,7 +12,8 @@
 The box tree is parsed and re-serialised with the vendored Google ``spatialmedia``
 library, which rewrites ``stco``/``co64`` chunk offsets when the ``moov`` box grows and
 keeps the box order, so a faststart file (``moov`` before ``mdat``) stays faststart.
-The file is replaced atomically (temp file + ``os.replace``).  :func:`read` reports what
+The file is replaced atomically (temp file + ``os.replace``, retried while Windows
+reports the fresh file as busy).  :func:`read` reports what
 a file contains.  Meta Quest players also rely on the filename tokens (``_180_LR``,
 ``_360_TB``...), which the pipeline adds.
 """
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from ..core.errors import EncodeError, InputError
+from ..core.fsutil import replace_with_retry
 from ..core.log import get_logger
 
 log = get_logger(__name__)
@@ -283,15 +285,19 @@ def inject(path: str | os.PathLike[str], *, coverage: int, stereo: str) -> Path:
             shutil.copymode(p, tmp)  # keep the original file permissions
         except OSError as exc:  # pragma: no cover - exotic filesystems
             log.debug("Could not copy permissions of %s: %s", p.name, exc)
-        os.replace(tmp, p)
+        replace_with_retry(tmp, p)  # Explorer thumbnailer / AV / sync may hold the fresh MP4
     except EncodeError:
         tmp.unlink(missing_ok=True)
         raise
     except OSError as exc:
         tmp.unlink(missing_ok=True)
+        busy = isinstance(exc, PermissionError)
         raise EncodeError(
             f"Could not write spatial metadata to {p.name}: {exc}",
-            hint="Close any program (player, Quest server) that has the video open and try again.",
+            hint="The file is busy (another program or antivirus). Close any player that shows the "
+            "video and try again."
+            if busy
+            else "Check that the disk has free space and the folder is writable, then try again.",
         ) from exc
     except Exception as exc:  # parser failure on an unusual file
         tmp.unlink(missing_ok=True)

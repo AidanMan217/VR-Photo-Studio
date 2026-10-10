@@ -37,7 +37,7 @@ from urllib.parse import urlparse
 
 from .. import __version__
 from ..core.config import get_settings
-from ..core.errors import Cancelled, DownloadError, ModelUnavailable
+from ..core.errors import UI_SETTINGS_MODELS, Cancelled, DownloadError, ModelUnavailable
 from ..core.log import get_logger
 from ..core.types import CancelToken, ProgressReporter
 from .registry import ModelSpec, env_var_for, file_url, get_spec, hf_endpoint
@@ -543,7 +543,7 @@ def _raise_http(e: urllib.error.HTTPError, title: str, url: str) -> None:
         is_hf = host == (urlparse(hf_endpoint()).hostname or "")
         hint = (
             "This model may require a free Hugging Face account: open the model page, accept "
-            "its licence, then paste an access token in Settings > Models. (Hugging Face also "
+            f"its licence, then paste an access token in {UI_SETTINGS_MODELS}. (Hugging Face also "
             "answers this way when a model has been moved or deleted - then check for an app update.)"
             if is_hf
             else "The server refused access; the download location may have changed - check for an app update."

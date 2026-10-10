@@ -184,7 +184,63 @@ def handle(task: str, inputs: dict, params: dict, out_dir: Path, progress: Progr
     return {"glb": str(glb_path), "preview": str(preview_path)}
 
 
-_IMPORTS = ("xformers", "o_voxel", "cumesh", "flex_gemm", "nvdiffrast.torch", "utils3d", "transformers", "kornia", "timm")
+_IMPORTS = (
+    "xformers",
+    "o_voxel",
+    "cumesh",
+    "flex_gemm",
+    "nvdiffrast.torch",
+    "utils3d",
+    "transformers",
+    "kornia",
+    "timm",
+    "einops",
+)
+REMBG_DIR = ("MODELS", "RMBG-2.0")
+
+
+def _remote_code_entry_files(folder: Path) -> list[Path]:
+    """Python files the model's ``config.json`` ``auto_map`` points at (``birefnet.py`` by default)."""
+    import json
+
+    names: list[str] = []
+    try:
+        auto_map = json.loads((folder / "config.json").read_text(encoding="utf-8")).get("auto_map") or {}
+        for ref in auto_map.values():
+            ref = ref[0] if isinstance(ref, (list, tuple)) and ref else ref
+            if isinstance(ref, str) and "." in ref:
+                names.append(ref.split("--")[-1].rsplit(".", 1)[0])
+    except (OSError, ValueError, AttributeError):
+        pass
+    files = [folder / f"{n}.py" for n in dict.fromkeys(names)]
+    files = [f for f in files if f.is_file()]
+    return files or [f for f in [folder / "birefnet.py"] if f.is_file()]
+
+
+def check_remote_code(folder: Path) -> str | None:
+    """Verify that every package the background remover's downloaded model code imports is
+    installed - the check transformers runs before executing ``trust_remote_code`` files -
+    so a missing one fails the install check instead of the first generation.  Returns an
+    error description, or None when everything is importable (or nothing is downloaded)."""
+    todo = _remote_code_entry_files(folder)
+    if not todo:
+        return None
+    try:
+        from transformers.dynamic_module_utils import check_imports
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    seen: set[Path] = set()
+    while todo:
+        f = todo.pop()
+        if f in seen:
+            continue
+        seen.add(f)
+        try:
+            relative = check_imports(f)
+        except Exception as e:
+            return f"{f.name}: {type(e).__name__}: {e}"
+        todo.extend(p for p in (folder / f"{r}.py" for r in relative) if p.is_file())
+    return None
 
 
 def check(require_gpu: bool) -> dict:
@@ -201,6 +257,9 @@ def check(require_gpu: bool) -> dict:
         _setup_path()
     except WorkerError as e:
         failures["models"] = str(e)
+    problem = check_remote_code(addon_dir().joinpath(*REMBG_DIR))
+    if problem:
+        failures["background remover (BiRefNet)"] = problem
     if failures:
         detail = "; ".join(f"{k}: {v}" for k, v in failures.items())
         gpu_only = all(("DLL" in v or "CUDA" in v or "nvcuda" in v) for v in failures.values())

@@ -506,7 +506,7 @@ class AddonsDialog(QDialog):
                 details="1. Create an account at https://huggingface.co\n"
                 "2. Open the model page linked on the add-on card and accept its terms\n"
                 "3. Create a 'Read' token under Settings > Access Tokens\n"
-                "4. Paste it into VR Photo Studio: Settings > Hugging Face token",
+                "4. Paste it into VR Photo Studio: Settings > AI models > Hugging Face token",
             )
             return False
         warn = [t for lvl, t in requirement_notes(m, self.gpu, self._free_gb()) if lvl == "warn"]

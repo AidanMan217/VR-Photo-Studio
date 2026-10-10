@@ -302,9 +302,11 @@ def test_layered_background_detail_follows_the_hallucinated_region(two_plane_sce
         rtol=1e-5,
     )
     assert detail.sum() > 100
-    # detail vertices stay near the hallucinated ring (dilated by one grid cell)
-    stride = np.sqrt((s.K.width - 1) * (s.K.height - 1) * 2 / 20000.0)
+    # detail vertices stay near the hallucinated ring (dilated by one grid cell of the
+    # background grid, which is coarser than the front's: BACKGROUND_DENSITY)
     pd = px[detail]
+    stride = float(np.median(np.diff(np.unique(np.round(pd[:, 0])))))
+    assert stride >= np.sqrt((s.K.width - 1) * (s.K.height - 1) * 2 / 20000.0)
     assert pd[:, 0].min() > 120 - 2 * stride and pd[:, 0].max() < 200 + 2 * stride
     assert pd[:, 1].min() > 80 - 2 * stride and pd[:, 1].max() < 160 + 2 * stride
     core = (
@@ -375,6 +377,76 @@ def test_layered_meshes_validation_and_cancel(two_plane_scene):
     seen = []
     layered_meshes(li, target_faces=5000, progress=lambda f, m: seen.append(f))
     assert seen[-1] == pytest.approx(1.0)
+
+
+def _total_faces(meshes: list[Mesh]) -> int:
+    return int(sum(len(m.faces) for m in meshes))
+
+
+def _full_band(s) -> LayeredImage:
+    """Like the default look-behind band: the background differs from the front on
+    (almost) every pixel (98 % in real photos)."""
+    bg_inv = (s.inv_z * 0.9).astype(np.float32)  # pushed back everywhere
+    bg_rgb = np.clip(s.img.astype(np.int16) + 40, 0, 255).astype(np.uint8)
+    ones = np.ones(s.inv_z.shape, np.float32)
+    return LayeredImage([Layer(bg_rgb, bg_inv, ones.copy()), Layer(s.img, s.inv_z, ones.copy())], s.K)
+
+
+@pytest.mark.parametrize("target", [8000, 20000])
+def test_layered_total_faces_follow_the_detail_setting(simplify_mode, two_plane_scene, target):
+    """E2E-6: "Detail" (target_faces) is the size of the whole scene, not per layer; a
+    full look-behind band used to give ~2x the triangles shown in the GUI."""
+    s = two_plane_scene
+    meshes = layered_meshes(_full_band(s), target_faces=target)
+    total = _total_faces(meshes)
+    assert 0.75 * target <= total <= 1.05 * target, total
+    bg, fg = meshes
+    assert len(fg.faces) > len(bg.faces) - target // 16  # the front keeps the larger share
+
+
+def test_layered_front_keeps_most_of_the_budget_when_little_is_hallucinated(simplify_mode, two_plane_scene):
+    s = two_plane_scene
+    target = 20000
+    bg, fg = layered_meshes(_two_layer(s), target_faces=target)  # thin ring only
+    total = len(bg.faces) + len(fg.faces)
+    assert total <= 1.05 * target
+    if simplify_mode == "qem":
+        assert len(fg.faces) >= 0.7 * target
+
+
+def test_single_layer_and_cleanplate_totals_stay_within_budget(simplify_mode, two_plane_scene):
+    s = two_plane_scene
+    one = LayeredImage([Layer(s.img, s.inv_z, np.ones(s.inv_z.shape, np.float32))], s.K)
+    assert _total_faces(layered_meshes(one, target_faces=16000)) <= 1.02 * 16000
+    clean = _two_layer(s, alpha_front=s.fg_mask.astype(np.float32))
+    total = _total_faces(layered_meshes(clean, target_faces=20000))
+    assert 0.5 * 20000 <= total <= 1.05 * 20000, total
+
+
+def test_anchor_scale_matches_layered_meshes(two_plane_scene):
+    """F3: the pipeline sizes the look-behind band for real head movement with the same
+    scale layered_meshes applies (band built for max_baseline / s)."""
+    s = two_plane_scene
+    li = _two_layer(s)
+    sc = meshmod.anchor_scale(s.inv_z, s.K, 2.0)
+    assert sc == pytest.approx(2.0 / s.z_near)  # the central window sees the near square
+    fg = layered_meshes(li, target_faces=6000, anchor_distance_m=2.0, eye_height_m=0.0)[-1]
+    z_scene = -fg.vertices[:, 2].astype(np.float64)
+    assert np.isclose(z_scene, s.z_near * sc, atol=1e-4).any()
+    assert np.all(
+        np.isclose(z_scene, s.z_near * sc, atol=1e-4) | np.isclose(z_scene, s.z_far * sc, atol=1e-4)
+    )
+    # clean-plate: the matte decides which pixels count
+    alpha = np.zeros(s.inv_z.shape, np.float32)
+    alpha[:, :40] = 1.0  # only far pixels are opaque -> window empty -> whole-frame fallback
+    assert meshmod.anchor_scale(s.inv_z, s.K, 2.0, alpha=alpha) == pytest.approx(2.0 / s.z_far)
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(InputError):
+            meshmod.anchor_scale(s.inv_z, s.K, bad)
+    with pytest.raises(InputError):
+        meshmod.anchor_scale(s.inv_z[:10], s.K, 2.0)
+    with pytest.raises(MeshError):
+        meshmod.anchor_scale(np.zeros_like(s.inv_z), s.K, 2.0)
 
 
 # --------------------------------------------------------------------------- decimate

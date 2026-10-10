@@ -73,7 +73,7 @@ def test_status_not_installed():
 def test_run_requires_install(tmp_path):
     with pytest.raises(AddonNotInstalled) as ei:
         manager.run("sdxl360", "outpaint_360", {}, {}, tmp_path)
-    assert "Settings" in ei.value.hint
+    assert "Add-ons window (toolbar > Add-ons)" in ei.value.hint and "Settings" not in ei.value.hint
 
 
 def test_run_rejects_unknown_task(tmp_path):

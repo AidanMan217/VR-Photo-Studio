@@ -28,7 +28,6 @@ import base64
 import io
 import json
 import math
-import os
 import re
 import struct
 from pathlib import Path
@@ -39,6 +38,7 @@ import numpy as np
 from PIL import Image
 
 from ..core.errors import InputError, VRPhotoError
+from ..core.fsutil import replace_with_retry
 from ..core.log import get_logger
 from ..core.types import CancelToken, Mesh, ProgressReporter
 
@@ -243,19 +243,25 @@ def _glb_bytes(doc: dict[str, Any], binary: bytes) -> bytes:
     return b"".join(out)
 
 
+def _busy_hint(e: OSError) -> str | None:
+    if isinstance(e, PermissionError):
+        return "The file is busy (another program or antivirus) or the folder is read-only; try again."
+    return None
+
+
 def _atomic_write(path: Path, data: bytes) -> None:
     tmp = path.with_name(path.name + ".part")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "wb") as fh:
             fh.write(data)
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
     except OSError as e:
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
-        raise GltfError(f"Cannot write {path.name}: {e}") from e
+        raise GltfError(f"Cannot write {path.name}: {e}", hint=_busy_hint(e)) from e
 
 
 # --------------------------------------------------------------------------- writer
@@ -724,9 +730,9 @@ def write_obj(meshes: list[Mesh], path: str | Path) -> Path:
             raise InputError("Nothing to export: every mesh is empty.")
         with open(mtl_path, "w", encoding="utf-8", newline="\n") as fm:
             fm.write("".join(mtl_lines))
-        os.replace(obj_tmp, path)
+        replace_with_retry(obj_tmp, path)
     except OSError as e:
-        raise GltfError(f"Cannot write {path.name}: {e}") from e
+        raise GltfError(f"Cannot write {path.name}: {e}", hint=_busy_hint(e)) from e
     finally:
         if obj_tmp.exists():
             try:

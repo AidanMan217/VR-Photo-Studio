@@ -2,7 +2,8 @@
 
 Behaviour switches (environment): FAKE_TOOL_LOG (jsonl argv log), FAKE_REG (images to
 register), FAKE_GLOBAL_REG (images the global mapper registers), FAKE_NO_GLOBAL (no
-global_mapper), FAKE_GLOBAL_FAIL, FAKE_GPU_FAIL, FAKE_LEGACY (COLMAP 3.x option names).
+global_mapper), FAKE_GLOBAL_FAIL, FAKE_GPU_FAIL, FAKE_LEGACY (COLMAP 3.x option names),
+FAKE_CAMS (JSON file with camera poses for images.bin).
 """
 
 import json
@@ -32,10 +33,14 @@ def list_images(root):
 
 def write_model(folder: Path, names):
     folder.mkdir(parents=True, exist_ok=True)
+    poses = None
+    if os.environ.get("FAKE_CAMS"):  # JSON list of [qw, qx, qy, qz, tx, ty, tz] (cycled)
+        poses = json.loads(Path(os.environ["FAKE_CAMS"]).read_text(encoding="utf-8"))
     with open(folder / "images.bin", "wb") as fh:
         fh.write(struct.pack("<Q", len(names)))
         for i, n in enumerate(names):
-            fh.write(struct.pack("<I7dI", i + 1, 1.0, 0.0, 0.0, 0.0, 0.1 * i, 0.0, 0.0, 1))
+            pose = poses[i % len(poses)] if poses else (1.0, 0.0, 0.0, 0.0, 0.1 * i, 0.0, 0.0)
+            fh.write(struct.pack("<I7dI", i + 1, *pose, 1))
             fh.write(n.encode() + b"\0")
             fh.write(struct.pack("<Q", 1))
             fh.write(struct.pack("<ddq", 1.0, 2.0, -1))

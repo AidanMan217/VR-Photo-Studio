@@ -152,6 +152,8 @@ def test_local_stereo_resolution_matches_geometry(two_plane_scene):
         StereoParams(max_parallax_pct=0.5),
         StereoParams(max_parallax_pct=0.0),
         StereoParams(mode="vr", ipd_m=0.07),
+        StereoParams(convergence_m=1.0, strength=3.0, screen_width_m=6.0),  # divergence limit
+        StereoParams(convergence_m=1.0, strength=3.0, screen_width_m=0.0),
     ]
     for p in cases:
         B1, z1 = gstereo.resolve_stereo(li, p, K)

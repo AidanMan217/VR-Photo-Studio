@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+# Where things are in the GUI, for error hints (keep in sync with gui/main_window.py).
+# Add-ons and AI models are their own windows (toolbar buttons / Tools menu), not
+# sections of the Settings dialog.
+UI_ADDONS = "Add-ons window (toolbar > Add-ons)"
+UI_MODELS = "AI models window (toolbar > AI models)"
+UI_SETTINGS_MODELS = "Settings > AI models"  # default model picks and the Hugging Face token
+UI_LOG = "Help > Log"
+MODE_VIDEO = "3D Video"
+
 
 class VRPhotoError(Exception):
     """Base class.  ``str(e)`` must be a human-readable message suitable for the GUI."""

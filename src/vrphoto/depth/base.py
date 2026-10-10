@@ -41,7 +41,7 @@ _ESTIMATORS: dict[str, str] = {
     "da2-large": "Depth Anything V2 Large (best detail, non-commercial)",
     "moge2": "MoGe-2 ViT-L (metric depth + field of view)",
     "da3": "Depth Anything 3 Mono Large (experimental)",
-    "heuristic": "Heuristic (no AI model, instant)",
+    "heuristic": "Heuristic (simple, no AI model, instant)",
 }
 _ALIASES = {
     "moge2-vitl": "moge2",
@@ -49,6 +49,7 @@ _ALIASES = {
     "da3-mono-large": "da3",
     "da2": "da2-small",
     "none": "heuristic",
+    "simple": "heuristic",  # older docs called it "Simple"
 }
 
 
@@ -97,7 +98,7 @@ class AutoEstimator:
     The fallback is sticky so a batch job does not retry a failing download for every
     image, but not forever (the estimator lives as long as the app's run context): the
     model is tried again after ``retry_after_s`` seconds, or immediately once its files
-    appear on disk (e.g. the user downloaded it from Settings > Models after a failed
+    appear on disk (e.g. the user downloaded it in the AI models window after a failed
     download)."""
 
     def __init__(

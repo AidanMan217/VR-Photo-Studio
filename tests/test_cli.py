@@ -655,3 +655,82 @@ def test_wildcards_and_folders_are_expanded(tmp_path, photo):
     assert code == 0, err
     res = json_lines(out)[-1]
     assert len(res["outputs"]) == 4  # 2 photos x (16-bit + colour)
+
+
+# --------------------------------------------------------------------------- review round 2
+def test_serve_never_shares_the_output_folder(monkeypatch):
+    """SEC-1: only the viewer app and the scene library go on the network."""
+    from vrphoto.webxr import server
+
+    made = []
+
+    class FakeServer:
+        https_port = None
+
+        def __init__(self, library, **kwargs):
+            made.append(kwargs)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def urls(self):
+            return {"local": "http://localhost:1/"}
+
+    monkeypatch.setattr(server, "ViewerServer", FakeServer)
+    code, out, err = run_cli(["serve", "--duration", "0", "--no-qr"])
+    assert code == 0, err
+    assert made and "files_dir" not in made[0]
+
+
+def test_cli_logs_to_its_own_file(photo, monkeypatch):
+    """WIN-1: the CLI never shares (and rotates) the GUI's vrphoto.log."""
+    from vrphoto.core import log as core_log
+
+    seen = []
+    real = core_log.setup_logging
+
+    def spy(*a, **k):
+        seen.append(k.get("filename"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(core_log, "setup_logging", spy)
+    code, _, err = run_cli(["stereo", photo, "--dry-run"])
+    assert code == 0, err
+    assert seen and seen[0] == core_log.CLI_LOG_FILE == "cli.log"
+
+
+def test_unexpected_error_traceback_goes_to_the_log_only(photo, monkeypatch):
+    import vrphoto.pipeline.run as R
+
+    def bug(*a, **k):
+        raise ZeroDivisionError("oops")
+
+    monkeypatch.setattr(R, "run_job", bug)
+    code, _, err = run_cli(["stereo", photo])
+    assert code == 1 and "ZeroDivisionError" in err and "Traceback" not in err
+    code, _, err = run_cli(["stereo", photo, "-v"])
+    assert code == 1 and "Traceback" in err  # -v shows it
+
+
+def test_unwritable_output_folder_is_a_friendly_early_error(photo, tmp_path, monkeypatch):
+    """R5: no traceback, no wasted processing - the folder is checked first."""
+    import errno
+    import os
+
+    out = tmp_path / "locked"
+    out.mkdir()
+    real = os.open
+
+    def locked(path, flags, *a, **k):  # creating files in ``out`` is refused
+        if Path(path).parent == out:
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real(path, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", locked)
+    code, _, err = run_cli(["stereo", photo, *NO_MODELS, "-o", out])
+    assert code == 1
+    assert "Cannot save files into" in err and "Traceback" not in err and "Unexpected" not in err
+    assert "Hint:" in err

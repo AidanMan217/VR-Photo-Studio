@@ -5,6 +5,12 @@
 //  * VR: a neutral room (soft sky + floor grid) with the object distance_m in front of you.
 //  * Both: grip (squeeze) to grab & move + turn it, both grips to resize, thumbstick left/right
 //    to rotate, menu "Reset 1:1 scale".  Hands: pinch on the object to grab it.
+// Size: ``scale`` (metres per asset unit) shows an asset that is already real size - e.g. a
+// capture the app scaled to metres - as is, and ``height_m`` then only names its subject's
+// height; otherwise the asset's bounding box (splats: of the centres) is fitted to
+// ``height_m``; without either it is shown as is.  A splat stands on its own floor and is
+// centred on its median (y = 0 / x = z = 0 after the app's normalisation), measured robustly
+// so a few stray "floater" splats cannot lift it off the real floor or move it off the reticle.
 
 import * as THREE from 'three';
 import { backgroundColor } from '../manifest.js';
@@ -14,7 +20,7 @@ import {
   loadGLB,
   loadSplatMesh,
   makeUnlit,
-  splatBounds,
+  splatRobustBounds,
   upAxisQuaternion,
 } from '../loaders.js';
 import { clamp, log } from '../util.js';
@@ -77,30 +83,40 @@ export async function load(ctx, scene) {
   orient.updateMatrix();
   orient.updateMatrixWorld(true);
   let box;
+  let pivot = null; // splats: (median x, robust floor y, median z); else from the box
   if (isGLB) {
     box = new THREE.Box3().setFromObject(orient, true);
   } else {
-    box = splatBounds(splat).clone().applyMatrix4(orient.matrix);
+    const robust = splatRobustBounds(splat);
+    box = robust.full.clone().applyMatrix4(orient.matrix);
+    if (robust.median) {
+      const floorY = robust.box.clone().applyMatrix4(orient.matrix).min.y;
+      pivot = robust.median.clone().applyMatrix4(orient.matrix).setY(floorY);
+    }
   }
-  if (box.isEmpty()) box = new THREE.Box3(new THREE.Vector3(-0.5, 0, -0.5), new THREE.Vector3(0.5, 1, 0.5));
+  if (box.isEmpty()) {
+    box = new THREE.Box3(new THREE.Vector3(-0.5, 0, -0.5), new THREE.Vector3(0.5, 1, 0.5));
+    pivot = null;
+  }
   const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
+  if (!pivot) pivot = new THREE.Vector3(center.x, box.min.y, center.z);
   const nativeHeight = Math.max(size.y, 1e-4);
-  const fitScale = cfg.height_m ? cfg.height_m / nativeHeight : 1;
+  const fitScale = cfg.scale || (cfg.height_m ? cfg.height_m / nativeHeight : 1);
   model.scale.setScalar(fitScale);
   const base = cfg.pivot !== 'center';
-  orient.position.set(-center.x, base ? -box.min.y : -center.y, -center.z);
+  orient.position.set(-pivot.x, base ? -pivot.y : -center.y, -pivot.z);
   if (!base) model.position.y = CENTER_PIVOT_HEIGHT;
-  const realHeight = nativeHeight * fitScale;
+  // "Real size: ... m tall": a real-size asset's height_m is its subject (the asset may also
+  // hold some floor / surroundings); otherwise the height as shown.
+  const realHeight = cfg.scale && cfg.height_m ? cfg.height_m : nativeHeight * fitScale;
   const footprint = Math.max(size.x, size.z) * fitScale;
   // Content-space bounds (before user scale), used for hand picking.
-  const halfX = (size.x / 2) * fitScale;
-  const halfZ = (size.z / 2) * fitScale;
-  const yMin = base ? 0 : CENTER_PIVOT_HEIGHT - realHeight / 2;
-  const localBox = new THREE.Box3(
-    new THREE.Vector3(-halfX, yMin, -halfZ),
-    new THREE.Vector3(halfX, yMin + realHeight, halfZ),
-  ).expandByScalar(0.05);
+  const toContent = (v) =>
+    new THREE.Vector3(v.x + orient.position.x, v.y + orient.position.y, v.z + orient.position.z)
+      .multiplyScalar(fitScale)
+      .add(model.position);
+  const localBox = new THREE.Box3(toContent(box.min), toContent(box.max)).expandByScalar(0.05);
 
   if (base) content.add(createShadowBlob(Math.max(0.2, footprint * 0.6), 0.45));
   ctx.root.add(content);
@@ -518,6 +534,8 @@ export async function load(ctx, scene) {
       yaw: content.rotation.y,
       scale: state.userScale,
       realHeight,
+      fitScale,
+      pivot: orient.position.toArray().map((v) => Math.round(v * 1000) / 1000),
       hitTest: state.hitSources.size > 0,
       reticle: reticle.visible,
       anchored: !!state.anchor,

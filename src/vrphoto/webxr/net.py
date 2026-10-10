@@ -42,6 +42,8 @@ __all__ = [
 ]
 
 FIREWALL_RULE_NAME = "VR Photo Studio"
+#: Executables of the installed app (GUI and CLI live in the same folder).
+_APP_EXES = ("VRPhotoStudio.exe", "vrphoto-cli.exe")
 _ERROR_CANCELLED = 1223  # user declined the UAC prompt
 
 # --------------------------------------------------------------------------- subprocess helpers
@@ -376,18 +378,37 @@ def firewall_status(port: int) -> str:
     return rep["status"]
 
 
+def _rule_programs() -> list[str]:
+    """Executables the allow rule is limited to: when frozen, this exe plus the app's other
+    exe next to it (GUI / CLI, so ``vrphoto-cli serve`` keeps working).  Empty when running
+    from source (the rule must not cover every Python program)."""
+    if not (getattr(sys, "frozen", False) and sys.executable):
+        return []
+    me = _program_path()
+    progs = [me]
+    for name in _APP_EXES:
+        other = Path(me).parent / name
+        if other.name.lower() != Path(me).name.lower() and other.is_file():
+            progs.append(str(other))
+    return progs
+
+
 def _firewall_command(ports: list[int]) -> str:
-    """``cmd.exe /c`` parameters: replace our named rule (and, when frozen, stale per-program
-    *block* rules Windows creates if the user dismissed its prompt) with an allow rule."""
+    """``cmd.exe /c`` parameters: replace our named rule(s) (and, when frozen, stale
+    per-program *block* rules Windows creates if the user dismissed its prompt) with allow
+    rules.  When frozen the rules only cover the app's own executables, so other programs
+    listening on the same ports are not exposed to the network."""
     plist = ",".join(str(p) for p in ports)
+    programs = _rule_programs()
     cmds = [f'netsh advfirewall firewall delete rule name="{FIREWALL_RULE_NAME}" dir=in >nul 2>&1']
-    if getattr(sys, "frozen", False) and sys.executable:
-        cmds.append(f'netsh advfirewall firewall delete rule name=all dir=in program="{_program_path()}" >nul 2>&1')
-    cmds.append(
+    cmds += [f'netsh advfirewall firewall delete rule name=all dir=in program="{p}" >nul 2>&1' for p in programs]
+    add = (
         f'netsh advfirewall firewall add rule name="{FIREWALL_RULE_NAME}" dir=in action=allow '
         f"protocol=TCP localport={plist} profile=private,domain"
     )
-    return "/c " + " & ".join(cmds)
+    adds = [f'{add} program="{p}"' for p in programs] or [add]
+    # cmd.exe returns the exit code of the last command; "&&" makes a failed add count
+    return "/c " + " & ".join(cmds) + " & " + " && ".join(adds)
 
 
 def _shell_execute_runas(file: str, params: str, timeout_s: float = 120.0) -> int | None:
@@ -471,7 +492,9 @@ def _shell_execute_runas(file: str, params: str, timeout_s: float = 120.0) -> in
 def add_firewall_rule(ports: list[int]) -> bool:
     """Allow inbound TCP ``ports`` on the Private/Domain profiles (Windows only).
 
-    Shows one UAC prompt (``netsh advfirewall`` needs administrator rights) and waits for
+    Only the HTTPS viewer port needs this: the HTTP listener is bound to 127.0.0.1, and
+    loopback traffic is never filtered.  In the installed app the rule is limited to the
+    app's executables.  Shows one UAC prompt (``netsh advfirewall`` needs administrator rights) and waits for
     it.  Returns True when the rule was added; False when declined, failed or not on
     Windows.  Never raises.
     """

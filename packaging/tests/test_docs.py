@@ -318,3 +318,86 @@ def test_changelog_version_matches_package():
 
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert f"## [{vrphoto.__version__}]" in text
+
+
+# --------------------------------------------------------------------------- review fixes
+def _guide() -> str:
+    return (ROOT / "docs" / "USER_GUIDE.md").read_text(encoding="utf-8")
+
+
+def _option_row(section: str, label: str) -> str:
+    for row in _table_rows(section, "| Option |"):
+        cell = re.sub(r"\*\((Advanced|More)\)\*", "", row.split("|")[1]).strip()
+        if cell == label:
+            return row
+    raise AssertionError(f"no option row {label!r}")
+
+
+def test_user_guide_billboard_thickness_matches_the_default():
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    section = _section(_guide(), r"^### 4\.\d+ Person / Object\b.*$")
+    row = _option_row(section, "Thickness")
+    assert row.rstrip(" |").endswith(f"{ObjectJob().thickness:g}"), row
+
+
+def test_user_guide_names_the_heuristic_depth_model():
+    """The depth combo calls the no-AI estimator 'Heuristic', not 'Simple'."""
+    from vrphoto.depth.base import list_estimators
+
+    assert any(str(label).startswith("Heuristic") for _, label in list_estimators())
+    common = _section(_guide(), r"^### In every mode.*$")
+    assert "*Heuristic*" in _option_row(common, "Depth model")
+    assert "*Simple*" not in common
+
+
+def test_user_guide_spatial_metadata_only_for_vr180_video():
+    section = _section(_guide(), r"^### 4\.\d+ 3D Video\b.*$")
+    out = section[section.index("**Output:**") :]
+    assert "VR180, with spatial metadata" in out
+    assert "`name_TB.mp4` or `name_180_LR.mp4` (with spatial metadata)" not in out
+
+
+def test_user_guide_flat_living_photo_is_h264():
+    section = _section(_guide(), r"^### 4\.\d+ Living Photo\b.*$")
+    row = _option_row(section, "Video format")
+    assert "flat videos as H.264" in row and "HEVC" in row
+    assert "1920 px" in _option_row(section, "Width")
+
+
+def test_user_guide_documents_new_object_and_capture_options():
+    guide = _guide()
+    obj = _section(guide, r"^### 4\.\d+ Person / Object\b.*$")
+    assert "Hunyuan3D" in _option_row(obj, "Paint texture")
+    assert "SHARP always gives the same result" in _option_row(obj, "Variation")
+    cap = _section(guide, r"^### 4\.\d+ Capture\b.*$")
+    assert "Automatic" in _option_row(cap, "Subject height")
+    scene = _section(guide, r"^### 4\.\d+ 3D Scene\b.*$")
+    assert "in total" in _option_row(scene, "Detail")
+
+
+def test_docs_firewall_only_opens_the_https_port():
+    from vrphoto.core.config import Settings
+
+    s = Settings()
+    guide = _guide()
+    assert f"TCP {s.https_port} and {s.http_port}" not in guide
+    assert f"The port is TCP {s.https_port}" in guide
+
+
+def test_docs_viewer_does_not_share_the_output_folder():
+    privacy = _section(_guide(), r"^## 12\. Privacy and licenses\s*$")
+    assert "not your output folder" in privacy
+
+
+def test_checklist_open_on_pc_has_no_certificate_warning():
+    """'Open on this PC' uses http://localhost:<http_port>/ - no certificate warning."""
+    from vrphoto.core.config import Settings
+
+    text = (ROOT / "docs" / "QUEST_CHECKLIST.md").read_text(encoding="utf-8")
+    row = next(line for line in text.splitlines() if line.startswith("| E2 |"))
+    expected = row.split("|")[3]
+    assert "no warning" in expected and f"localhost:{Settings().http_port}" in expected
+    assert not expected.strip().startswith("Certificate warning")
+    c3 = next(line for line in text.splitlines() if line.startswith("| C3 |"))
+    assert "H.264" in c3

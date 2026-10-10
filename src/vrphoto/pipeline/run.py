@@ -25,10 +25,13 @@ module (e.g. by the GUI job queue) stays fast.
 
 from __future__ import annotations
 
+import errno
 import inspect
+import io
 import json
 import math
 import os
+import secrets
 import shutil
 import struct
 import tempfile
@@ -41,7 +44,18 @@ from typing import Any
 import numpy as np
 
 from ..core.config import Settings
-from ..core.errors import AddonError, AddonNotInstalled, Cancelled, InputError, VRPhotoError
+from ..core.errors import (
+    MODE_VIDEO,
+    UI_ADDONS,
+    UI_LOG,
+    UI_SETTINGS_MODELS,
+    AddonError,
+    AddonNotInstalled,
+    Cancelled,
+    InputError,
+    VRPhotoError,
+)
+from ..core.fsutil import atomic_write_bytes, replace_with_retry, temp_sibling
 from ..core.imaging import is_image, is_video, limit_long, load_image
 from ..core.log import get_logger
 from ..core.types import (
@@ -88,6 +102,13 @@ STILL_VIDEO_FPS = 10.0
 EYE_HEIGHT_M = 1.5
 #: Viewer sphere radius for VR180 / 360 scenes.
 SPHERE_RADIUS_M = 20.0
+#: Virtual screen for flat 3D photos / videos in the viewer: at most this wide (the viewer's
+#: default) and this tall (centred at 1.6 m, a taller screen would reach into the floor).
+SCREEN_MAX_WIDTH_M = 3.0
+SCREEN_MAX_HEIGHT_M = 2.2
+#: Longest side of a flat "living photo" video when no width is given: plays smoothly on
+#: phones and PCs (H.264 level limits) and keeps files small.
+FLAT_VIDEO_MAX_LONG = 1920
 #: Highest frame rate of converted videos (faster clips are converted at this rate).
 MAX_VIDEO_FPS = 60.0
 #: Most Gaussians in an object / add-on splat (what a Quest 3 browser shows smoothly).
@@ -300,7 +321,8 @@ def fit_glb_height(src: Path, dst: Path, height_m: float) -> bool:
     """Rescale a GLB losslessly so it is ``height_m`` tall, feet at y=0, centred on x/z.
 
     Adds one root node with scale + translation (materials, textures and animations are
-    untouched).  Returns False (and writes nothing) if the file cannot be analysed.
+    untouched).  Returns False (and writes nothing) if the file cannot be analysed; a
+    failure to write ``dst`` (disk full, folder not writable) raises ``OSError``.
     """
     try:
         data = Path(src).read_bytes()
@@ -340,13 +362,12 @@ def fit_glb_height(src: Path, dst: Path, height_m: float) -> bool:
         js += b" " * ((4 - len(js) % 4) % 4)
         body = struct.pack("<II", len(js), 0x4E4F534A) + js + rest
         out = struct.pack("<III", 0x46546C67, 2, 12 + len(body)) + body
-        tmp = Path(dst).with_name(f".{Path(dst).name}.tmp")
-        tmp.write_bytes(out)
-        os.replace(tmp, dst)
-        return True
     except (OSError, ValueError, KeyError, IndexError, TypeError, struct.error) as e:
         log.info("Could not rescale %s: %s", src, e)
         return False
+    # temp file + rename that waits out a briefly locked file (antivirus / indexer on Windows)
+    atomic_write_bytes(dst, out, fsync=False)
+    return True
 
 
 # --------------------------------------------------------------------------- work folders
@@ -381,6 +402,50 @@ def _sweep_stale_work(root: Path, max_age_s: float = STALE_WORK_S) -> int:
     if removed:
         log.info("Removed %d stale work folder(s) from %s", removed, root)
     return removed
+
+
+# --------------------------------------------------------------------------- output folder
+#: Hint for an output folder the app may not write to.
+WRITE_HINT = (
+    "Choose another output folder in the options or in Settings. If Windows Security "
+    "'Controlled folder access' is on, allow VR Photo Studio there."
+)
+
+
+#: Name prefix of the empty file :func:`_check_writable` creates (and removes at once).
+WRITE_TEST_PREFIX = ".vrphoto-write-test-"
+
+
+def _check_writable(folder: Path) -> None:
+    """Fail before any slow work when files cannot be created in ``folder``.
+
+    ``mkdir(exist_ok=True)`` succeeds for an existing read-only folder (or one protected by
+    Windows 'Controlled folder access'), which would otherwise only show up when the
+    result is saved, after all the processing.
+
+    One plain create of a uniquely named file, deliberately not :mod:`tempfile`: on Windows
+    its name loop takes every "access denied" for a name clash while the folder looks
+    writable and tries again - up to ``os.TMP_MAX`` (2**31) times on Python 3.11 and older
+    3.12 releases, i.e. a hang on exactly such a folder - and Controlled folder access
+    reports every attempt as a blocked change.
+    """
+    o_temp = getattr(os, "O_TEMPORARY", 0)  # Windows: deleted when closed, even if antivirus peeks
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOINHERIT", 0) | o_temp
+    for _ in range(3):  # (a name clash is practically impossible)
+        probe = folder / f"{WRITE_TEST_PREFIX}{os.getpid()}-{secrets.token_hex(6)}.tmp"
+        try:
+            fd = os.open(probe, flags, 0o600)
+        except FileExistsError:
+            continue
+        except OSError as e:
+            raise InputError(f"Cannot save files into {folder} ({e.strerror or e}).", hint=WRITE_HINT) from e
+        os.close(fd)
+        if not o_temp:
+            try:
+                probe.unlink()
+            except OSError as e:  # pragma: no cover - created but not removable: harmless
+                log.debug("Could not remove the write test file %s: %s", probe, e)
+        return
 
 
 # --------------------------------------------------------------------------- run state
@@ -445,6 +510,7 @@ class _Run:
                 f"Cannot create the output folder {out or self.settings.output_dir}: {e}",
                 hint="Choose another output folder in the options or in Settings.",
             ) from e
+        _check_writable(self.out_dir)
         self.quest = _choice(self.common.quest_model or "quest3", QUEST_MODELS, "headset")
 
     # ---------------------------------------------------------------- helpers
@@ -505,22 +571,30 @@ class _Run:
 
 
 # --------------------------------------------------------------------------- shared steps
-def _load_photo(run: _Run, item: _Item, rep: ProgressReporter, *, with_alpha: bool = False) -> _Photo:
-    """Load + downscale (``max_process_px``) a photo.  ``with_alpha`` also returns the file's
-    transparency as ``_Photo.alpha`` when it has a real one (e.g. an iPhone "lift subject" PNG)."""
+def _max_process_px(run: _Run) -> int:
+    max_px = int(run.common.max_process_px or 0) or int(run.settings.max_process_px)
+    if max_px < 256:
+        raise InputError(f"Max processing size must be at least 256 px (got {max_px}).")
+    return max_px
+
+
+def _load_photo(
+    run: _Run, item: _Item, rep: ProgressReporter, *, with_alpha: bool = False, max_px: int | None = None
+) -> _Photo:
+    """Load + downscale (``max_process_px``, or ``max_px`` when given) a photo.  ``with_alpha``
+    also returns the file's transparency as ``_Photo.alpha`` when it has a real one (e.g. an
+    iPhone "lift subject" PNG)."""
     from ..core.imaging import exif_hfov
 
     rep(0.0, f"Loading {item.path.name}")
     if is_video(item.path):
         raise InputError(
             f"{item.path.name} is a video; this mode needs photos.",
-            hint="Use 'Video to 3D' for videos.",
+            hint=f"Use '{MODE_VIDEO}' for videos.",
         )
-    img = load_image(item.path, with_alpha=with_alpha)
-    max_px = int(run.common.max_process_px or 0) or int(run.settings.max_process_px)
-    if max_px < 256:
-        raise InputError(f"Max processing size must be at least 256 px (got {max_px}).")
-    img, s = limit_long(img, max_px)
+    limit = _max_process_px(run) if max_px is None else int(max_px)
+    img = load_image(item.path, with_alpha=with_alpha, max_px=limit)  # reduced-scale JPEG decode
+    img, s = limit_long(img, limit)
     alpha: FloatMap | None = None
     if img.ndim == 3 and img.shape[2] == 4:
         a = img[..., 3].astype(np.float32) / 255.0
@@ -562,7 +636,7 @@ def _note_depth_fallback(run: _Run, est: Any, res: DepthResult) -> None:
             + (f" ({reason})" if reason else "")
             + ". A simple built-in depth estimate was used instead, so the 3D effect may be weaker or "
             "less accurate. Models download on first use - check your internet connection, or pick a "
-            "depth model in Settings > Models."
+            f"depth model in {UI_SETTINGS_MODELS}."
         )
 
 
@@ -665,24 +739,17 @@ def _build_layers(
 
 
 def _save_jpeg_or_png(path: Path, img: RGB, *, xmp: bytes | None = None) -> Path:
-    """Save an RGB image (JPEG quality 92 with optional XMP, or PNG)."""
+    """Save an RGB image (JPEG quality 92 with optional XMP, or PNG).
+
+    :func:`~vrphoto.core.imaging.save_image` encodes in memory (retrying a failed optimised
+    JPEG pass itself) and writes atomically, so a full disk raises instead of leaving a
+    truncated file behind.
+    """
     from ..core.imaging import save_image
 
     if path.suffix.lower() not in (".jpg", ".jpeg"):
         return save_image(path, img)
-    try:
-        return save_image(path, img, quality=JPEG_QUALITY, xmp=xmp)
-    except OSError as e:
-        # Pillow's optimised JPEG encoder can run out of buffer on extremely detailed/noisy
-        # images ("Suspension not allowed here"); retry without the optimisation pass.
-        log.info("Optimised JPEG save of %s failed (%s); retrying without optimisation", path.name, e)
-        from PIL import Image
-
-        kw: dict[str, Any] = {"quality": JPEG_QUALITY, "subsampling": 0}
-        if xmp:
-            kw["xmp"] = xmp
-        Image.fromarray(np.ascontiguousarray(img[..., :3])).save(path, "JPEG", **kw)
-        return path
+    return save_image(path, img, quality=JPEG_QUALITY, xmp=xmp)
 
 
 def _export_scene(
@@ -726,20 +793,39 @@ def _export_scene(
     return sid
 
 
-def _video_preset(run: _Run, preset: str | None) -> str:
+def _video_preset(run: _Run, preset: str | None, *, output: str | None = None) -> str:
+    """Encoder preset for ``preset`` ("auto" -> by ``output`` kind and headset).
+
+    ``output`` is the kind of video: ``"flat"`` is for phones / PCs (H.264, which every
+    player decodes), anything else is watched in the headset (the Quest HEVC presets).
+    """
     from ..video import encode
 
     p = str(preset or "auto").strip().lower()
     if p == "auto":
         fn = getattr(encode, "resolve_preset", None)
         if fn is not None:
-            return str(fn("auto", run.quest))
+            return str(_call_opt(fn, "auto", run.quest, output=output))
+        if output == "flat":
+            return "h264_compat"
         return {"quest3": "quest3_hevc", "quest2": "quest2_hevc"}.get(run.quest, "h264_compat")
     if p not in encode.PRESETS:
         raise InputError(
             f"Unknown video format {preset!r}.", hint=f"Choose one of: auto, {', '.join(encode.PRESETS)}."
         )
     return p
+
+
+def _exact_fps(fps: float) -> float:
+    """``fps`` with NTSC rates made exact: ffmpeg prints 24000/1001 as ``23.98``, and decoding
+    at the rounded rate while the encoder writes 24000/1001 makes the picture drift behind
+    the sound (about 0.2 ms per second)."""
+    try:
+        from ..video.encode import ntsc_rate
+    except ImportError:  # pragma: no cover - older video module
+        return fps
+    exact = ntsc_rate(fps)
+    return float(exact) if exact is not None else fps
 
 
 def _video_writer(run: _Run, path: Path, w: int, h: int, fps: float, preset: str, **kw: Any) -> Any:
@@ -798,7 +884,7 @@ def _addon_manifest(addon_id: str) -> Any:
     except AddonError as e:
         raise AddonNotInstalled(
             f"The '{addon_id}' add-on is not available in this version of VR Photo Studio.",
-            hint="Update VR Photo Studio, then install it in Add-ons.",
+            hint=f"Update VR Photo Studio, then install it in the {UI_ADDONS}.",
         ) from e
 
 
@@ -816,7 +902,7 @@ def _require_addon(addon_id: str) -> Any:
     if not _addon_installed(addon_id):
         raise AddonNotInstalled(
             f"{m.title} is not installed.",
-            hint="Install it in Add-ons (Settings > Add-ons); it is downloaded once and then works offline.",
+            hint=f"Install it in the {UI_ADDONS}; it is downloaded once and then works offline.",
         )
     return m
 
@@ -831,7 +917,7 @@ def _run_addon(
     try:
         outs = manager.run(addon_id, task, inputs, params, work, progress=rep, cancel=run.cancel)
     except AddonNotInstalled as e:
-        raise AddonNotInstalled(str(e), hint=e.hint or "Install it in Add-ons (Settings > Add-ons).") from e
+        raise AddonNotInstalled(str(e), hint=e.hint or f"Install it in the {UI_ADDONS}.") from e
     run.check()
     return dict(outs or {})
 
@@ -843,7 +929,7 @@ def _outpaint(
     if not _addon_installed("sdxl360"):
         run.warn(
             "AI outpainting needs the 'AI outpainting for VR180 / 360' add-on, which is not installed, so "
-            "a soft blur was used instead. Install it in Add-ons to use AI outpainting."
+            f"a soft blur was used instead. Install it in the {UI_ADDONS} to use AI outpainting."
         )
         return None
     from ..core.imaging import save_image
@@ -908,10 +994,42 @@ def _mode_depth(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     rep(1.0, "Done")
 
 
+def _screen_width_m(aspect: float) -> float:
+    """Width of the viewer's virtual screen for a picture of ``aspect`` (width / height).
+
+    :data:`SCREEN_MAX_WIDTH_M` wide, but never taller than :data:`SCREEN_MAX_HEIGHT_M`
+    (portrait photos / vertical videos), so the screen does not reach into the floor.  The
+    same width goes into ``StereoParams.screen_width_m`` (the limit that keeps the
+    background from needing eye divergence) and into the scene manifest, so the viewer
+    shows the pair at the size it was made for.
+    """
+    a = float(aspect) if aspect and math.isfinite(aspect) and aspect > 0 else 16 / 9
+    return round(min(SCREEN_MAX_WIDTH_M, SCREEN_MAX_HEIGHT_M * a), 4)
+
+
+def _flat_stereo(aspect: float, **kw: Any) -> StereoParams:
+    """Flat-mode stereo parameters for a picture of ``aspect`` shown on the viewer screen."""
+    return StereoParams(mode="flat", screen_width_m=_screen_width_m(aspect), **kw)
+
+
+def _aspect(img_or_K: Any) -> float:
+    if isinstance(img_or_K, Intrinsics):
+        return img_or_K.width / max(img_or_K.height, 1)
+    h, w = img_or_K.shape[:2]
+    return w / max(h, 1)
+
+
 def _stereo_scene_block(media: str, kind: str, layout: str, left: RGB) -> dict[str, Any]:
-    lay = "tb" if layout in ("tb", "half_tb") else "sbs"
-    h, w = left.shape[:2]
-    return {"media": media, "kind": kind, "layout": lay, "aspect": round(w / max(h, 1), 6)}
+    """Viewer block for a flat stereo (or mono) picture; ``left`` is one eye's view."""
+    lay = "tb" if layout in ("tb", "half_tb") else "mono" if layout == "mono" else "sbs"
+    aspect = _aspect(left)
+    return {
+        "media": media,
+        "kind": kind,
+        "layout": lay,
+        "aspect": round(aspect, 6),
+        "screen_width_m": _screen_width_m(aspect),
+    }
 
 
 def _save_gif(path: Path, frames: list[RGB], frame_ms: int = 80) -> Path:
@@ -926,7 +1044,9 @@ def _save_gif(path: Path, frames: list[RGB], frame_ms: int = 80) -> Path:
             )
         )
     path.parent.mkdir(parents=True, exist_ok=True)
-    ims[0].save(path, save_all=True, append_images=ims[1:], duration=frame_ms, loop=0, disposal=1)
+    buf = io.BytesIO()  # encoded in memory: a full disk raises instead of truncating the file
+    ims[0].save(buf, "GIF", save_all=True, append_images=ims[1:], duration=frame_ms, loop=0, disposal=1)
+    atomic_write_bytes(path, buf.getvalue(), fsync=False)
     return path
 
 
@@ -943,12 +1063,12 @@ def _mode_stereo(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     photo = _load_photo(run, item, rep.sub(0.0, 0.05))
     d = _estimate_depth(run, item, photo, rep.sub(0.05, 0.4))
     li = _build_layers(run, item, photo, d, rep.sub(0.4, 0.6), max_baseline=ipd * strength, look_behind=look)
-    params = StereoParams(
+    params = _flat_stereo(
+        _aspect(li.K),
         ipd_m=ipd,
         strength=strength,
         convergence_m=spec.convergence_m,
         max_parallax_pct=float(spec.max_parallax_pct),
-        mode="flat",
         swap_eyes=bool(spec.swap_eyes),
     )
     rep(0.6, "Rendering the two eye views")
@@ -1016,7 +1136,7 @@ def _mode_parallax(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     duration = _positive(spec.duration_s, "Duration")
     amp = _positive(spec.amplitude_m, "Movement size", allow_zero=True)
     ipd = _positive(spec.ipd_m, "Eye distance (IPD)")
-    preset = _video_preset(run, spec.encoder_preset)
+    preset = _video_preset(run, spec.encoder_preset, output=output)
     n_frames = max(1, int(round(duration * fps)))
     path_args: dict[str, Any] = {
         "n_frames": n_frames,
@@ -1043,6 +1163,9 @@ def _mode_parallax(run: _Run, item: _Item, rep: ProgressReporter) -> None:
         if output != "vr180":
             K = K.scaled(w / K.width)
     elif output != "vr180":
+        if output == "flat" and max(K.width, K.height) > FLAT_VIDEO_MAX_LONG:
+            # a video for phones / PCs: a size every H.264 decoder plays, and small files
+            K = K.scaled(FLAT_VIDEO_MAX_LONG / max(K.width, K.height))
         # never render more pixels than the video format can hold (e.g. 4096 px for H.264)
         n_eyes = 2 if output == "sbs" else 1
         enc_w = _encoded_width(n_eyes * K.width, K.height, preset) // n_eyes
@@ -1055,7 +1178,7 @@ def _mode_parallax(run: _Run, item: _Item, rep: ProgressReporter) -> None:
         )
         kind, label = "parallax", "Living photo video"
     elif output == "sbs":
-        stereo = StereoParams(ipd_m=ipd, mode="flat")
+        stereo = _flat_stereo(_aspect(K), ipd_m=ipd)
         frames = _call_opt(
             render_path_frames, li, path, out_K=K, stereo=stereo, layout="sbs", cancel=run.cancel
         )
@@ -1119,14 +1242,8 @@ def _mode_parallax(run: _Run, item: _Item, rep: ProgressReporter) -> None:
             eye_img = thumb[:, : thumb.shape[1] // 2] if thumb is not None else photo.rgb
             block = _stereo_scene_block(media, "video", "sbs", eye_img)
         else:
-            src = thumb if thumb is not None else photo.rgb
-            block = {
-                "media": media,
-                "kind": "video",
-                "layout": "mono",
-                "aspect": round(src.shape[1] / max(src.shape[0], 1), 6),
-            }
-            eye_img = src
+            eye_img = thumb if thumb is not None else photo.rgb
+            block = _stereo_scene_block(media, "video", "mono", eye_img)
         _export_scene(run, item, mode="stereo", block=block, assets={media: out}, thumbnail=eye_img)
     rep(1.0, "Done")
 
@@ -1253,9 +1370,18 @@ def _mode_pano(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     fill = _choice(spec.fill, FILLS, "fill style")
     ipd = _positive(spec.ipd_m, "Eye distance (IPD)", allow_zero=True)
     as_video = _positive(spec.as_video_s, "Video length", allow_zero=True)
-    photo = _load_photo(run, item, rep.sub(0.0, 0.04))
+    max_px = _max_process_px(run)
+    try:
+        want_w = int(spec.width or 0)
+    except (TypeError, ValueError):
+        raise InputError(f"360 width must be a whole number of pixels (got {spec.width!r}).") from None
+    # A 360 photo is resampled straight to the output width (its depth is estimated on small
+    # cube faces), so load it at up to that width instead of 'Max processing size'.
+    photo = _load_photo(run, item, rep.sub(0.0, 0.04), max_px=max(max_px, want_w, PANO_WIDTH[run.quest]))
     rgb = photo.rgb
     is_360 = _is_equirect(rgb) if spec.input_is_360 is None else bool(spec.input_is_360)
+    if not is_360 and max(rgb.shape[:2]) > max_px:
+        rgb = limit_long(rgb, max_px)[0]  # a normal photo is processed at the usual size
     assets: dict[str, Path | bytes] = {}
     depth_block: dict[str, Any] = {}
     if is_360:
@@ -1386,6 +1512,26 @@ def _segment(run: _Run, item: _Item, rgb: RGB, rep: ProgressReporter) -> FloatMa
     return alpha
 
 
+#: Smallest anchor scale used to size the look-behind layers of a 3D scene (a photo whose
+#: centre is sky or far horizon); below it the inpainted band is at its widest anyway.
+MIN_ANCHOR_SCALE = 0.1
+
+
+def _scene_anchor_scale(depth: _Depth, anchor_m: float, alpha: FloatMap | None) -> float:
+    """The scale :func:`~vrphoto.geometry.mesh.layered_meshes` will apply for ``anchor_m``
+    (median depth of the central window of the front layer -> ``anchor_m``)."""
+    try:
+        from ..geometry.mesh import anchor_scale
+    except ImportError:  # pragma: no cover - older geometry module
+        return 1.0
+    try:
+        s = float(anchor_scale(depth.inv_z, depth.K, anchor_m, alpha=alpha))
+    except VRPhotoError as e:  # no valid depth in the window: layered_meshes reports it
+        log.info("Cannot compute the scene scale up front: %s", e)
+        return 1.0
+    return s if math.isfinite(s) and s > MIN_ANCHOR_SCALE else MIN_ANCHOR_SCALE
+
+
 def _mode_scene(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     from ..geometry.gltf import write_glb, write_obj
     from ..geometry.mesh import layered_meshes
@@ -1405,8 +1551,16 @@ def _mode_scene(run: _Run, item: _Item, rep: ProgressReporter) -> None:
         if float((alpha > 0.5).mean()) < 0.002:
             run.warn("No subject was found for the clean background; used normal look-behind instead.")
             look, alpha = "band", None
+    # The meshes are scaled by s about the eye so the photo's centre is 'anchor' metres away:
+    # a real head movement m is then a movement of m / s in the photo's own depth units, so
+    # that is what the look-behind layers must be prepared for.
+    s = _scene_anchor_scale(d, anchor, alpha if look == "cleanplate" else None)
+    log.info(
+        "Scene scale %.3f: look-behind prepared for %.2f m of head movement (%.2f m in photo units)",
+        s, max_b, max_b / s,
+    )  # fmt: skip
     li = _build_layers(
-        run, item, photo, d, rep.sub(0.45, 0.65), max_baseline=max_b, look_behind=look, alpha=alpha
+        run, item, photo, d, rep.sub(0.45, 0.65), max_baseline=max_b / s, look_behind=look, alpha=alpha
     )
     rep(0.65, "Building 3D meshes")
     meshes = _call_opt(
@@ -1552,10 +1706,14 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     save_image(cut, _cutout_rgba(photo.rgb, alpha))
     run.add_output(item, "Cut-out (PNG with transparency)", cut)
     params: dict[str, Any] = {"seed": int(spec.seed), "name": "model"}
+    if method == "hunyuan":
+        params["texture"] = bool(getattr(spec, "hunyuan_texture", False))  # paint a texture (slower)
     image_in = cut
     if method == "sharp":
         from ..geometry.camera import estimate_intrinsics
 
+        if int(spec.seed):
+            run.warn(f"{manifest.title} always gives the same result; the 'Variation' number is not used.")
         K = estimate_intrinsics(photo.rgb.shape, hfov_deg=run.common.hfov_deg, exif_hfov=photo.exif_hfov)
         params = {"hfov_deg": round(K.hfov_deg, 3), "name": "model"}
         image_in = run.work_dir(item) / "sharp_input.png"
@@ -1569,7 +1727,7 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     if glb_src and Path(glb_src).is_file():
         dst = run.out_path(item, f"_{method}", "glb")
         if not fit_glb_height(Path(glb_src), dst, height):
-            shutil.copyfile(glb_src, dst)
+            _copy_file(glb_src, dst)
         run.add_output(item, f"3D object (GLB, {title})", dst)
         assets["object.glb"] = dst
         block = {
@@ -1581,7 +1739,7 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
         }
         if ply_src and Path(ply_src).is_file():
             extra = run.out_path(item, f"_{method}", Path(ply_src).suffix.lstrip(".") or "ply")
-            shutil.copyfile(ply_src, extra)
+            _copy_file(ply_src, extra)
             run.add_output(item, f"3D Gaussians ({Path(ply_src).suffix.lstrip('.').upper()}, {title})", extra)
     elif ply_src and Path(ply_src).is_file():
         from ..geometry.splat import (
@@ -1615,7 +1773,7 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     else:
         raise AddonError(
             f"{title} finished but did not return a 3D model.",
-            hint="See the add-on log in Settings > Add-ons.",
+            hint=f"Details are in the log ({UI_LOG}). Try again, or reinstall the add-on in the {UI_ADDONS}.",
         )
     _export_scene(
         run,
@@ -1745,6 +1903,63 @@ def _keep_capture_log(run: _Run, item: _Item, work: Path) -> Path | None:
     return dst
 
 
+def _capture_scale(splat: Path) -> dict[str, Any] | None:
+    """The metric scale record ``<stem>.capture.json`` written next to a captured splat.
+
+    Returns ``{"scale", "height_m", "method"}`` (``height_m``: the subject's height when it
+    was given, else the splat's height, in metres) or None when there is no usable record.
+    """
+    p = splat.with_name(f"{splat.stem}.capture.json")
+    try:
+        info = json.loads(p.read_text(encoding="utf-8"))
+        scale = float(info["scale"])
+        method = str(info.get("method") or "none")
+        # the subject height the user typed (when given) else the splat bounding-box height;
+        # with scale 1.0 the viewer shows the splat 1:1 and height_m only describes it
+        height = float(info.get("subject_height_m") or info.get("height_m") or 0.0)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as e:
+        log.info("Ignoring the capture scale record %s: %s", p, e)
+        return None
+    if not (math.isfinite(scale) and scale > 0):
+        return None
+    if not (math.isfinite(height) and height > 0):
+        height = 0.0
+    log.info("Capture scale x%.4g (%s): %.2f m tall", scale, method, height)
+    return {"scale": scale, "height_m": round(height, 4), "method": method}
+
+
+def _copy_file(src: Path | str, dst: Path) -> None:
+    """Copy a file to its output name through a temp file: ``dst`` is never half-written
+    (disk full), and the final rename waits out a brief Windows file lock."""
+    tmp = temp_sibling(dst)
+    try:
+        shutil.copyfile(src, tmp)
+        replace_with_retry(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _move_file(src: Path, dst: Path) -> None:
+    """Move a finished file from the work folder to its output name.
+
+    A rename when both are on one drive (retried while antivirus or the Windows search
+    indexer briefly holds the new file), else :func:`_copy_file`.
+    """
+    try:
+        replace_with_retry(src, dst)
+        return
+    except OSError as e:  # another drive (or the file stays locked): copy it
+        log.debug("Cannot rename %s to %s (%s); copying it", src, dst, e)
+    _copy_file(src, dst)
+    try:
+        os.unlink(src)
+    except OSError:  # the work folder is deleted at the end of the job anyway
+        pass
+
+
 def _mode_capture(run: _Run, items: list[_Item], rep: ProgressReporter) -> None:
     from ..addons.capture import capture_to_splat
 
@@ -1758,6 +1973,7 @@ def _mode_capture(run: _Run, items: list[_Item], rep: ProgressReporter) -> None:
         item.base = safe_base(
             first.name if first.is_dir() else (first.parent.name if len(items) > 1 else first.stem)
         )
+    subject_h = _positive(getattr(spec, "subject_height_m", 0.0) or 0.0, "Subject height", allow_zero=True)
     paths = [it.path for it in items]
     work = run.work_dir(item) / "capture"
     work.mkdir(parents=True, exist_ok=True)
@@ -1766,10 +1982,10 @@ def _mode_capture(run: _Run, items: list[_Item], rep: ProgressReporter) -> None:
             capture_to_splat, paths, work,
             video_fps=float(spec.video_fps), max_images=int(spec.max_images), steps=int(spec.steps),
             max_splats=int(spec.max_splats), crop_pct=float(spec.crop_pct), name="capture",
-            progress=rep.sub(0.0, 0.95), cancel=run.cancel,
+            subject_height_m=subject_h, progress=rep.sub(0.0, 0.95), cancel=run.cancel,
         )  # fmt: skip
     except AddonNotInstalled as e:
-        raise AddonNotInstalled(str(e), hint=e.hint or "Install it in Add-ons (Settings > Add-ons).") from e
+        raise AddonNotInstalled(str(e), hint=e.hint or f"Install it in the {UI_ADDONS}.") from e
     except Cancelled:
         raise
     except VRPhotoError as e:
@@ -1786,18 +2002,31 @@ def _mode_capture(run: _Run, items: list[_Item], rep: ProgressReporter) -> None:
         raise err from e
     run.check()
     splat = Path(splat)
+    size = _capture_scale(splat)
+    if size is None or size["method"] == "none":
+        msg = "The real-world size of the captured scene could not be worked out"
+        if spec.as_object:
+            msg += "; in the viewer, resize it with both grip buttons if it looks too big or too small."
+        else:  # a walk-in splat scene cannot be resized in the viewer
+            msg += ", so it may look too big or too small in the viewer."
+        run.warn(msg + ("" if subject_h else " Or set 'Subject height' and run it again."))
     dst = run.out_path(item, "capture", "splat")
-    shutil.move(str(splat), str(dst))
+    _move_file(splat, dst)
     run.add_output(item, "Captured 3D scene (Gaussian splat)", dst)
     ply = splat.with_suffix(".ply")
     if ply.is_file():
         dply = run.out_path(item, "capture", "ply")
-        shutil.move(str(ply), str(dply))
+        _move_file(ply, dply)
         run.add_output(item, "Captured 3D scene (PLY)", dply)
     media = _asset_name(dst, "capture.splat")
     thumb = _first_frame(item.path)
     if spec.as_object:
         block = {"asset": media, "format": "splat", "pivot": "base", "placement": "hit-test"}
+        if size is not None and size["method"] != "none":
+            # already real size: show it 1:1 ('height_m' then names the subject's height)
+            block["scale"] = 1.0
+            if size["height_m"] > 0:
+                block["height_m"] = size["height_m"]
         _export_scene(
             run,
             item,
@@ -1821,9 +2050,10 @@ def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
 
     Frames are decoded at a constant rate (at most :data:`MAX_VIDEO_FPS`) so the copied sound
     stays in sync; depth is smoothed over time (``temporal_smooth``) and so is the flat-mode
-    screen distance, so the 3D effect does not "breathe".
+    screen distance, so the 3D effect does not "breathe".  At a cut (a new shot whose depth
+    has nothing to do with the previous frame) both start over from the new frame.
     """
-    from ..depth.post import temporal_align
+    from ..depth.post import scene_cut, temporal_align
     from ..geometry.camera import estimate_intrinsics
     from ..geometry.layers import build_layers
     from ..geometry.projection import vr180_frame
@@ -1835,7 +2065,7 @@ def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     ipd = _positive(spec.ipd_m, "Eye distance (IPD)")
     strength = _positive(spec.strength, "3D strength", allow_zero=True)
     ema = min(max(float(spec.temporal_smooth), 0.0), 0.95)
-    preset = _video_preset(run, spec.encoder_preset)
+    preset = _video_preset(run, spec.encoder_preset, output=output)
     if not is_video(item.path):
         raise InputError(
             f"{item.path.name} is not a video.", hint="Use '3D photo' or another photo mode for images."
@@ -1861,6 +2091,7 @@ def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     out_fps = min(src_fps, MAX_VIDEO_FPS) if src_fps > 0 and math.isfinite(src_fps) else 30.0
     if src_fps > MAX_VIDEO_FPS:
         log.info("%s has %.0f fps; converting at %.0f fps", item.path.name, src_fps, out_fps)
+    out_fps = _exact_fps(out_fps)  # 23.98 -> 24000/1001: decoder and encoder use the same rate
     cfr = out_fps
     n_est = (
         max(1, int(round(span * out_fps)))
@@ -1897,7 +2128,11 @@ def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
             d = np.asarray(res.disparity, dtype=np.float32)
             if d.shape != frame.shape[:2]:
                 d = np.clip(_resize(d, frame.shape[1], frame.shape[0]), 0, 1)
-            d = temporal_align(prev, d, ema=ema) if ema > 0 else d
+            if ema > 0:
+                if prev is not None and scene_cut(prev, d):
+                    log.debug("Scene cut at frame %d: depth and screen plane start over", i)
+                    prev, inv_c = None, None
+                d = temporal_align(prev, d, ema=ema)
             prev = d
             d = _refine_disparity(run, d, frame)
             inv = scale.to_inv_z(d)
@@ -1914,12 +2149,12 @@ def _mode_video(run: _Run, item: _Item, rep: ProgressReporter) -> None:
                 zc = float(auto_convergence(inv))
                 c = 1.0 / zc if zc > 0 and math.isfinite(zc) else 0.0
                 inv_c = c if inv_c is None else (ema * inv_c + (1.0 - ema) * c)  # steady screen plane
-                params = StereoParams(
+                params = _flat_stereo(
+                    _aspect(K),
                     ipd_m=ipd,
                     strength=strength,
                     convergence_m=(1.0 / inv_c) if inv_c and inv_c > 0 else None,
                     max_parallax_pct=float(spec.max_parallax_pct),
-                    mode="flat",
                 )
                 left, right = _call_opt(stereo_pair, li, params, cancel=run.cancel)
                 out_frame = compose(left, right, output)
@@ -2060,6 +2295,15 @@ def _friendly(e: BaseException) -> VRPhotoError | None:
                 "Not enough memory to process this file.",
                 hint="Lower 'Max processing size' in the advanced options.",
             )
+    if isinstance(e, OSError):
+        where = f" ({e.filename})" if getattr(e, "filename", None) else ""
+        if e.errno == errno.ENOSPC:  # also Windows ERROR_DISK_FULL / ERROR_HANDLE_DISK_FULL
+            return VRPhotoError(
+                f"The disk is full: the result could not be saved{where}.",
+                hint="Free some disk space or choose an output folder on another drive, then try again.",
+            )
+        if isinstance(e, PermissionError):
+            return VRPhotoError(f"A file could not be saved: permission denied{where}.", hint=WRITE_HINT)
     return None
 
 

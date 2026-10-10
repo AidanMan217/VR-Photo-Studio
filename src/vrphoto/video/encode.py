@@ -32,6 +32,7 @@ from typing import Any
 import numpy as np
 
 from ..core.errors import EncodeError, InputError
+from ..core.fsutil import replace_with_retry
 from ..core.log import get_logger
 
 log = get_logger(__name__)
@@ -61,10 +62,14 @@ _ALIASES: dict[str, dict[str, str]] = {
     "cpu": {"hevc": "libx265", "h264": "libx264"},
 }
 
+#: Constant-quality rate control everywhere (a fixed bitrate target would make a short or
+#: small clip as many Mbit/s as an 8K VR180 film).  NVENC: quality-targeted VBR with a
+#: peak cap (the Quest's decoder limit); AMF / QSV: constant QP (supported by every
+#: driver generation, unlike AMF QVBR / QSV ICQ).
 _HEVC_HW_ARGS: dict[str, list[str]] = {
-    "hevc_nvenc": ["-preset", "p5", "-rc", "vbr", "-b:v", "60M", "-maxrate", "100M", "-profile:v", "main"],
-    "hevc_amf": ["-quality", "quality", "-rc", "vbr_peak", "-b:v", "60M", "-maxrate", "100M"],
-    "hevc_qsv": ["-preset", "medium", "-b:v", "60M", "-maxrate", "100M"],
+    "hevc_nvenc": "-preset p5 -rc vbr -cq 19 -b:v 0 -maxrate 100M -bufsize 200M -profile:v main".split(),
+    "hevc_amf": ["-quality", "quality", "-rc", "cqp", "-qp_i", "20", "-qp_p", "22"],
+    "hevc_qsv": ["-preset", "medium", "-q:v", "22"],
     "libx265": ["-preset", "fast", "-crf", "18", "-x265-params", "log-level=error"],
 }
 
@@ -95,10 +100,10 @@ PRESETS: dict[str, dict[str, Any]] = {
         "codec": "h264",
         "encoders": ["h264_nvenc", "libx264"],
         "args": {
-            "h264_nvenc": ["-preset", "p5", "-rc", "vbr", "-cq", "18", "-b:v", "0", "-profile:v", "high"],
+            "h264_nvenc": "-preset p5 -rc vbr -cq 18 -b:v 0 -maxrate 60M -bufsize 120M -profile:v high".split(),
             "libx264": ["-preset", "medium", "-crf", "18", "-profile:v", "high"],
-            "h264_amf": ["-quality", "quality", "-rc", "vbr_peak", "-b:v", "40M", "-maxrate", "60M"],
-            "h264_qsv": ["-preset", "medium", "-b:v", "40M", "-maxrate", "60M"],
+            "h264_amf": ["-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-qp_b", "22"],
+            "h264_qsv": ["-preset", "medium", "-q:v", "20"],
         },
         "max_width": 4096,
         "max_height": 4096,
@@ -120,6 +125,10 @@ PRESETS: dict[str, dict[str, Any]] = {
 
 #: Preset used for each ``Settings.quest_model`` when ``preset="auto"``.
 QUEST_PRESETS: dict[str, str] = {"quest3": "quest3_hevc", "quest2": "quest2_hevc", "pcvr": "h264_compat"}
+#: Preset for ``preset="auto"`` by output kind, overriding the headset preset: a flat
+#: video is for phones / PCs, which may lack an HEVC decoder (stock Windows needs a paid
+#: extension), so it is H.264.
+OUTPUT_PRESETS: dict[str, str] = {"flat": "h264_compat"}
 
 _CONTAINERS = {".mp4": "mp4", ".m4v": "mp4", ".mov": "mov"}
 _LOG_TAIL_CHARS = 2000
@@ -303,10 +312,18 @@ def probe_encoders(refresh: bool = False) -> dict[str, bool]:
 
 
 # --------------------------------------------------------------------------- helpers
-def resolve_preset(preset: str, quest_model: str | None = None) -> str:
-    """Map ``"auto"`` to a preset name via ``quest_model`` (default from settings)."""
+def resolve_preset(preset: str, quest_model: str | None = None, *, output: str | None = None) -> str:
+    """Map ``"auto"`` to a preset name.
+
+    ``output`` is the kind of video being made (``"flat"``, ``"sbs"``, ``"vr180"`` ...):
+    a flat video plays on phones / PCs and becomes ``"h264_compat"``; anything else is
+    for the headset and follows ``quest_model`` (default from settings).
+    """
     name = str(preset or "auto").strip().lower()
     if name == "auto":
+        kind = str(output or "").strip().lower()
+        if kind in OUTPUT_PRESETS:
+            return OUTPUT_PRESETS[kind]
         if quest_model is None:
             try:
                 from ..core.config import get_settings
@@ -364,6 +381,9 @@ def output_size(width: int, height: int, preset: str) -> tuple[int, int]:
     return max(2, w // 2 * 2), max(2, h // 2 * 2)
 
 
+_QUALITY_OPTS = ("-crf", "-cq", "-qp_i", "-qp_p", "-qp_b", "-q:v", "-b:v", "-maxrate", "-bufsize")
+
+
 def _rate_args(spec: dict[str, Any], encoder: str, bitrate: str | None) -> list[str]:
     args = list(spec["args"].get(encoder, []))
     if bitrate:
@@ -374,7 +394,11 @@ def _rate_args(spec: dict[str, Any], encoder: str, bitrate: str | None) -> list[
             if skip:
                 skip = False
                 continue
-            if a in ("-crf", "-cq", "-b:v", "-maxrate", "-bufsize") and i + 1 < len(args):
+            if a in _QUALITY_OPTS and i + 1 < len(args):
+                skip = True
+                continue
+            if a == "-rc" and i + 1 < len(args) and args[i + 1] == "cqp":
+                out += ["-rc", "vbr_peak"]  # AMF: constant QP ignores bitrates
                 skip = True
                 continue
             out.append(a)
@@ -409,12 +433,30 @@ def _codec_of(encoder: str) -> str | None:
     return None
 
 
-def _fps_arg(fps: float) -> str:
-    """ffmpeg rate string; NTSC rates (29.97 ...) become exact ``N*1000/1001`` fractions."""
-    for base in (24, 30, 48, 60, 120):
-        if abs(fps - base * 1000 / 1001) < 0.005:
-            return f"{base * 1000}/1001"
-    fr = Fraction(fps).limit_denominator(1001)
+_NTSC_BASES = (24, 30, 48, 60, 120)
+
+
+def ntsc_rate(fps: float) -> Fraction | None:
+    """Exact ``N*1000/1001`` rate for an NTSC frame rate, else None.
+
+    ffmpeg prints rates rounded to two decimals (24000/1001 shows as ``23.98``); using
+    the rounded value for decoding while the encoder writes 24000/1001 would make the
+    picture drift behind the sound (about 0.2 ms per second).
+    """
+    for base in _NTSC_BASES:
+        if abs(float(fps) - base * 1000 / 1001) < 0.005:
+            return Fraction(base * 1000, 1001)
+    return None
+
+
+def fps_arg(fps: float) -> str:
+    """ffmpeg rate string; NTSC rates (29.97 ...) become exact ``N*1000/1001`` fractions.
+
+    Use the same string for decoding (``fps`` filter) and encoding so both agree exactly.
+    """
+    fr = ntsc_rate(fps) or Fraction(float(fps)).limit_denominator(1001)
+    if fr <= 0 < float(fps):  # very slow rates (< 1/2002 fps) would round to "0/1"
+        fr = Fraction(float(fps)).limit_denominator(10**9)
     return f"{fr.numerator}/{fr.denominator}"
 
 
@@ -560,7 +602,7 @@ class VideoWriter:
         self._spec = spec
         self._container = container
         self._audio_start = audio_start
-        self._rate = _fps_arg(self.fps)
+        self._rate = fps_arg(self.fps)
         self._closed = False
         self._result: Path | None = None
         self._mux_audio = self.audio_from is not None and _source_has_audio(self.audio_from)
@@ -745,9 +787,12 @@ class VideoWriter:
                 _unlink(self._tmp_video)
                 raise
         try:
-            os.replace(self._tmp, self.path)
+            replace_with_retry(self._tmp, self.path)
         except OSError as exc:
-            self._fail(f"could not move the video into place ({exc}); is it open in another program?")
+            self._fail(
+                f"could not move the video into place ({exc}); the file is busy (another program "
+                "or antivirus) - close any player showing it and try again"
+            )
         self._finish(delete_log=True)
         self._result = self.path
         log.info("Wrote %s (%d frames, %s)", self.path, self.frames_written, self.encoder)
@@ -856,6 +901,9 @@ __all__ = [
     "ffmpeg_exe",
     "probe_encoders",
     "resolve_preset",
+    "OUTPUT_PRESETS",
+    "ntsc_rate",
+    "fps_arg",
     "choose_encoder",
     "encoder_works_at",
     "output_size",

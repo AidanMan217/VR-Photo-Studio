@@ -71,6 +71,42 @@ class ServerController(QObject):
     def local_url(self) -> str:
         return self.urls().get("local", "")
 
+    def http_problem(self) -> str:
+        """Why the local http address (USB cable / 'Open on this PC') is missing, else "".
+
+        The viewer server treats its localhost-only http listener as optional: when that port
+        is busy the Wi-Fi (https) viewer still starts, on another free http port or without
+        the ``"local"`` URL.
+        """
+        if not self.running or self.local_url():
+            return ""
+        port = int(getattr(self.settings, "http_port", 0) or 0)
+        if not port:
+            return ""
+        return (
+            f"The USB (http) port {port} could not be opened - another program is probably using it - "
+            "so the USB cable connection is not available (Wi-Fi works normally). Choose another "
+            "'USB (http) port' in Settings."
+        )
+
+    def http_note(self) -> str:
+        """Note when the configured USB (http) port was busy and another one is used, else ""."""
+        if not self.running or getattr(self.server, "http_error", None) is None:
+            return ""
+        from urllib.parse import urlparse
+
+        try:
+            actual = urlparse(self.local_url()).port
+        except ValueError:
+            actual = None
+        wanted = int(getattr(self.settings, "http_port", 0) or 0)
+        if not actual or not wanted or actual == wanted:
+            return ""
+        return (
+            f"The USB (http) port {wanted} is used by another program, so port {actual} is used "
+            "instead this time. To keep a fixed address, choose another 'USB (http) port' in Settings."
+        )
+
     def scene_url(self, scene_id: str | None, base: str | None = None) -> str:
         """URL of the viewer page for ``scene_id`` (gallery when None)."""
         base = base if base is not None else self.https_url()
@@ -90,11 +126,13 @@ class ServerController(QObject):
             return self.server_factory(self.settings)
         from ..webxr.server import ViewerServer
 
+        # Only the viewer app and the scene library are served to the network.  The output
+        # folder is never shared (no ``files_dir``): it can be any folder the user picked
+        # (Desktop, Documents, a whole drive...) and the viewer does not need it.
         return ViewerServer(
             self.settings.library_dir,
             https_port=int(self.settings.https_port),
             http_port=int(self.settings.http_port),
-            files_dir=self.settings.outputs_dir,
         )
 
     def _set_busy(self, on: bool) -> None:
@@ -193,6 +231,9 @@ class ServerController(QObject):
         self._set_busy(False)
         urls = self.urls()
         log.info("Live viewer running: %s", ", ".join(urls.values()))
+        problem = self.http_problem() or self.http_note()
+        if problem:
+            log.warning("%s", problem)
         self.started.emit(urls)
         if self._restart_pending:
             self._restart_pending = False

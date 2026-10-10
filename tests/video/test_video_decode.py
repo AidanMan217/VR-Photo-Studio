@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 import pytest
-from video_helpers import H, N, W, encode_clip, make_tone, synth_frames
+from video_helpers import H, N, W, encode_clip, ffmpeg, make_tone, synth_frames
 
 from vrphoto.core.errors import Cancelled, EncodeError, InputError
 from vrphoto.core.types import CancelToken
@@ -138,7 +138,7 @@ def test_parse_banner_rotation_fps_audio():
     info = parse_ffmpeg_info(BANNER)
     assert info["duration"] == pytest.approx(62.5)
     assert (info["width"], info["height"]) == (1080, 1920)  # rotated portrait video
-    assert info["fps"] == pytest.approx(29.97)
+    assert info["fps"] == 30000 / 1001  # banner "29.97" snapped to the exact NTSC rate
     assert info["rotation"] == pytest.approx(-90.0)
     assert info["has_audio"] is True
     assert info["codec"] == "hevc"
@@ -405,3 +405,58 @@ def test_tiny_videos_round_trip(tmp_path, w, h):
         "  Stream #0:0: Video: h264 (High) (avc1 / 0x31637661), yuv420p, 6x4, 30 fps\n"
     )
     assert (tag_only["width"], tag_only["height"]) == (6, 4)
+
+
+# --------------------------------------------------------------------------- review fixes
+def test_ntsc_24p_decodes_without_drift(tmp_path):
+    """F4: a 24000/1001 source shows as "23.98 fps"; decoding at 23.980 made extra frames
+    (the picture then drifted behind the sound).  probe() returns the exact rate and the
+    decode filter uses the same fraction as the encoder, so the frame count is exact."""
+    src = tmp_path / "ntsc24.mp4"
+    subprocess.run(
+        [ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "color=c=gray:s=16x16:r=24000/1001:d=300", "-c:v", "libx264", "-preset", "ultrafast", str(src)],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    info = probe(src)
+    assert info.fps == 24000 / 1001
+    assert info.n_frames == 7193
+    filters = decode._decode_filters("ffmpeg", {"width": 16, "height": 16}, 16, 16, info.fps, True, "x")
+    assert filters[0] == "fps=24000/1001"
+    assert sum(1 for _ in iter_frames(src, fps=info.fps)) == info.n_frames  # was 7194 at 23.980
+
+
+def test_audio_only_file_says_so(tmp_path):
+    """R6: no raw ffmpeg banner as the hint; tell the user what the file is."""
+    tone = make_tone(tmp_path / "sound.mp4", 1.0)
+    for call in (probe, iter_frames):
+        with pytest.raises(InputError) as ei:
+            call(tone)
+        assert "only sound" in str(ei.value) and "sound.mp4" in str(ei.value)
+        text = f"{ei.value} {ei.value.hint}"
+        assert "Metadata" not in text and "vendor_id" not in text and "Stream #" not in text
+
+
+def test_damaged_or_unreadable_file_messages(tmp_path):
+    """R6: a partly copied video is called damaged with a remedy; ffmpeg's own output
+    stays in the log, not in the message or hint."""
+    full = tmp_path / "phone.mp4"  # like a phone recording: index (moov) at the end
+    subprocess.run(
+        [ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc2=s=64x64:r=30:d=2", "-c:v", "libx264", str(full)],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    head = tmp_path / "partial.mp4"
+    head.write_bytes(full.read_bytes()[: full.stat().st_size // 2])  # copy interrupted
+    with pytest.raises(EncodeError) as ei:
+        probe(head)
+    assert "damaged or was not copied completely" in str(ei.value)
+    assert "Copy the video" in ei.value.hint
+    for text in (str(ei.value), ei.value.hint):
+        assert "[mov" not in text and "Error opening" not in text and "@ 0x" not in text
+    # unknown failure: short generic hint pointing at the log
+    err = decode._no_video_error(tmp_path / "x.mkv", "Something odd happened\n", {"has_audio": False})
+    assert isinstance(err, EncodeError) and "Help > Log" in err.hint and "odd" not in str(err)
+    # a broken video stream next to an audio stream is not "only sound"
+    err = decode._no_video_error(tmp_path / "x.mp4", "", {"has_audio": True, "stream": 0})
+    assert isinstance(err, EncodeError) and "only sound" not in str(err)

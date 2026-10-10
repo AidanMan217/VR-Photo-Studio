@@ -171,9 +171,14 @@ class StereoParams:
     ipd_m: float = 0.063
     strength: float = 1.0  # multiplies baseline in flat mode
     convergence_m: float | None = None  # flat mode: zero-parallax distance (None = auto)
-    max_parallax_pct: float = 3.0  # flat mode: clamp |parallax| to this % of width
+    max_parallax_pct: float = 3.0  # flat mode: clamp |parallax| to this % of width (uncrossed side
+    # additionally capped by ipd_m/screen_width_m, see below)
     mode: Literal["flat", "vr"] = "flat"
     swap_eyes: bool = False
+    # flat mode: width (m) of the virtual screen the stereo image is shown on (viewer default
+    # 3.0 m).  Uncrossed parallax is limited so the background never exceeds the eye
+    # separation on that screen (no divergence).
+    screen_width_m: float = 3.0
 
 
 @dataclass

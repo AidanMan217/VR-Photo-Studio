@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 from ..core.errors import (
+    UI_MODELS,
     Cancelled,
     DownloadError,
     InferenceError,
@@ -36,7 +37,7 @@ log = get_logger(__name__)
 
 _MODEL_HINT = (
     "Check your internet connection (AI models are downloaded once, on first use), "
-    "or delete the model in Settings > Models so it is downloaded again."
+    f"or delete the model in the {UI_MODELS} so it is downloaded again."
 )
 
 

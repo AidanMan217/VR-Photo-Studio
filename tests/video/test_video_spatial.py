@@ -269,3 +269,50 @@ def test_inject_after_two_pass_audio_mux(tmp_path):
     assert meta["spherical"] and meta["stereo"] == "lr" and meta["coverage"] == 180
     boxes = top_level_boxes(out)
     assert boxes.index(b"moov") < boxes.index(b"mdat")
+
+
+def test_inject_waits_out_a_briefly_locked_file(h264_copy, monkeypatch):
+    """WIN-2: right after the encoder publishes the MP4 into an indexed folder, Explorer's
+    thumbnailer / antivirus may hold it for a moment; the metadata rename retries."""
+    import os
+
+    from vrphoto.core import fsutil
+
+    real = os.replace
+    calls = []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(32, "The process cannot access the file", str(dst))
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(fsutil.time, "sleep", lambda s: None)
+    assert inject(h264_copy, coverage=180, stereo="lr") == h264_copy
+    monkeypatch.undo()
+    assert len(calls) == 3
+    info = read(h264_copy)
+    assert info["spherical"] and info["stereo"] == "lr" and info["coverage"] == 180
+    assert not [p for p in h264_copy.parent.iterdir() if p.name != h264_copy.name]  # no temp left
+
+
+def test_inject_on_a_file_that_stays_busy(h264_copy, monkeypatch):
+    import os
+
+    from vrphoto.core import fsutil
+
+    monkeypatch.setattr(fsutil.time, "sleep", lambda s: None)  # Windows CI retries; do not wait
+    before = h264_copy.read_bytes()
+
+    def locked(src, dst):
+        raise PermissionError(32, "The process cannot access the file", str(dst))
+
+    monkeypatch.setattr(os, "replace", locked)
+    with pytest.raises(EncodeError) as ei:
+        inject(h264_copy, coverage=180, stereo="lr")
+    monkeypatch.undo()
+    assert "busy" in ei.value.hint and "antivirus" in ei.value.hint
+    assert h264_copy.read_bytes() == before
+    assert not [p for p in h264_copy.parent.iterdir() if p.name != h264_copy.name]

@@ -8,19 +8,33 @@ Task ``image_to_3d``:
              background is removed with rembg.
     params:  ``model`` ("mini-turbo" | "mini" | "2.0" | "2.1"), ``steps`` (5 for turbo, else 30),
              ``octree_resolution`` (380), ``guidance`` (5.0), ``seed`` (0), ``num_chunks``
-             (20000), ``texture`` (false; needs the optional custom_rasterizer extension),
-             ``max_faces`` (100000; 0 = keep), ``name`` ("model").
-    outputs: ``glb``, optionally ``textured`` (true/false as string) and ``warning``.
+             (20000), ``texture`` (false; paints a texture - needs the optional
+             custom_rasterizer extension; the paint models download on the first textured
+             run, with progress), ``max_faces`` (100000; 0 = keep), ``name`` ("model").
+    outputs: ``glb``, ``textured`` (true/false as string), optionally ``warning``.
 
 License: Tencent Hunyuan 3D 2.0 Community License - not valid in the EU, UK and South Korea.
 """
 
 from __future__ import annotations
 
+import os
 import sys
+import threading
 from pathlib import Path
 
-from _common import Progress, WorkerError, cuda_info, free_cuda, log, param, require_input, run, tqdm_factory
+from _common import (
+    Progress,
+    WorkerError,
+    addon_dir,
+    cuda_info,
+    free_cuda,
+    log,
+    param,
+    require_input,
+    run,
+    tqdm_factory,
+)
 
 VERSION = "1.0"
 
@@ -33,6 +47,85 @@ MODELS = {
 }
 PAINT_REPO = "tencent/Hunyuan3D-2"
 PAINT_SUBFOLDER = "hunyuan3d-paint-v2-0-turbo"
+DELIGHT_SUBFOLDER = "hunyuan3d-delight-v2-0"
+PAINT_COMPLETE = ".vrphoto-paint-complete"
+PAINT_FULL_VRAM_GB = 20  # below this the paint models are offloaded to the CPU between steps
+
+
+def flag(params: dict, name: str, default: bool = False) -> bool:
+    """Boolean parameter that also accepts "true"/"false"/"1"/"0" strings."""
+    v = params.get(name, default)
+    if isinstance(v, str):
+        v = v.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("", "0", "false", "no", "off", "none"):
+            return False
+        raise WorkerError(f"Invalid value for '{name}': {params.get(name)!r} (expected true or false).")
+    return bool(v)
+
+
+def paint_models_dir() -> Path:
+    """Where the texture models live: ``$HY3DGEN_MODELS/tencent/Hunyuan3D-2`` - the local
+    folder ``Hunyuan3DPaintPipeline.from_pretrained`` looks in before any download."""
+    base = os.environ.get("HY3DGEN_MODELS") or str(addon_dir() / "models")
+    return Path(base).expanduser() / PAINT_REPO
+
+
+def ensure_paint_models(progress: Progress, *, download=None) -> Path:
+    """Download the texture-painting models (delight + paint turbo, several GB) on first
+    use, reporting progress; later runs use the local copy without any network access.
+
+    ``download`` (tests) replaces ``huggingface_hub.snapshot_download``.  Raises
+    :class:`WorkerError` when the download fails.
+    """
+    local = paint_models_dir()
+    if (local / PAINT_COMPLETE).is_file():
+        return local
+    patterns = [f"{DELIGHT_SUBFOLDER}/*", f"{PAINT_SUBFOLDER}/*"]
+    total = 0
+    if download is None:
+        from huggingface_hub import HfApi, snapshot_download
+
+        download = snapshot_download
+        try:
+            from huggingface_hub.utils import filter_repo_objects
+
+            info = HfApi().model_info(PAINT_REPO, files_metadata=True)
+            sizes = {s.rfilename: s.size or 0 for s in (info.siblings or [])}
+            total = sum(sizes[f] for f in filter_repo_objects(list(sizes), allow_patterns=patterns))
+        except Exception as e:  # size unknown: progress without percentage
+            log(f"No size information for the texture models: {e}", "warning")
+    local.mkdir(parents=True, exist_ok=True)
+    errors: list[BaseException] = []
+
+    def fetch() -> None:
+        try:
+            download(repo_id=PAINT_REPO, allow_patterns=patterns, local_dir=str(local), max_workers=4)
+        except BaseException as e:  # noqa: BLE001 - reported to the main thread
+            errors.append(e)
+
+    t = threading.Thread(target=fetch, name="paint-models", daemon=True)
+    t.start()
+    msg = "Downloading the texture models (first textured run only)"
+    while t.is_alive():
+        t.join(1.0)
+        if total:
+            done = sum(f.stat().st_size for f in local.rglob("*") if f.is_file())
+            progress(min(0.99, done / total), f"{msg}: {done / 1e9:.1f} of {total / 1e9:.1f} GB")
+        else:
+            progress(0.0, msg)
+    if errors:
+        e = errors[0]
+        raise WorkerError(f"The texture models could not be downloaded ({type(e).__name__}: {e}).",
+                          hint="Check your internet connection and try again; the download resumes.")
+    missing = [d for d in (DELIGHT_SUBFOLDER, PAINT_SUBFOLDER) if not (local / d).is_dir()]
+    if missing:
+        raise WorkerError(f"The texture models are incomplete (missing {', '.join(missing)}).",
+                          hint="Try again; the download resumes where it stopped.")
+    (local / PAINT_COMPLETE).write_text("ok\n", encoding="utf-8")
+    progress(1.0, "Texture models ready")
+    return local
 
 
 def _load_shape_pipeline(key: str):
@@ -104,10 +197,10 @@ def handle(task: str, inputs: dict, params: dict, out_dir: Path, progress: Progr
     seed = param(params, "seed", 0, int)
     chunks = param(params, "num_chunks", 20000, int, lo=1000, hi=200000)
     max_faces = param(params, "max_faces", 100_000, int, lo=0, hi=2_000_000)
-    want_texture = bool(params.get("texture", False))
+    want_texture = flag(params, "texture")
     name = str(params.get("name") or "model")
 
-    cuda_info(require=True)
+    gpu = cuda_info(require=True)
     import torch
 
     progress(0.02, "Loading Hunyuan3D (downloads on first use)")
@@ -133,20 +226,37 @@ def handle(task: str, inputs: dict, params: dict, out_dir: Path, progress: Progr
     result: dict[str, str] = {}
     textured = False
     if want_texture:
+        paint = None
         try:
             import custom_rasterizer  # noqa: F401
             from hy3dgen.texgen import Hunyuan3DPaintPipeline
 
-            progress(0.78, "Painting the texture (downloads paint models on first use)")
-            paint = Hunyuan3DPaintPipeline.from_pretrained(PAINT_REPO, subfolder=PAINT_SUBFOLDER)
+            models = ensure_paint_models(progress.sub(0.76, 0.85))
+            progress(0.86, "Painting the texture")
+            paint = Hunyuan3DPaintPipeline.from_pretrained(str(models), subfolder=PAINT_SUBFOLDER)
+            if float(gpu.get("vram_gb") or 0) < PAINT_FULL_VRAM_GB:
+                paint.enable_model_cpu_offload()  # upstream's low-VRAM mode
             mesh = paint(mesh, image=image)
             textured = True
-            del paint
+            paint = None
             free_cuda()
         except ImportError as e:
-            msg = f"Texture painting is unavailable ({e}); exported the untextured shape."
+            msg = (f"Texture painting is unavailable ({e}): the optional texture-painting extension "
+                   "was not built when the add-on was installed. Exported the untextured shape.")
             log(msg, "warning")
             result["warning"] = msg
+        except WorkerError as e:
+            msg = f"{e} Exported the untextured shape."
+            log(msg, "warning")
+            result["warning"] = msg
+        except Exception as e:  # e.g. CUDA out of memory: keep the shape that is already made
+            oom = "out of memory" in str(e).lower()
+            msg = (f"Texture painting failed ({type(e).__name__}: {str(e)[:300]}); exported the untextured shape."
+                   + (" The GPU ran out of memory: close other apps or turn off Paint texture." if oom else ""))
+            log(msg, "warning")
+            result["warning"] = msg
+            paint = None
+            free_cuda()
     glb_path = out_dir / f"{name}.glb"
     mesh.export(str(glb_path))
     result.update({"glb": str(glb_path), "textured": "true" if textured else "false"})
@@ -169,6 +279,7 @@ def check(require_gpu: bool) -> dict:
         info["texture_painting"] = True
     except Exception:
         info["texture_painting"] = False
+    info["texture_models_downloaded"] = (paint_models_dir() / PAINT_COMPLETE).is_file()
     return info
 
 

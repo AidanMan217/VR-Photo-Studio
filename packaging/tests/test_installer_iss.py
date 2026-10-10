@@ -101,11 +101,13 @@ def test_names_match_bundle(iss):
 
 
 def test_ports_match_settings(iss):
+    """Only the Wi-Fi (https) port is opened: the http listener is localhost-only (SEC-3)."""
     from vrphoto.core.config import Settings
 
     s = Settings()
     ports = {int(p) for p in _define(iss, "ViewerPorts").split(",")}
-    assert ports == {s.https_port, s.http_port}
+    assert ports == {s.https_port}
+    assert s.http_port not in ports
 
 
 def test_data_dir_matches_app(iss, tmp_path, monkeypatch):
@@ -195,10 +197,14 @@ def test_firewall_task_removes_stale_program_block_rules(iss):
     uninstaller remove them, like webxr.net.add_firewall_rule does."""
     run = _sections(iss)["Run"]
     delete_prog = [r for r in run if "delete rule name=all dir=in program=" in r]
-    assert len(delete_prog) == 1 and "Tasks: firewall" in delete_prog[0]
-    assert r"{app}\{#AppExe}" in delete_prog[0]
+    # one for the GUI and one for the CLI executable (both get a program-scoped allow rule)
+    assert len(delete_prog) == 2 and all("Tasks: firewall" in r for r in delete_prog)
+    assert any(r"{app}\{#AppExe}" in r for r in delete_prog)
+    assert any(r"{app}\{#CliExe}" in r for r in delete_prog)
     add = next(i for i, r in enumerate(run) if "firewall add rule" in r)
-    assert run.index(delete_prog[0]) < add, "stale rules must be removed before the allow rule is added"
+    assert all(run.index(r) < add for r in delete_prog), "stale rules must be removed before allow rules"
+    adds = [r for r in run if "firewall add rule" in r]
+    assert len(adds) == 2 and all("program=" in r and "localport={#ViewerPorts}" in r for r in adds)
     code = "\n".join(_sections(iss)["Code"])
     assert code.count("delete rule name=all program=") == 2  # GUI and CLI executables
     assert "{#AppExe}" in code and "{#CliExe}" in code

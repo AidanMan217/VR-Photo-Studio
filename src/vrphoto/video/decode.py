@@ -30,10 +30,10 @@ from pathlib import Path
 
 import numpy as np
 
-from ..core.errors import EncodeError, InputError
+from ..core.errors import UI_LOG, EncodeError, InputError
 from ..core.log import get_logger
 from ..core.types import CancelToken
-from .encode import ff_path, ffmpeg_exe, popen_flags
+from .encode import ff_path, ffmpeg_exe, fps_arg, ntsc_rate, popen_flags
 
 log = get_logger(__name__)
 
@@ -49,6 +49,9 @@ _RE_TBR = re.compile(r"([\d.]+)(k?)\s+tbr")
 _RE_ROT = re.compile(r"rotation of\s+(-?[\d.]+)\s+degrees")
 _RE_FRAME = re.compile(r"frame=\s*(\d+)")
 _RE_SAR = re.compile(r"\[SAR\s+(\d+):(\d+)")
+#: ffmpeg messages that mean "this file is broken / incomplete" (e.g. a phone video whose
+#: copy was interrupted: the index at the end of the file is missing).
+_DAMAGED = ("moov atom not found", "invalid data found", "partial file")
 _RE_PIXFMT = re.compile(
     r"^(yuvj?\w*|nv\d\w*|p0\d\d\w*|p[24]\d\d\w*|gray\w*|ya\w*|rgb\w*|bgr\w*|gbr\w*|[0ax]?rgb\w*|"
     r"[0ax]?bgr\w*|pal8|mono[bw]|xyz\w*|y2\d\d\w*|vuy\w*|ayuv\w*)(?:\((.*)\))?$"
@@ -118,7 +121,8 @@ def parse_ffmpeg_info(text: str) -> dict:
     ``codec``, ``stream`` (index of the stream in the file), ``sar`` (``(num, den)``),
     ``pix_fmt``, ``color_range``, ``color_space``, ``color_primaries``, ``color_trc``
     (ffmpeg names, ``None`` when untagged), ``hdr`` (PQ / HLG transfer) and ``interlaced``
-    (a field order is declared).  Missing values are ``None``.
+    (a field order is declared).  Missing values are ``None``.  NTSC rates, which the
+    banner rounds (``23.98``), are returned exactly (``24000/1001``).
     """
     info: dict = {"width": None, "height": None, "fps": None, "duration": None,
                   "has_audio": False, "rotation": 0.0, "codec": None, "stream": None,
@@ -150,7 +154,9 @@ def parse_ffmpeg_info(text: str) -> dict:
                 sar = _RE_SAR.search(flat)
                 if sar and int(sar.group(1)) > 0 and int(sar.group(2)) > 0:
                     info["sar"] = (int(sar.group(1)), int(sar.group(2)))
-                info["fps"] = _rate(_RE_FPS.search(flat)) or _rate(_RE_TBR.search(flat))
+                fps = _rate(_RE_FPS.search(flat)) or _rate(_RE_TBR.search(flat))
+                exact = ntsc_rate(fps) if fps else None
+                info["fps"] = float(exact) if exact is not None else fps
             continue
         if in_video:
             rm = _RE_ROT.search(line)
@@ -245,19 +251,40 @@ def _count_packets(exe: str, path: Path, stream: str = "0:v:0") -> int | None:
 
 
 def _header(p: Path) -> tuple[str, dict]:
-    """``(ffmpeg exe, parsed banner)`` for a video; raises if it has no video stream."""
+    """``(ffmpeg exe, parsed banner)`` for a video; raises if it has no video stream.
+
+    The raw ffmpeg output goes to the log; the error names the likely cause (damaged /
+    incompletely copied file, sound-only file) in plain words.
+    """
     exe = ffmpeg_exe()
     res = _run([exe, "-hide_banner", "-nostdin", "-i", ff_path(p)], _PROBE_TIMEOUT_S)
     text = res.stderr.decode("utf-8", errors="replace")
     info = parse_ffmpeg_info(text)
     if not info["width"] or not info["height"]:
-        lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
-        reason = next((ln for ln in reversed(lines) if "output file" not in ln.lower()), "")
-        msg = f"Could not read a video stream from {p.name}."
-        if reason:
-            msg += f" ffmpeg: {reason[-300:]}"
-        raise EncodeError(msg, hint=text.strip()[-_TAIL_CHARS:] or None)
+        raise _no_video_error(p, text, info)
     return exe, info
+
+
+def _no_video_error(p: Path, text: str, info: dict) -> EncodeError | InputError:
+    """User-facing error for a file in which ffmpeg found no picture."""
+    log.info("ffmpeg found no video stream in %s:\n%s", p, text.strip()[-_TAIL_CHARS:])
+    low = text.lower()
+    if info.get("has_audio") and info.get("stream") is None:  # audio, and no video (cover art only)
+        return InputError(
+            f"{p.name} contains only sound, no picture.",
+            hint="Choose a video file (with a picture) instead.",
+        )
+    if any(k in low for k in _DAMAGED):
+        return EncodeError(
+            f"{p.name} is damaged or was not copied completely.",
+            hint="Copy the video from your phone or camera again and make sure the copy finished, "
+            "then try again.",
+        )
+    return EncodeError(
+        f"Could not read a video stream from {p.name}.",
+        hint=f"This video format could not be read. Try converting it to MP4 (H.264); "
+        f"details are in the log ({UI_LOG}).",
+    )
 
 
 def probe(path: str | os.PathLike[str]) -> VideoInfo:
@@ -359,7 +386,7 @@ def _decode_filters(
     if info.get("interlaced"):
         filters.append("yadif=mode=send_frame:parity=auto:deint=interlaced")
     if fps:
-        filters.append(f"fps={float(fps):.6f}")
+        filters.append(f"fps={fps_arg(float(fps))}")  # same exact rate the encoder writes
     w, h = int(info["width"]), int(info["height"])
     # Always scale explicitly to the probed (displayed) size so the frame size we read
     # matches even for odd sizes / non-square pixels.

@@ -678,3 +678,29 @@ def test_splats_from_mesh_validation_and_coverage_cap():
         splats_from_mesh(quad, max_splats=0)
     with pytest.raises(InputError):
         splats_from_mesh(Mesh(quad.vertices, np.array([[0, 1, 9]], np.uint32), quad.uvs, tex))
+
+
+@pytest.mark.parametrize("ext", ["ply", "splat"])
+def test_write_splats_waits_out_a_briefly_locked_file(tmp_path, monkeypatch, ext):
+    """WIN-2: the final rename retries transient Windows sharing violations."""
+    import os
+    import sys
+
+    from vrphoto.core import fsutil
+
+    real = os.replace
+    calls = []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(32, "The process cannot access the file", str(dst))
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(fsutil.time, "sleep", lambda s: None)
+    p = write_splats(random_cloud(50), tmp_path / f"a.{ext}")
+    monkeypatch.undo()
+    assert len(calls) == 3 and len(read_splats(p)) == 50
+    assert [q.name for q in tmp_path.iterdir()] == [f"a.{ext}"]

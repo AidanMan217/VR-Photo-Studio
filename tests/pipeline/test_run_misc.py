@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -283,7 +284,9 @@ def test_metric_depth_and_model_intrinsics_are_used(settings, gradient_photo, fa
 def test_exif_and_user_fov(settings, gradient_photo):
     from vrphoto.pipeline.jobs import job_from_dict
 
-    for common, expected in (({}, 69.4), ({"hfov_deg": 50.0}, 50.0)):
+    # 26 mm (35 mm equivalent) on the 43.27 mm diagonal of a 4:3 photo (34.6 mm wide)
+    exif_fov = math.degrees(2 * math.atan(43.27 * 0.8 / 2 / 26))  # 67.3 deg
+    for common, expected in (({}, exif_fov), ({"hfov_deg": 50.0}, 50.0)):
         spec = job_from_dict(
             {
                 "kind": "depth",

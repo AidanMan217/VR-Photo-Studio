@@ -23,6 +23,7 @@ import zipfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
+from ..core import fsutil
 from ..core.errors import AddonError, Cancelled
 from ..core.log import get_logger
 from ..core.types import CancelToken
@@ -131,21 +132,15 @@ def _download_to_part(
             _sleep(delay, cancel)
 
 
-def replace_with_retry(src: str | os.PathLike[str], dst: str | os.PathLike[str], *, attempts: int = 40) -> None:
-    """``os.replace`` that waits out transient Windows sharing violations.
+def replace_with_retry(src: str | os.PathLike[str], dst: str | os.PathLike[str], *, attempts: int = 75) -> None:
+    """``os.replace`` that waits out transient Windows sharing violations
+    (:func:`vrphoto.core.fsutil.replace_with_retry` with a longer default: up to ~18 s).
 
     Antivirus scanners (Windows Defender) and search indexers briefly open freshly
     written files - especially the ``.exe`` / ``.dll`` files of COLMAP and Brush - and a
     rename of the file or its folder then fails with ``PermissionError`` for a moment.
     """
-    for i in range(attempts):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if sys.platform != "win32" or i == attempts - 1:
-                raise
-            time.sleep(min(0.05 * (i + 1), 0.5))
+    fsutil.replace_with_retry(src, dst, attempts=attempts)
 
 
 class _Retryable(Exception):

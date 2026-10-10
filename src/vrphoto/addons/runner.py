@@ -24,11 +24,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any
 
-from ..core.errors import AddonError, Cancelled
+from ..core.errors import UI_ADDONS, UI_SETTINGS_MODELS, AddonError, Cancelled
 from ..core.log import get_logger
 from ..core.types import CancelToken, ProgressReporter
 from . import protocol
-from .env import clean_env, kill_orphans, kill_process_tree, popen_kwargs
+from .env import assign_to_kill_job, clean_env, kill_orphans, kill_process_tree, popen_kwargs
 
 log = get_logger(__name__)
 
@@ -164,7 +164,7 @@ def _spawn(
 ) -> subprocess.Popen:
     args = [os.fspath(c) for c in cmd]
     try:
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -176,10 +176,13 @@ def _spawn(
     except FileNotFoundError as e:
         raise AddonError(
             f"{title}: program not found ({args[0]}).",
-            hint="The add-on installation may be incomplete; reinstall it from Settings > Add-ons.",
+            hint=f"The add-on installation may be incomplete; reinstall it from the {UI_ADDONS}.",
         ) from e
     except OSError as e:
         raise AddonError(f"{title}: cannot start {Path(args[0]).name}: {e}") from e
+    # Windows: killed by the OS together with the app, even after a crash / Task Manager kill
+    assign_to_kill_job(proc)
+    return proc
 
 
 def run_process(
@@ -323,7 +326,7 @@ _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"GatedRepoError|gated repo|401 Client Error|Access to model .* is restricted|Invalid user token", re.I),
         "This model is gated on Hugging Face: accept its license on the model page and enter an "
-        "access token in Settings.",
+        f"access token in {UI_SETTINGS_MODELS}.",
     ),
     (
         re.compile(r"No space left on device|not enough space on the disk|\[WinError 112\]|Errno 28", re.I),
@@ -336,7 +339,7 @@ _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(r"ModuleNotFoundError|ImportError|DLL load failed|No module named", re.I),
-        "The add-on installation looks incomplete or broken. Reinstall it from Settings > Add-ons.",
+        f"The add-on installation looks incomplete or broken. Reinstall it from the {UI_ADDONS}.",
     ),
     (
         re.compile(r"ConnectionError|Max retries exceeded|Temporary failure in name resolution|getaddrinfo failed", re.I),

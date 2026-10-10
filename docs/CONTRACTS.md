@@ -430,3 +430,44 @@ weights `opacity·∏scale`; opacity `1-∏(1-α)`; DC colour only. `.splat` rec
 **K. Spatial metadata.** After encode: V1 GSpherical XML + V2 st3d/sv3d (equi bounds; 180 →
 left = right = 0x40000000). JPEG gets GPano XMP. Filenames carry Quest tokens (`_LR`, `_180_LR`,
 `_360_TB`, `_360`).
+
+
+## 12. Changes after the v0.1 review round (authoritative where they differ from above)
+
+* **core**: `core.fsutil.replace_with_retry(src, dst, *, attempts=20)` and
+  `atomic_write_bytes(path, data)` - use for every final rename (Windows antivirus/indexer
+  locks are retried). `core.imaging.load_image(path, with_alpha=False, *, max_px=None)`
+  (reduced-scale JPEG decode), `to_srgb(im)` (embedded ICC profiles converted to sRGB on load),
+  `hfov_from_35mm(f35, w, h)`; `exif_hfov` uses the 43.27 mm diagonal definition and returns the
+  horizontal FOV of the displayed image. `setup_logging(..., filename=)`; the CLI logs to
+  `logs/cli.log` (`CLI_LOG_FILE`), the GUI to `logs/vrphoto.log`. UI hint constants live in
+  `core.errors` (`UI_ADDONS`, `UI_MODELS`, `UI_SETTINGS_MODELS`, `UI_LOG`, `MODE_VIDEO`).
+* **FOV**: the 65 deg default applies to the LONG side of the image (portrait photos get 65 deg
+  vertical); explicit and EXIF values are horizontal.
+* **Stereo (algorithm B)**: `StereoParams.screen_width_m` (default 3.0). Uncrossed parallax is
+  limited to `min(max_parallax_pct/100, ipd_m/screen_width_m) * width` so the background never
+  requires eye divergence on the viewer's virtual screen; crossed parallax keeps the full
+  percentage. The pipeline writes the same `screen_width_m` (`min(3.0, 2.2*aspect)`) into the
+  scene manifest; the viewer caps the screen height at 2.2 m.
+* **Mesh**: `layered_meshes(target_faces=...)` is the budget for the WHOLE scene (all layers);
+  `geometry.mesh.anchor_scale(inv_z, K, anchor_distance_m, *, alpha=None)` returns the scale
+  `layered_meshes` applies (the pipeline divides the layer `max_baseline` by it).
+* **Video**: `encode.resolve_preset(preset, quest_model=None, *, output=None)`; `output="flat"`
+  with "auto" -> `h264_compat`; hardware encoders use constant-quality rate control.
+  `encode.ntsc_rate`, `encode.fps_arg`: NTSC rates are exact fractions end to end.
+* **Depth post**: `temporal_align(prev, cur, ema=0.6, *, range_pull=0.1)` (symmetric trimmed fit +
+  range pull so the depth range never drifts over a clip) and `scene_cut(prev, cur, thresh=0.5) -> bool`.
+* **Capture**: `capture_to_splat(..., subject_height_m=0.0, camera_height_m=1.45)` gives the
+  splat metric scale (median camera height above the floor = 1.45 m, or the subject height when
+  given) and writes `<out_dir>/<name>.capture.json` `{scale, height_m, method, camera_height_m}`.
+* **Add-ons**: on Windows every add-on child process is assigned to a kill-on-close Job object
+  (`addons.env.assign_to_kill_job`), so COLMAP/Brush/workers die with the app.
+* **Server**: serves only the viewer app and the scene library (no output-folder sharing; the
+  files route is disabled by default); no CORS headers; the localhost HTTP listener is optional
+  (HTTPS still starts if its port is busy). The firewall rule covers the HTTPS port only.
+* **Scene library**: assets are hard-linked when on the same volume (else copied).
+* **Scene manifest**: `object` block also accepts `up` ("y" | "-y" | "z"), `alt_assets`, and
+  `scale` (metres per asset unit for an asset that is already real size: shown 1:1, `height_m`
+  only describes it). `sphere` accepts `depth_near_m` / `depth_far_m`. The thumbnail is
+  `thumb.jpg` and may be absent (`thumbnail: null` in `/api/scenes`). Asset names must be plain
+  file names (no separators, no `..`).

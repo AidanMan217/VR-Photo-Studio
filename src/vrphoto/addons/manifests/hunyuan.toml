@@ -1,10 +1,12 @@
 # Hunyuan3D-2 (Tencent): image -> 3D shape with the 0.6B "mini" DiT (turbo, 5-step) or the
-# Hunyuan3D-2.1 shape model; optional texture painting.  The license (Tencent Hunyuan 3D
-# Community License) does not apply in the EU, the UK and South Korea.
+# Hunyuan3D-2.1 shape model; optional texture painting (job option "Paint texture" ->
+# params["texture"]).  The license (Tencent Hunyuan 3D Community License) does not apply
+# in the EU, the UK and South Korea.
 id = "hunyuan"
 title = "Hunyuan3D-2 (photo to 3D shape)"
 description = """Fast single-photo 3D shape generation with Tencent's Hunyuan3D-2 mini model \
-(about 6 GB VRAM), optionally with texture painting. Not licensed for use in the EU, UK or South Korea."""
+(about 6 GB VRAM). Optional texture painting ("Paint texture" option; about 16 GB VRAM recommended). \
+Not licensed for use in the EU, UK or South Korea."""
 version = "1.0.0"
 experimental = true
 license = "Tencent Hunyuan 3D 2.0 Community License (not valid in the EU, UK and South Korea; commercial use under 1M monthly users)"
@@ -23,9 +25,11 @@ homepage = "https://github.com/Tencent-Hunyuan/Hunyuan3D-2"
 tasks = ["image_to_3d"]
 worker = "hunyuan_worker.py"
 platforms = ["win32", "linux"]
-notes = """Shape generation works out of the box. Texture painting needs the custom_rasterizer CUDA \
-extension, which is compiled during install only when the CUDA Toolkit and C++ build tools are present \
-(optional step); the paint models (about 8 GB) download on first textured run."""
+notes = """Shape generation works out of the box. Turn on "Paint texture" (Photo to 3D Object, \
+method Hunyuan3D) for a coloured model: it needs the custom_rasterizer CUDA extension, which is compiled \
+during install only when the CUDA Toolkit and C++ build tools are present (optional step; without it the \
+result stays an untextured shape, with a warning). The paint models (several GB) download once, on the \
+first textured run, with progress. Painting uses about 16 GB VRAM (less with CPU offload, but slower)."""
 
 [env]
 PYTORCH_CUDA_ALLOC_CONF = "garbage_collection_threshold:0.65"

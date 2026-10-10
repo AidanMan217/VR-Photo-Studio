@@ -222,6 +222,27 @@ def test_firewall_command_removes_stale_program_rules_when_frozen(monkeypatch):
     assert cmd.index("delete rule name=all") < cmd.index("add rule")
 
 
+def test_frozen_firewall_rule_is_limited_to_the_app_executables(monkeypatch, tmp_path):
+    """SEC-3: a port-wide rule would expose any other program listening on that port."""
+    (tmp_path / "VRPhotoStudio.exe").write_bytes(b"MZ")
+    (tmp_path / "vrphoto-cli.exe").write_bytes(b"MZ")
+    gui, cli = str(tmp_path / "VRPhotoStudio.exe"), str(tmp_path / "vrphoto-cli.exe")
+    monkeypatch.setattr(net.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(net, "_program_path", lambda: gui)
+    cmd = net._firewall_command([8443])
+    adds = [part for part in cmd.split("&") if "add rule" in part]
+    assert len(adds) == 2
+    assert all("localport=8443 " in a and "action=allow" in a for a in adds)
+    assert f'program="{gui}"' in adds[0] and f'program="{cli}"' in adds[1]
+    assert f'delete rule name=all dir=in program="{cli}"' in cmd
+    assert " && " in cmd  # a failed first add makes the command fail
+    # only the running exe when the other one is not installed
+    (tmp_path / "vrphoto-cli.exe").unlink()
+    cmd = net._firewall_command([8443])
+    assert [p for p in cmd.split("&") if "add rule" in p][0].strip().endswith(f'program="{gui}"')
+    assert cli not in cmd
+
+
 @pytest.mark.parametrize("result", [None, 1, "raise"])
 def test_add_firewall_rule_windows_failures_never_raise(monkeypatch, result):
     monkeypatch.setattr(net.sys, "platform", "win32")

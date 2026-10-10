@@ -124,10 +124,21 @@ def _resolve_stereo_local(li: LayeredImage, params: StereoParams, K: Intrinsics)
     v = w[np.isfinite(w) & (w > 0)]
     if B > 0 and params.max_parallax_pct and params.max_parallax_pct > 0 and v.size:
         inv_c = 0.0 if math.isinf(zc) else 1.0 / zc
-        pmax = K.fx * B * max(abs(float(v.max()) - inv_c), abs(float(v.min()) - inv_c))
+        crossed = K.fx * B * max(0.0, float(v.max()) - inv_c)
+        uncrossed = K.fx * B * max(0.0, inv_c - float(v.min()))
         limit = params.max_parallax_pct / 100.0 * K.width
-        if pmax > limit > 0:
-            B *= limit / pmax
+        # uncrossed parallax never wider than the eye separation on the virtual screen
+        frac = params.max_parallax_pct / 100.0
+        sw = float(params.screen_width_m or 0.0)
+        if sw > 0 and math.isfinite(sw):
+            frac = min(frac, float(params.ipd_m) / sw)
+        far_limit = frac * K.width
+        scale = 1.0
+        if crossed > limit > 0:
+            scale = limit / crossed
+        if uncrossed > far_limit > 0:
+            scale = min(scale, far_limit / uncrossed)
+        B *= scale
     return B, zc
 
 

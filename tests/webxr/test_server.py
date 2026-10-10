@@ -154,16 +154,19 @@ def test_json_files_have_validators_and_no_cache(server):
     assert h["etag"].startswith('"') and h["last-modified"].endswith("GMT")
 
 
-def test_cors_only_on_api(server):
-    """Scene assets are same-origin only: a foreign web page must not be able to read photos."""
-    for path in ("/scenes/beach-01/scene.json", "/scenes/beach-01/video_LR.mp4", "/scenes/beach-01/nope.jpg", "/"):
+def test_no_cors_headers_anywhere(server):
+    """Everything is same-origin only: a foreign web page must not be able to read photos,
+    scene titles, file names or the PC's LAN addresses (SEC-2)."""
+    paths = ("/scenes/beach-01/scene.json", "/scenes/beach-01/video_LR.mp4", "/scenes/beach-01/nope.jpg", "/",
+             "/api/scenes", "/api/info", "/api/unknown", "/api/files")
+    for path in paths:
         _, h, _ = get(server, path, {"Origin": "https://evil.example"})
-        assert "access-control-allow-origin" not in h, path
+        assert not any(k.startswith("access-control-") for k in h), (path, h)
     _, h, _ = get(server, "/scenes/beach-01/video_LR.mp4", {"Range": "bytes=0-1"})
     assert "access-control-allow-origin" not in h
-    for path in ("/api/scenes", "/api/info", "/api/unknown"):
-        _, h, _ = get(server, path, {"Origin": "https://example.org"})
-        assert h["access-control-allow-origin"] == "*", path
+    st, h, _ = req(server.http_port, "OPTIONS", "/api/files", {"Origin": "https://evil.example",
+                                                                "Access-Control-Request-Method": "GET"})
+    assert st == 204 and not any(k.startswith("access-control-") for k in h)
 
 
 # --------------------------------------------------------------------------- ranges
@@ -367,7 +370,7 @@ def test_api_scenes_fallback_lists_scene(server, monkeypatch):
     st, h, body = get(server, "/api/scenes")
     assert st == 200
     assert h["content-type"] == "application/json; charset=utf-8"
-    assert h["access-control-allow-origin"] == "*"
+    assert "access-control-allow-origin" not in h
     assert h["cache-control"] == "no-store"
     scenes = json.loads(body)
     assert [s["id"] for s in scenes] == ["beach-01"]
@@ -423,7 +426,7 @@ def test_api_scenes_module_failure_falls_back(server, monkeypatch, exc):
 
 def test_api_info(server):
     st, h, body = get(server, "/api/info")
-    assert st == 200 and h["access-control-allow-origin"] == "*"
+    assert st == 200 and "access-control-allow-origin" not in h
     info = json.loads(body)
     from vrphoto import __version__
 
@@ -436,8 +439,8 @@ def test_api_info(server):
 
 def test_options_and_methods(server):
     st, h, body = req(server.http_port, "OPTIONS", "/api/scenes")
-    assert st == 204 and h["access-control-allow-origin"] == "*"
-    assert "GET" in h["access-control-allow-methods"]
+    assert st == 204 and "access-control-allow-origin" not in h
+    assert "GET" in h["allow"] and body == b""
     st, h, _ = req(server.http_port, "POST", "/api/scenes", {"Content-Length": "0"})
     assert st == 405 and "GET" in h["allow"]
     assert h["connection"] == "close"  # unread request bodies must not poison keep-alive
@@ -448,6 +451,7 @@ def test_options_and_methods(server):
 def test_local_server_rejects_foreign_host_header(server):
     st, _, _ = get(server, "/api/scenes", {"Host": "evil.example:80"})
     assert st == 403
+    assert req(server.http_port, "OPTIONS", "/api/scenes", {"Host": "evil.example:80"})[0] == 403
     assert get(server, "/api/scenes", {"Host": f"localhost:{server.http_port}"})[0] == 200
     assert get(server, "/api/scenes", {"Host": f"127.0.0.1:{server.http_port}"})[0] == 200
 
@@ -555,19 +559,77 @@ def test_http_only_server_needs_no_certificate(site, tmp_path):
     assert not (tmp_path / "nocerts").exists()
 
 
-def test_port_busy_raises_friendly_error(site, tmp_path):
+def _blocker() -> tuple[socket.socket, int]:
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     blocker.bind(("127.0.0.1", 0))
     blocker.listen(1)
-    busy = blocker.getsockname()[1]
+    return blocker, blocker.getsockname()[1]
+
+
+def test_port_busy_raises_friendly_error(site, tmp_path):
+    blocker, busy = _blocker()
     try:
-        srv = ViewerServer(site["library"], https_port=0, http_port=busy, viewer_dir=site["viewer"],
+        # HTTP is the only listener: a busy port is fatal
+        srv = ViewerServer(site["library"], https_port=None, http_port=busy, viewer_dir=site["viewer"],
                            cert_dir=tmp_path / "certs", bind="127.0.0.1")
         with pytest.raises(VRPhotoError) as ei:
             srv.start()
         assert isinstance(ei.value, ServerError)
         assert str(busy) in str(ei.value) and ei.value.hint
         assert not srv.running
+        # so is a busy HTTPS port (the Wi-Fi viewer is the main path)
+        srv = ViewerServer(site["library"], https_port=busy, http_port=0, viewer_dir=site["viewer"],
+                           cert_dir=tmp_path / "certs", bind="127.0.0.1")
+        with pytest.raises(ServerError) as ei:
+            srv.start()
+        assert str(busy) in str(ei.value) and "HTTPS" in str(ei.value)
+        assert not srv.running
+    finally:
+        blocker.close()
+
+
+def test_busy_http_port_does_not_stop_the_wifi_viewer(site, tmp_path):
+    """E2E-2: the localhost HTTP port (USB mode) being busy must not take HTTPS down."""
+    blocker, busy = _blocker()
+    try:
+        srv = ViewerServer(site["library"], https_port=0, http_port=busy, viewer_dir=site["viewer"],
+                           cert_dir=tmp_path / "certs", bind="127.0.0.1")
+        with srv:
+            assert srv.running
+            assert isinstance(srv.http_error, ServerError) and str(busy) in str(srv.http_error)
+            assert srv.http_port not in (None, busy)  # a free port instead
+            assert srv.urls()["local"] == f"http://localhost:{srv.http_port}/"
+            assert get(srv, "/")[0] == 200
+            assert req(srv.https_port, "GET", "/", ctx=_ctx(tmp_path))[0] == 200
+            info = json.loads(get(srv, "/api/info")[2])
+            assert info["http_port"] == srv.http_port
+        assert srv.http_port == busy  # stopped: the configured port again
+        # a clean start clears the error
+        blocker.close()
+        with srv:
+            assert srv.http_error is None and srv.http_port == busy
+    finally:
+        blocker.close()
+
+
+def test_no_http_port_at_all_still_serves_https(site, tmp_path, monkeypatch):
+    blocker, busy = _blocker()
+    real_bind = ViewerServer._bind
+
+    def no_http(self, host, port, ctx, local_only):
+        if ctx is None:
+            raise ServerError(f"Port {port} is already in use or reserved, so the HTTP viewer server cannot start.")
+        return real_bind(self, host, port, ctx, local_only)
+
+    monkeypatch.setattr(ViewerServer, "_bind", no_http)
+    try:
+        srv = ViewerServer(site["library"], https_port=0, http_port=busy, viewer_dir=site["viewer"],
+                           cert_dir=tmp_path / "certs", bind="127.0.0.1")
+        with srv:
+            assert srv.running and srv.http_port is None and srv.http_error is not None
+            assert "local" not in srv.urls() and "https" in srv.urls()
+            st, _, body = req(srv.https_port, "GET", "/api/info", ctx=_ctx(tmp_path))
+            assert st == 200 and json.loads(body)["http_port"] is None
     finally:
         blocker.close()
 
@@ -689,15 +751,23 @@ def test_concurrent_requests(server):
 
 
 # --------------------------------------------------------------------------- optional /files
-def test_files_endpoint(site, tmp_path):
+def _outputs(tmp_path: Path) -> Path:
     outputs = tmp_path / "outputs"
     (outputs / "sub").mkdir(parents=True)
     (outputs / "beach_LR.mp4").write_bytes(b"m" * 1000)
     (outputs / "sub" / "pano_360.jpg").write_bytes(b"j" * 10)
+    (outputs / "other.mp4").write_bytes(b"o" * 10)
     (outputs / "notes.txt").write_text("skip", encoding="utf-8")
+    (outputs / "x_capture_log.txt").write_text("C:\\Users\\me", encoding="utf-8")
     (outputs / ".secret.mp4").write_bytes(b"s")
+    return outputs
+
+
+def test_files_endpoint(site, tmp_path):
+    outputs = _outputs(tmp_path)
     srv = ViewerServer(site["library"], https_port=None, http_port=0, viewer_dir=site["viewer"],
-                       files_dir=outputs)
+                       files_dir=outputs,
+                       files_allow=["beach_LR.mp4", outputs / "sub" / "pano_360.jpg", "notes.txt", ".secret.mp4"])
     with srv:
         st, h, body = get(srv, "/files/beach_LR.mp4?download=1")
         assert st == 200 and body == b"m" * 1000
@@ -713,11 +783,78 @@ def test_files_endpoint(site, tmp_path):
         assert all(item["download"].endswith("?download=1") for item in listing)
         assert get(srv, "/files/../library/beach-01/scene.json")[0] == 403
         assert json.loads(get(srv, "/api/info")[2])["files"] is True
+        # only listed media files: not other outputs, logs, text or dot-files (SEC-1)
+        for path in ("/files/other.mp4", "/files/notes.txt", "/files/x_capture_log.txt", "/files/.secret.mp4"):
+            assert get(srv, path)[0] == 404, path
 
 
 def test_files_endpoint_disabled_by_default(server):
     assert get(server, "/files/anything.mp4")[0] == 404
     assert get(server, "/api/files")[0] == 404
+    assert json.loads(get(server, "/api/info")[2])["files"] is False
+
+
+def test_files_dir_alone_shares_nothing(site, tmp_path):
+    """SEC-1: passing an output folder (as the GUI / CLI used to) no longer exposes it."""
+    outputs = _outputs(tmp_path)
+    with ViewerServer(site["library"], https_port=None, http_port=0, viewer_dir=site["viewer"],
+                      files_dir=outputs) as srv:
+        for path in ("/files/beach_LR.mp4", "/files/notes.txt", "/files/sub/pano_360.jpg", "/api/files"):
+            assert get(srv, path)[0] == 404, path
+        assert json.loads(get(srv, "/api/info")[2])["files"] is False
+
+
+def test_files_refuses_home_drive_root_and_app_data(site, tmp_path, monkeypatch):
+    """SEC-1: a broad shared folder could leak settings.json (HF token) and the TLS key."""
+    profile = tmp_path / "profile"
+    appdata = profile / "AppData" / "Local" / "VRPhotoStudio"
+    (appdata / "certs").mkdir(parents=True)
+    (appdata / "certs" / "thumb.jpg").write_bytes(b"k")
+    (profile / "Pictures").mkdir()
+    (profile / "Pictures" / "IMG_0001.jpg").write_bytes(b"p")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: profile))
+    cases = [
+        (profile, ["Pictures/IMG_0001.jpg"]),  # the user folder itself
+        (tmp_path, ["profile/Pictures/IMG_0001.jpg"]),  # a folder containing it
+        (Path(Path(tmp_path).anchor), [str(profile / "Pictures" / "IMG_0001.jpg")]),  # a drive root
+    ]
+    monkeypatch.setenv("VRPHOTO_HOME", str(appdata))
+    cases.append((appdata / "certs", ["thumb.jpg"]))  # inside the app's data folder
+    for root, allow in cases:
+        with ViewerServer(site["library"], https_port=None, http_port=0, viewer_dir=site["viewer"],
+                          files_dir=root, files_allow=allow) as srv:
+            assert srv.files_root is None, root
+            assert get(srv, "/files/" + allow[0].lstrip("/"))[0] in (403, 404), root
+            assert get(srv, "/api/files")[0] == 404
+
+
+def test_files_skip_windows_hidden_attribute(site, tmp_path, monkeypatch):
+    outputs = _outputs(tmp_path)
+    hidden = {outputs / "sub"}
+    monkeypatch.setattr(srvmod, "_is_hidden", lambda p: Path(p) in hidden or Path(p).name.startswith("."))
+    with ViewerServer(site["library"], https_port=None, http_port=0, viewer_dir=site["viewer"],
+                      files_dir=outputs, files_allow=["beach_LR.mp4", "sub/pano_360.jpg"]) as srv:
+        assert get(srv, "/files/beach_LR.mp4")[0] == 200
+        assert get(srv, "/files/sub/pano_360.jpg")[0] == 404
+        assert [i["name"] for i in json.loads(get(srv, "/api/files")[2])] == ["beach_LR.mp4"]
+
+
+def test_files_links_out_of_the_folder_are_not_shared(site, tmp_path):
+    """SEC-1: a link inside the shared folder that points out of it answers 404 (not 403,
+    which would confirm that it exists), even when it is listed."""
+    outputs = _outputs(tmp_path)
+    secret = tmp_path / "private" / "key.mp4"
+    secret.parent.mkdir()
+    secret.write_bytes(b"secret")
+    try:
+        (outputs / "link.mp4").symlink_to(secret)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available")
+    with ViewerServer(site["library"], https_port=None, http_port=0, viewer_dir=site["viewer"],
+                      files_dir=outputs, files_allow=["beach_LR.mp4", "link.mp4"]) as srv:
+        assert get(srv, "/files/link.mp4")[0] == 404
+        assert get(srv, "/files/beach_LR.mp4")[0] == 200
+        assert [i["name"] for i in json.loads(get(srv, "/api/files")[2])] == ["beach_LR.mp4"]
 
 
 # --------------------------------------------------------------------------- packaging

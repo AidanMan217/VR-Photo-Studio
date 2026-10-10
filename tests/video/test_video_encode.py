@@ -38,7 +38,8 @@ def test_presets_contract():
     assert PRESETS["quest3_hevc"]["encoders"][0] == "hevc_nvenc"
     assert PRESETS["quest3_hevc"]["encoders"][-1] == "libx265"
     nv = PRESETS["quest3_hevc"]["args"]["hevc_nvenc"]
-    for flag, val in (("-preset", "p5"), ("-rc", "vbr"), ("-b:v", "60M"), ("-maxrate", "100M")):
+    # constant quality with a peak cap (E2E-1 / R3: no fixed 60 Mbit/s target for small clips)
+    for flag, val in (("-preset", "p5"), ("-rc", "vbr"), ("-cq", "19"), ("-b:v", "0"), ("-maxrate", "100M")):
         assert nv[nv.index(flag) + 1] == val
     x265 = PRESETS["quest3_hevc"]["args"]["libx265"]
     assert x265[x265.index("-preset") + 1] == "fast" and x265[x265.index("-crf") + 1] == "18"
@@ -463,3 +464,109 @@ def test_encoder_works_at_real_ffmpeg():
     assert encode.encoder_works_at("libx264", 320, 240) is True
     assert encode.encoder_works_at("libx264", 320, 240) is True  # cached
     assert encode.encoder_works_at("definitely_not_an_encoder", 64, 64) is False
+
+
+# --------------------------------------------------------------------------- review fixes
+def test_flat_output_auto_preset_is_h264():
+    """E2E-1 / R3: a flat video is for phones / PCs (no HEVC decoder on stock Windows):
+    "auto" gives H.264 there; headset outputs keep the Quest HEVC preset."""
+    assert encode.resolve_preset("auto", "quest3", output="flat") == "h264_compat"
+    assert encode.resolve_preset("auto", "quest2", output=" FLAT ") == "h264_compat"
+    assert encode.resolve_preset("", "quest3", output="flat") == "h264_compat"
+    for out in ("sbs", "vr180", "tb", None):
+        assert encode.resolve_preset("auto", "quest3", output=out) == "quest3_hevc"
+    # an explicit preset always wins
+    assert encode.resolve_preset("quest3_hevc", "quest3", output="flat") == "quest3_hevc"
+    assert encode.resolve_preset("preview", output="flat") == "preview"
+
+
+def test_hardware_encoders_use_constant_quality():
+    """E2E-1: no fixed bitrate target (60 Mbit/s made a 6 s clip ~45 MB); every hardware
+    encoder uses quality-based rate control, NVENC keeps a peak cap for the Quest."""
+    for preset in ("quest3_hevc", "quest2_hevc", "h264_compat"):
+        for enc, args in PRESETS[preset]["args"].items():
+            if enc in ("libx264", "libx265"):
+                assert "-crf" in args
+                continue
+            assert any(q in args for q in ("-cq", "-qp_i", "-q:v")), (preset, enc, args)
+            if "-b:v" in args:
+                assert args[args.index("-b:v") + 1] == "0", (preset, enc)
+            if enc.endswith("_nvenc"):
+                assert args[args.index("-rc") + 1] == "vbr" and "-maxrate" in args
+            if enc.endswith("_amf"):
+                assert args[args.index("-rc") + 1] == "cqp"
+
+
+def test_bitrate_override_switches_hardware_rate_control():
+    spec = PRESETS["quest3_hevc"]
+    amf = encode._rate_args(spec, "hevc_amf", "20M")
+    assert amf[amf.index("-rc") + 1] == "vbr_peak" and "cqp" not in amf
+    assert amf[amf.index("-b:v") + 1] == "20M" and "-qp_i" not in amf and "-qp_p" not in amf
+    nv = encode._rate_args(spec, "hevc_nvenc", "20M")
+    assert "-cq" not in nv and nv.count("-b:v") == 1 and nv[nv.index("-b:v") + 1] == "20M"
+    qsv = encode._rate_args(spec, "hevc_qsv", "20M")
+    assert "-q:v" not in qsv and qsv[qsv.index("-b:v") + 1] == "20M"
+    assert encode._rate_args(spec, "hevc_nvenc", None) == spec["args"]["hevc_nvenc"]
+
+
+def test_ntsc_rates_are_exact():
+    """F4: the banner's rounded "23.98" means 24000/1001 for decoding and encoding."""
+    from fractions import Fraction
+
+    assert encode.ntsc_rate(23.98) == Fraction(24000, 1001)
+    assert encode.ntsc_rate(24000 / 1001) == Fraction(24000, 1001)
+    assert encode.ntsc_rate(29.97) == Fraction(30000, 1001)
+    assert encode.ntsc_rate(59.94) == Fraction(60000, 1001)
+    assert encode.ntsc_rate(47.95) == Fraction(48000, 1001)
+    assert encode.ntsc_rate(24.0) is None and encode.ntsc_rate(25.0) is None
+    assert encode.fps_arg(23.98) == "24000/1001"
+    assert encode.fps_arg(30.0) == "30/1"
+    assert encode.fps_arg(12.5) == "25/2"
+    # the decoder now uses fps_arg too: a very slow rate must not round to "0/1"
+    slow = encode.fps_arg(0.0004)
+    assert slow != "0/1" and float(Fraction(slow)) == pytest.approx(0.0004)
+
+
+def test_close_retries_a_briefly_locked_destination(tmp_path, monkeypatch):
+    """WIN-2: antivirus / thumbnailer briefly lock the fresh file on Windows; the final
+    rename waits that out instead of failing the whole encode."""
+    from vrphoto.core import fsutil
+
+    out = tmp_path / "locked.mp4"
+    vw = VideoWriter(out, 64, 32, 30, encoder="libx264")
+    vw.write(np.zeros((32, 64, 3), np.uint8))
+    real = os.replace
+    calls = []
+
+    def flaky(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(32, "The process cannot access the file", str(dst))
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", flaky)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(fsutil.time, "sleep", lambda s: None)
+    assert vw.close() == out
+    monkeypatch.undo()
+    assert len(calls) == 3 and out.is_file() and decode.probe(out).n_frames == 1
+    assert not list(tmp_path.glob(".*encoding*"))
+
+
+def test_close_reports_a_busy_file_in_plain_words(tmp_path, monkeypatch):
+    from vrphoto.core import fsutil
+
+    monkeypatch.setattr(fsutil.time, "sleep", lambda s: None)  # Windows CI retries; do not wait
+    out = tmp_path / "busy.mp4"
+    vw = VideoWriter(out, 64, 32, 30, encoder="libx264")
+    vw.write(np.zeros((32, 64, 3), np.uint8))
+
+    def locked(src, dst):
+        raise PermissionError(32, "The process cannot access the file", str(dst))
+
+    monkeypatch.setattr(os, "replace", locked)
+    with pytest.raises(EncodeError) as ei:
+        vw.close()
+    monkeypatch.undo()
+    assert "busy" in str(ei.value) and "antivirus" in str(ei.value)
+    assert not out.exists() and not list(tmp_path.glob(".*encoding*"))

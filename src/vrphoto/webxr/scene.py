@@ -102,6 +102,7 @@ _BLOCKS: dict[str, tuple[tuple[str, ...], dict[str, tuple]]] = {
             "distance_m": ("posnum",),
             "alt_assets": ("strarray", 0),
             "up": ("enum", ("y", "-y", "z")),
+            "scale": ("posnum",),
         },
     ),
     "splat": (
@@ -335,10 +336,74 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
+# Windows cloud-files placeholders (OneDrive, Dropbox, ...): the OFFLINE, RECALL_ON_OPEN,
+# PINNED, UNPINNED and RECALL_ON_DATA_ACCESS attributes and the IO_REPARSE_TAG_CLOUD_* tags.
+_CLOUD_ATTRS = 0x1000 | 0x40000 | 0x80000 | 0x100000 | 0x400000
+_CLOUD_TAG, _CLOUD_TAG_MASK = 0x9000001A, 0xFFFF0FFF
+_ONEDRIVE_VARS = ("OneDrive", "OneDriveConsumer", "OneDriveCommercial")
+
+
+def _cloud_marked(path: Path) -> bool:
+    """``path`` itself is a cloud-files placeholder (Windows)."""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+    if getattr(st, "st_file_attributes", 0) & _CLOUD_ATTRS:
+        return True
+    tag = getattr(st, "st_reparse_tag", 0)
+    return bool(tag) and (tag & _CLOUD_TAG_MASK) == _CLOUD_TAG
+
+
+def _in_cloud_folder(path: Path) -> bool:
+    """Windows: ``path`` lies in a OneDrive (or other cloud-files) synced folder.
+
+    Sync engines do not allow a hard link from outside their folder (CF_HARDLINK_POLICY):
+    linking a fresh output there would stop it from syncing.  Pictures - where the outputs go
+    by default - is often backed up to OneDrive.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        real = path.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return True  # unsure: copy
+    for var in _ONEDRIVE_VARS:
+        root = os.environ.get(var)
+        if not root:
+            continue
+        try:
+            if real.is_relative_to(Path(root).resolve()):
+                return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return any(_cloud_marked(p) for p in (real, *real.parents))
+
+
+def _link_or_copy(src: Path, tmp: Path) -> None:
+    """Hard-link ``src`` as ``tmp`` (same volume: no second copy on disk), else copy it.
+
+    Never links into or out of a cloud-synced folder (see :func:`_in_cloud_folder`).
+    """
+    link = getattr(os, "link", None)
+    if link is not None and (_in_cloud_folder(src) or _in_cloud_folder(tmp.parent)):
+        log.debug("Not hard-linking %s: it is in a cloud-synced folder; copying it", src)
+        link = None
+    if link is not None:
+        try:
+            link(src, tmp)
+            return
+        except (OSError, NotImplementedError) as e:
+            # other drive, FAT/exFAT, network or cloud folder, link limit, ...
+            log.debug("Cannot hard-link %s (%s); copying it", src, e)
+            tmp.unlink(missing_ok=True)
+    shutil.copyfile(src, tmp)
+
+
 def _atomic_copy(src: Path, dst: Path) -> None:
     tmp = _temp_name(dst)
     try:
-        shutil.copyfile(src, tmp)
+        _link_or_copy(src, tmp)
         _replace(tmp, dst)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -401,7 +466,9 @@ def export_scene(
     ``manifest`` is completed with defaults (``schema``, ``id`` from the title, ``created``,
     ``units``, ``thumbnail`` when one is given), validated, and written last and atomically as
     ``scene.json`` - a half-written scene is never listed.  ``assets`` maps plain file names to
-    a source ``Path`` (copied) or ``bytes`` (written).  ``thumbnail`` (RGB array) is saved as
+    a source ``Path`` or ``bytes`` (written).  Source files are hard-linked when the library is
+    on the same volume (a large video then takes no extra disk space; deleting either name
+    keeps the other) and copied otherwise.  ``thumbnail`` (RGB array) is saved as
     ``thumb.jpg`` with its long side limited to 512 px.  Re-exporting an existing id replaces
     the scene's files.  ``library`` defaults to ``Settings.library_dir``.
     """

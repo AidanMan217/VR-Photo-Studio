@@ -342,6 +342,20 @@ def test_settings_change_updates_option_defaults(make_window, settings):
     assert w.modes.current_panel().common_values()["depth_model"] == "moge2"
 
 
+def test_output_folder_change_does_not_restart_viewer(make_window, qtbot, fake_server_factory):
+    """The viewer does not serve the output folder (SEC-1), so changing it keeps the viewer
+    running; changing a port restarts it."""
+    w, _ = make_window()
+    w.server.start()
+    qtbot.waitUntil(lambda: w.server.running and not w.server.busy, timeout=5000)
+    first = fake_server_factory.instances[-1]
+    w.apply_settings({"output_dir"})
+    assert w.server.running and not w.server.busy and first.stops == 0
+    w.apply_settings({"http_port"})
+    qtbot.waitUntil(lambda: first.stops == 1 and w.server.running and not w.server.busy, timeout=5000)
+    assert fake_server_factory.instances[-1] is not first
+
+
 def test_log_panel_shows_messages(make_window, qtbot):
     from vrphoto.core.log import get_logger
 

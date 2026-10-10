@@ -7,6 +7,8 @@ Two stdlib :class:`~http.server.ThreadingHTTPServer` instances run in daemon thr
   A plain-HTTP request that reaches this port is answered with a redirect to ``https://``.
 * **HTTP** on ``127.0.0.1:http_port`` (default 8080) - for ``adb reverse`` over USB
   (``http://localhost`` is a secure context, so WebXR works) and the desktop browser.
+  Optional when HTTPS runs: if its port is busy, a free port is used instead (or, failing
+  that, the HTTPS viewer runs alone); :attr:`ViewerServer.http_error` says why.
 
 Routes::
 
@@ -15,8 +17,9 @@ Routes::
     GET /scenes/<id>/<file>    exported scene assets from the library folder
     GET /api/scenes            JSON scene list (webxr.scene.list_scenes)
     GET /api/info              JSON {app, version, urls, ...}
-    GET /files/<path>[?download=1]  optional: files from ``files_dir`` (outputs)
-    GET /api/files             optional: JSON list of media files in ``files_dir``
+    GET /files/<path>[?download=1]  off by default: only the media files listed in
+                               ``files_allow`` (inside ``files_dir``); everything else 404
+    GET /api/files             off by default: JSON list of those files
 
 Static files support ``HEAD``, single byte ``Range`` requests (206/416; required for
 video seeking on the Quest), ``ETag``/``Last-Modified`` revalidation (304) and
@@ -24,10 +27,10 @@ video seeking on the Quest), ``ETag``/``Last-Modified`` revalidation (304) and
 encoded dots, backslashes, drive letters, NTFS streams, device names and dot-files are
 rejected and there are no directory listings.
 
-``Access-Control-Allow-Origin: *`` is sent for ``/api/*`` only.  The viewer loads scene
-assets same-origin, so they deliberately carry no CORS header: otherwise any web page
-open in a browser that can reach this server (the desktop browser via localhost, or
-Quest Browser after the certificate was accepted) could read the user's photos.
+No response carries CORS headers (``Access-Control-Allow-Origin``).  The viewer loads its
+API and the scene assets same-origin; with CORS any web page open in a browser that can
+reach this server (the desktop browser via localhost, or Quest Browser after the
+certificate was accepted) could read the user's photos, file names and LAN addresses.
 """
 
 from __future__ import annotations
@@ -40,8 +43,10 @@ import re
 import socket
 import socketserver
 import ssl
+import stat
 import sys
 import threading
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from email.utils import formatdate, parsedate_to_datetime
 from http import HTTPStatus
@@ -51,7 +56,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .. import APP_NAME, __version__
-from ..core.config import get_settings, resource_path
+from ..core.config import data_root, get_settings, resource_path
 from ..core.errors import VRPhotoError
 from ..core.log import get_logger
 
@@ -199,6 +204,41 @@ def _resolve_in(root: Path, segs: list[str]) -> Path | None:
         return real if real.is_file() else None
     except OSError:
         return None
+
+
+_HIDDEN_ATTRS = getattr(stat, "FILE_ATTRIBUTE_HIDDEN", 2) | getattr(stat, "FILE_ATTRIBUTE_SYSTEM", 4)
+
+
+def _is_hidden(path: Path) -> bool:
+    """Dot-files and (Windows) files / folders with the hidden or system attribute."""
+    if path.name.startswith("."):
+        return True
+    try:
+        attrs = getattr(os.stat(path, follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return True
+    return bool(attrs & _HIDDEN_ATTRS)
+
+
+def _unsafe_share_reason(root: Path, protected: Iterable[Path]) -> str | None:
+    """Why ``root`` must not be shared over the network (None = acceptable).
+
+    A drive root, the user's home folder or any folder that contains it, and folders that
+    contain or lie inside the app's data folder (settings with the Hugging Face token,
+    the HTTPS private key) are refused.
+    """
+    if root.parent == root:
+        return "it is the root of a drive"
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        home = None
+    if home is not None and home.is_relative_to(root):
+        return "it is your user folder or contains it"
+    for p in protected:
+        if p.is_relative_to(root) or root.is_relative_to(p):
+            return f"it contains or is inside the app's private folder {p}"
+    return None
 
 
 # --------------------------------------------------------------------------- range / caching
@@ -472,11 +512,12 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
         self._dispatch(head=True)
 
     def do_OPTIONS(self) -> None:
+        # No CORS: the viewer is same-origin, so cross-origin preflights get no permission.
+        if not self._host_allowed():
+            self._send_error(HTTPStatus.FORBIDDEN, "Unknown host name")
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
-        self._cors_headers()
-        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Range, Content-Type, If-None-Match, If-Range")
-        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Allow", "GET, HEAD, OPTIONS")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -488,13 +529,6 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
     do_POST = do_PUT = do_DELETE = do_PATCH = _not_allowed
 
     # ------------------------------------------------------------------ helpers
-    def _cors_headers(self) -> None:
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, ETag")
-
-    def _is_api(self) -> bool:
-        return _split_target(self.path)[0].lstrip("/").startswith("api")
-
     def _send_error(self, code: int, message: str = "", *, allow: bool = False, head: bool = False) -> None:
         status = HTTPStatus(code)
         body = json.dumps({"error": message or status.phrase, "status": int(code)}).encode("utf-8")
@@ -507,8 +541,6 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
             self.send_header("Allow", "GET, HEAD, OPTIONS")
         if self.close_connection:
             self.send_header("Connection", "close")
-        if self._is_api():
-            self._cors_headers()
         self.end_headers()
         if not head and self.command != "HEAD":
             self.wfile.write(body)
@@ -520,7 +552,6 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self._cors_headers()
         self.end_headers()
         if not head:
             self.wfile.write(body)
@@ -555,16 +586,15 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
             download = False
             if segs[0] == "scenes":
                 path = _resolve_in(app.library_root, segs[1:])
-            elif segs[0] == "files" and app.files_root is not None:
-                path = _resolve_in(app.files_root, segs[1:])
+            elif segs[0] == "files":
+                path = app.shared_file(segs[1:])
                 download = query.get("download", ["0"])[0].lower() in ("1", "true", "yes")
             else:
                 path = _resolve_in(app.viewer_root, segs)
             if path is None:
                 self._send_error(HTTPStatus.NOT_FOUND, "Not found", head=head)
                 return
-            # same-origin content: no CORS header (see module docstring)
-            self._serve_file(path, head=head, cors=False, download=download)
+            self._serve_file(path, head=head, download=download)
         except _Forbidden as exc:
             log.debug("Rejected path %r from %s: %s", self.path, self.client_address[0], exc)
             self._send_error(HTTPStatus.FORBIDDEN, "Forbidden", head=head)
@@ -603,7 +633,7 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
             self._send_error(HTTPStatus.NOT_FOUND, "Unknown API endpoint", head=head)
 
     # ------------------------------------------------------------------ files
-    def _serve_file(self, path: Path, *, head: bool, cors: bool, download: bool) -> None:
+    def _serve_file(self, path: Path, *, head: bool, download: bool) -> None:
         try:
             st = path.stat()
         except OSError:
@@ -626,8 +656,6 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
             self.send_header("ETag", etag)
             self.send_header("Last-Modified", last_modified)
             self.send_header("Cache-Control", "no-cache")
-            if cors:
-                self._cors_headers()
             self.end_headers()
             return
 
@@ -640,8 +668,6 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
                 self.send_header("Content-Range", f"bytes */{size}")
                 self.send_header("Content-Length", "0")
                 self.send_header("Accept-Ranges", "bytes")
-                if cors:
-                    self._cors_headers()
                 self.end_headers()
                 return
             if parsed is not _IGNORE:
@@ -665,8 +691,6 @@ class _Handler(_QuietHandlerMixin, BaseHTTPRequestHandler):
             self.send_header("X-Content-Type-Options", "nosniff")
             if status == HTTPStatus.PARTIAL_CONTENT:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            if cors:
-                self._cors_headers()
             if download:
                 self.send_header("Content-Disposition", _content_disposition(path.name))
             self.end_headers()
@@ -743,9 +767,17 @@ class ViewerServer:
         srv.stop()
 
     Port ``0`` picks a free port (``urls()`` then reports the real one); ``None``
-    disables that listener.  ``files_dir`` (optional, not in the frozen contract) also
-    exposes a folder of finished outputs under ``/files/`` for download in Quest Browser.
-    ``start``/``stop`` are thread-safe and idempotent; the instance can be restarted.
+    disables that listener.  The localhost HTTP listener is optional while HTTPS runs: if
+    its port is busy a free port is used instead (or none at all), :attr:`http_error`
+    keeps the reason and ``urls()`` reports what really runs.
+
+    Only the viewer app and the scene library are served.  ``files_dir`` + ``files_allow``
+    (optional, not in the frozen contract, off by default) let Quest Browser download
+    individual finished outputs under ``/files/``: only the media files explicitly listed
+    in ``files_allow`` (inside ``files_dir``) are served, everything else answers 404, and
+    a ``files_dir`` that is a drive root, the user folder or the app's data folder is
+    refused.  ``start``/``stop`` are thread-safe and idempotent; the instance can be
+    restarted.
     """
 
     def __init__(
@@ -758,6 +790,7 @@ class ViewerServer:
         cert_dir: Path | None = None,
         bind: str = "0.0.0.0",
         files_dir: Path | None = None,
+        files_allow: Iterable[str | os.PathLike[str]] | None = None,
     ) -> None:
         if https_port is None and http_port is None:
             raise ServerError("At least one of the HTTPS and HTTP servers must be enabled")
@@ -770,6 +803,7 @@ class ViewerServer:
         self.viewer_dir = Path(viewer_dir) if viewer_dir is not None else resource_path("webxr", "viewer")
         self.cert_dir = Path(cert_dir) if cert_dir is not None else None
         self.files_dir = Path(files_dir) if files_dir is not None else None
+        self.files_allow = tuple(Path(f) for f in files_allow or ())
         self.bind = bind or "0.0.0.0"
         self._https_port_cfg = https_port
         self._http_port_cfg = http_port
@@ -779,10 +813,12 @@ class ViewerServer:
         self._ports: dict[str, int] = {}
         self._ips: list[str] | None = None
         self._running = False
+        self._http_error: ServerError | None = None
         # resolved roots (set by start(); usable by handlers)
         self.library_root = self.library
         self.viewer_root = self.viewer_dir
         self.files_root: Path | None = None
+        self._shared: frozenset[Path] = frozenset()
 
     # ------------------------------------------------------------------ properties
     @property
@@ -797,8 +833,20 @@ class ViewerServer:
 
     @property
     def http_port(self) -> int | None:
-        """Actual HTTP (localhost) port while running (else the configured one)."""
-        return self._ports.get("http", self._http_port_cfg)
+        """Actual HTTP (localhost) port while running (else the configured one).
+
+        None if disabled, or while running without it because no port could be bound.
+        """
+        if self._running:
+            return self._ports.get("http")
+        return self._http_port_cfg
+
+    @property
+    def http_error(self) -> ServerError | None:
+        """Why the configured HTTP (USB / desktop browser) port could not be used during the
+        last :meth:`start` (the server then runs on a free port, see :attr:`http_port`, or
+        without HTTP); None when it started normally."""
+        return self._http_error
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -823,7 +871,7 @@ class ViewerServer:
                 raise ServerError(f"Cannot create the library folder {self.library}: {exc}") from exc
             self.library_root = self.library.resolve()
             self.viewer_root = self.viewer_dir.resolve()
-            self.files_root = self.files_dir.resolve() if self.files_dir and self.files_dir.is_dir() else None
+            self.files_root, self._shared = self._resolve_shared()
 
             ssl_ctx = None
             self._ips = self._detect_ips()
@@ -841,11 +889,14 @@ class ViewerServer:
                     ) from exc
 
             servers: list[tuple[str, _HTTPServer]] = []
+            self._http_error = None
             try:
                 if self._https_port_cfg is not None:
                     servers.append(("https", self._bind(self.bind, self._https_port_cfg, ssl_ctx, False)))
                 if self._http_port_cfg is not None:
-                    servers.append(("http", self._bind("127.0.0.1", self._http_port_cfg, None, True)))
+                    http = self._bind_optional_http(required=not servers)
+                    if http is not None:
+                        servers.append(("http", http))
             except BaseException:
                 for _, srv in servers:
                     srv.server_close()
@@ -935,40 +986,126 @@ class ViewerServer:
             out["local"] = f"http://localhost:{self.http_port}/"
         return out
 
-    # ------------------------------------------------------------------ files listing
+    # ------------------------------------------------------------------ shared files
+    def _resolve_shared(self) -> tuple[Path | None, frozenset[Path]]:
+        """``(files_root, allowed files)`` for ``/files/``; ``(None, empty)`` = disabled."""
+        if self.files_dir is None:
+            return None, frozenset()
+        if not self.files_allow:
+            log.info("No files are listed for download, so /files/ stays disabled")
+            return None, frozenset()
+        try:
+            root = self.files_dir.resolve(strict=True)
+        except (OSError, RuntimeError):
+            log.warning("Not sharing %s for download: the folder does not exist", self.files_dir)
+            return None, frozenset()
+        protected = [data_root().resolve()]
+        if self.cert_dir is not None:
+            protected.append(self.cert_dir.resolve())
+        reason = _unsafe_share_reason(root, protected) if root.is_dir() else "it is not a folder"
+        if reason:
+            log.warning("Not sharing %s for download: %s", root, reason)
+            return None, frozenset()
+        allowed: set[Path] = set()
+        for f in self.files_allow:
+            cand = f if f.is_absolute() else root / f
+            try:
+                real = cand.resolve(strict=True)
+            except (OSError, RuntimeError):
+                continue
+            if self._shareable(root, real):
+                allowed.add(real)
+            else:
+                log.warning("Not sharing %s for download: not a media file inside %s", cand, root)
+        return (root if allowed else None), frozenset(allowed)
+
+    @staticmethod
+    def _shareable(root: Path, real: Path) -> bool:
+        """A regular, visible media file below ``root`` (no hidden folder on the way)."""
+        if not real.is_relative_to(root) or real == root or real.suffix.lower() not in _DOWNLOADABLE:
+            return False
+        try:
+            if not real.is_file():
+                return False
+        except OSError:
+            return False
+        p = real
+        while p != root:
+            if _is_hidden(p):
+                return False
+            p = p.parent
+        return True
+
+    def shared_file(self, segs: list[str]) -> Path | None:
+        """The explicitly shared file ``files_dir/segs`` (else None -> 404)."""
+        root = self.files_root
+        if root is None or not self._shared:
+            return None
+        try:
+            path = _resolve_in(root, segs)
+        except _Forbidden:  # e.g. a link out of the folder: 404 like everything not shared
+            return None
+        if path is None or path not in self._shared or not self._shareable(root, path):
+            return None
+        return path
+
     def list_files(self) -> list[dict]:
-        """Media files under ``files_dir`` (newest first, at most 2000) for ``/api/files``."""
+        """The shared files (newest first, at most 2000) for ``/api/files``."""
         root = self.files_root
         if root is None:
             return []
         items: list[dict] = []
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
-            for name in filenames:
-                p = Path(dirpath) / name
-                if name.startswith(".") or p.suffix.lower() not in _DOWNLOADABLE:
-                    continue
-                try:
-                    st = p.stat()
-                    rel = p.relative_to(root).as_posix()
-                except (OSError, ValueError):
-                    continue
-                url = "files/" + quote(rel)
-                items.append({
-                    "name": rel,
-                    "size": st.st_size,
-                    "modified": datetime.fromtimestamp(st.st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "url": url,
-                    "download": url + "?download=1",
-                })
-                if len(items) >= _MAX_FILE_LIST:
-                    break
+        for p in sorted(self._shared):
+            if not self._shareable(root, p):
+                continue
+            try:
+                st = p.stat()
+                rel = p.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            url = "files/" + quote(rel)
+            items.append({
+                "name": rel,
+                "size": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "url": url,
+                "download": url + "?download=1",
+            })
             if len(items) >= _MAX_FILE_LIST:
                 break
         items.sort(key=lambda d: d["modified"], reverse=True)
         return items
 
     # ------------------------------------------------------------------ internals
+    def _bind_optional_http(self, *, required: bool) -> _HTTPServer | None:
+        """Bind the localhost HTTP listener.
+
+        When it is ``required`` (no HTTPS listener) a busy port raises :class:`ServerError`.
+        Otherwise HTTP only serves USB mode and the desktop browser, so a busy port must not
+        stop the Wi-Fi viewer: a free port is used instead, or none (``http_error`` says why).
+        """
+        port = self._http_port_cfg
+        assert port is not None
+        try:
+            return self._bind("127.0.0.1", port, None, True)
+        except ServerError as exc:
+            if required:
+                raise
+            self._http_error = exc
+            first = exc
+        if int(port) != 0:
+            try:
+                srv = self._bind("127.0.0.1", 0, None, True)
+            except ServerError as exc:
+                log.debug("No free port for the HTTP viewer server either: %s", exc)
+            else:
+                log.warning(
+                    "%s Using port %d for USB mode and the desktop browser instead.", first, srv.server_port
+                )
+                return srv
+        log.warning("%s The Wi-Fi (HTTPS) viewer runs without it; USB mode is unavailable.", first)
+        return None
+
     def _bind(self, host: str, port: int, ctx: ssl.SSLContext | None, local_only: bool) -> _HTTPServer:
         try:
             return _HTTPServer((host, int(port)), _Handler, app=self, ssl_context=ctx, local_only=local_only)

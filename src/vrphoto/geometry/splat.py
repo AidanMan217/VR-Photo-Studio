@@ -27,7 +27,6 @@ vectorised with ``np.bincount`` (3 M splats take a few seconds and < 1 GB).
 from __future__ import annotations
 
 import math
-import os
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -36,6 +35,7 @@ from typing import Any
 import numpy as np
 
 from ..core.errors import InputError, VRPhotoError
+from ..core.fsutil import replace_with_retry
 from ..core.log import get_logger
 from ..core.types import CancelToken, Mesh, ProgressReporter, SplatCloud
 from .mesh import _as_reporter, _check
@@ -306,10 +306,15 @@ def _sorted_by_importance(sc: SplatCloud) -> SplatCloud:
 
 def _atomic_replace(tmp: Path, path: Path) -> None:
     try:
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)  # waits out antivirus / indexer locks on Windows
     except OSError as e:
         tmp.unlink(missing_ok=True)
-        raise VRPhotoError(f"Cannot write {path.name}: {e}") from e
+        hint = (
+            "The file is busy (another program or antivirus); try again."
+            if isinstance(e, PermissionError)
+            else None
+        )
+        raise VRPhotoError(f"Cannot write {path.name}: {e}", hint=hint) from e
 
 
 # --------------------------------------------------------------------------- PLY

@@ -192,11 +192,16 @@ class Console:
 
 
 class _ConsoleLogHandler(logging.Handler):
-    """Log records to the console's stderr without breaking the progress line."""
+    """Log records to the console's stderr without breaking the progress line.
 
-    def __init__(self, console: Console, level: int) -> None:
+    Tracebacks only go to the log file unless ``tracebacks`` (``-v``) is set: the console
+    gets the one-line message, and the error summary names the log file.
+    """
+
+    def __init__(self, console: Console, level: int, *, tracebacks: bool = False) -> None:
         super().__init__(level)
         self.console = console
+        self.tracebacks = tracebacks
         self.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -206,6 +211,10 @@ class _ConsoleLogHandler(logging.Handler):
         return super().filter(record)
 
     def emit(self, record: logging.LogRecord) -> None:
+        if not self.tracebacks and (record.exc_info or record.exc_text or record.stack_info):
+            record = logging.makeLogRecord(
+                {**record.__dict__, "exc_info": None, "exc_text": None, "stack_info": None}
+            )
         try:
             msg = self.format(record)
         except Exception:  # pragma: no cover - logging must never raise
@@ -350,6 +359,16 @@ def _meta_tooltip(kind: str, name: str) -> str:
     return str(getattr(meta, "tooltip", "") or "")
 
 
+def _meta_zero_label(kind: str, name: str) -> str:
+    """The GUI's label for the value 0 of a numeric option (e.g. 'Automatic'), or ''."""
+    try:
+        from .gui.options_meta import COMMON_META, JOB_META  # Qt-free metadata
+    except Exception:  # noqa: BLE001 - optional (GUI metadata)
+        return ""
+    meta = COMMON_META.get(name) if kind == "common" else JOB_META.get(kind, {}).get(name)
+    return str(getattr(meta, "zero_label", "") or "")
+
+
 #: Units of numeric fields by name suffix (the CLI uses the stored units, e.g. metres not mm).
 _UNITS = {
     "_m": "metres",
@@ -378,7 +397,8 @@ def _help_for(
     elif isinstance(default, bool):
         text += f" Default: {'on' if default else 'off'}."
     elif default != "":
-        text += f" Default: {default}."
+        zero = _meta_zero_label(kind, f.name) if default == 0 else ""
+        text += f" Default: {default} ({zero})." if zero else f" Default: {default}."
     return _escape(text)
 
 
@@ -777,15 +797,9 @@ def _cmd_serve(console: Console, ns: argparse.Namespace) -> int:
     s = get_settings()
     https_port = ns.https_port if ns.https_port is not None else s.https_port
     http_port = ns.http_port if ns.http_port is not None else s.http_port
-    kwargs: dict[str, Any] = {"https_port": https_port, "http_port": http_port, "bind": ns.bind}
-    try:
-        import inspect
-
-        if "files_dir" in inspect.signature(ViewerServer).parameters:
-            kwargs["files_dir"] = s.outputs_dir
-    except (TypeError, ValueError):  # pragma: no cover
-        pass
-    srv = ViewerServer(s.library_dir, **kwargs)
+    # Only the viewer app and the scene library are served to the network - never the output
+    # folder (no ``files_dir``): it can be any folder (Desktop, Documents, a whole drive).
+    srv = ViewerServer(s.library_dir, https_port=https_port, http_port=http_port, bind=ns.bind)
     srv.start()
     try:
         urls = srv.urls()
@@ -1100,9 +1114,11 @@ def _safe_stream(stream: TextIO | None) -> TextIO:
 
 
 def _setup_logging(console: Console, verbose: int, quiet: bool) -> _ConsoleLogHandler:
-    from .core.log import setup_logging
+    from .core.log import CLI_LOG_FILE, setup_logging
 
-    setup_logging(logging.DEBUG if verbose >= 2 else logging.INFO, console=False)
+    # The command line tool has its own log file: the GUI (or another command) may keep
+    # vrphoto.log open, and on Windows a shared file cannot be rotated.
+    setup_logging(logging.DEBUG if verbose >= 2 else logging.INFO, console=False, filename=CLI_LOG_FILE)
     if verbose >= 2:
         logging.getLogger().setLevel(logging.DEBUG)
     level = (
@@ -1114,7 +1130,7 @@ def _setup_logging(console: Console, verbose: int, quiet: bool) -> _ConsoleLogHa
         if quiet
         else logging.WARNING
     )
-    handler = _ConsoleLogHandler(console, level)
+    handler = _ConsoleLogHandler(console, level, tracebacks=verbose >= 1)
     logging.getLogger().addHandler(handler)
     return handler
 

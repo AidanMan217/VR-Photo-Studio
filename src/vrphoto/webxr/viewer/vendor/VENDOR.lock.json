@@ -1,0 +1,111 @@
+{
+  "generated": [
+    {
+      "description": "Disables git line-ending conversion so files stay byte-identical to this lock.",
+      "path": ".gitattributes",
+      "sha256": "595487545cc5d121fe6b06086a16fcf26f18c2d735606a032162900a18ee919c"
+    },
+    {
+      "description": "Explains the vendor folder.",
+      "path": "README.md",
+      "sha256": "8bbd439ffd85a8cafbf598b3d6033911822edddab170340c7c69a3b9d2871d07"
+    },
+    {
+      "description": "profilesList.json filtered to the vendored profiles; aliases: generic-trigger -> generic-trigger-squeeze-thumbstick",
+      "path": "webxr-input-profiles/profiles/profilesList.json",
+      "sha256": "7bdb02f3c99fd87a13c1ca85326aa0acbb71a465992b472cd59455ad1b1eef71"
+    }
+  ],
+  "generated_by": "scripts/vendor_web.py",
+  "note": "Do not edit vendored files by hand; re-run the script.",
+  "packages": {
+    "spark": {
+      "files": {
+        "spark/LICENSE": "51829693e5dccd9ca1daa093991faac3aaa93238eb8fd5f5cb4130af85791d64",
+        "spark/dist/spark.module.js": "2de375d5e489692f976abe3199c8435ecc00f97fabaf35e489eb7d368e1f6f60"
+      },
+      "homepage": "https://sparkjs.dev/",
+      "integrity": "sha512-K+SyIbkO/dx1TLLudK8Jp3/noS13z/kdNPo6OK2waxQaGy81HBmKGnNBT/t/K9Ew3dsIXmWqsJXxGfmAu1T5Jg==",
+      "license": "MIT",
+      "license_files": [
+        "spark/LICENSE"
+      ],
+      "name": "@sparkjsdev/spark",
+      "tarball": "sparkjsdev-spark-2.3.1.tgz",
+      "version": "2.3.1"
+    },
+    "three": {
+      "files": {
+        "three/LICENSE": "8b378ebe60e2fe500158cb0ac71cb5e8b7d92953c2abcc63a0eb90499653b5bc",
+        "three/build/three.core.js": "9edde002b066a9a05676a6127f67735b62baf399bdea529f2f7e31657da769e6",
+        "three/build/three.module.js": "9052042d676cb0fdc1ddfefe193053f34b7ac0513a616fdac4535d49987812ea",
+        "three/examples/jsm/controls/OrbitControls.js": "3d79d07ecb686b4e5d93232eedab255331c1beef711e13164eaa1f68655a5f2b",
+        "three/examples/jsm/libs/motion-controllers.module.js": "4bf534b98dbb0f3e90b1332ac4d49c7d7747253768970abc7e4133b7700b75b1",
+        "three/examples/jsm/loaders/GLTFLoader.js": "131c0f78c01d19368ae495caa65b3adaa10487810a36a05bb5901b769a35ac16",
+        "three/examples/jsm/postprocessing/Pass.js": "444b409c235ead986893c472e720da1b779a56985c7d10b279c7944b52bd61c5",
+        "three/examples/jsm/utils/BufferGeometryUtils.js": "9fb63427ce6641fa14fd0baff9cc4d1b5f9c3d85fd084bf2e90e803c44ec1797",
+        "three/examples/jsm/utils/SkeletonUtils.js": "b1632a703206c3d830de9fcbe515696770d04b71a15ee6b50afa6d2c3298c86f",
+        "three/examples/jsm/webxr/ARButton.js": "ee83c9c0ee1add5f4ebe14fb192fa31e603e98de6cce83a246fbf81407387401",
+        "three/examples/jsm/webxr/VRButton.js": "35a7621bbbe776203dad04cddc79c8e1b166dc3b6757d8b907f97df86d8a9d48",
+        "three/examples/jsm/webxr/XRButton.js": "13ceb022e450bfc8ff48e7af8e39faceacf08fea84a844fb82858a126c4e0249",
+        "three/examples/jsm/webxr/XRControllerModelFactory.js": "54c952cc928690c134129829a0ae3a9cfdde782c5be22e152b821b937b16f182",
+        "three/examples/jsm/webxr/XRHandMeshModel.js": "fb8090a78af25ce2510d259a94b5678d53a2b66958dab8c956d8cf4806a54e03",
+        "three/examples/jsm/webxr/XRHandModelFactory.js": "eb850592ebc60acd01b5d40f9151bd1404c6479ad1167da7914d370707c3205e",
+        "three/examples/jsm/webxr/XRHandPrimitiveModel.js": "401ec6836ba4ca82f709e07329d6df4f687c91062b532a1e30415fb689ffdb97"
+      },
+      "homepage": "https://threejs.org/",
+      "integrity": "sha512-blFeqb49wRCSGUGj7gtpfnSGHy2lwDk94RhUmS1c/hTby70kvChbWpkJ4Pm1390LqzzvTmzgXKHPEafJwCb8jA==",
+      "license": "MIT",
+      "license_files": [
+        "three/LICENSE"
+      ],
+      "name": "three",
+      "tarball": "three-0.186.1.tgz",
+      "version": "0.186.1"
+    },
+    "webxr-input-profiles": {
+      "files": {
+        "webxr-input-profiles/LICENSE.md": "0ef0c87e8ffdd0681f332dc3b39f284dee2166d1f853fabc3853884fe81a6f30",
+        "webxr-input-profiles/profiles/generic-hand/left.glb": "bc67783144944ea1cda54d9247885825ea5fb9d4651469fe7d00be517a5c2b87",
+        "webxr-input-profiles/profiles/generic-hand/profile.json": "749bb0624eb032d1e726e87dad398e6729020f35d62d2e9b431d4202e4c656fc",
+        "webxr-input-profiles/profiles/generic-hand/right.glb": "291790c14f7f88a7f9bd35330c47392ed8e8d395ae6728f4bb7089f1bc1f2b96",
+        "webxr-input-profiles/profiles/generic-trigger-squeeze-thumbstick/left.glb": "22a6f7824467aa2fe52fec8ae5eaa665f4af89ca711810bbed04f3dbe3940a32",
+        "webxr-input-profiles/profiles/generic-trigger-squeeze-thumbstick/none.glb": "6f0cde10489cd56093a71751caf969d88bccd404046f28eb73d947b6f36b04c1",
+        "webxr-input-profiles/profiles/generic-trigger-squeeze-thumbstick/profile.json": "e18518190becce2b6eac448a5b1fbf4d60fbd56822f7b21173605b6233e14eab",
+        "webxr-input-profiles/profiles/generic-trigger-squeeze-thumbstick/right.glb": "9f86b08bee52ca869298fd2c0f155697efe81df35c9f6b58c7caf343b185623d",
+        "webxr-input-profiles/profiles/meta-quest-touch-plus/left.glb": "41a35b80221398d37029cbfaa9e39084ccd43e0206be72a5e8460f52e7882cb4",
+        "webxr-input-profiles/profiles/meta-quest-touch-plus/profile.json": "f69041753f555fb91c36d97fd4a58885f3ceb35e2273b179f59cedd464aec688",
+        "webxr-input-profiles/profiles/meta-quest-touch-plus/right.glb": "5126d638fb1d03e05d16d8eec3b31b9588df88eaa8b42cc21b857fac3bd44916",
+        "webxr-input-profiles/profiles/oculus-touch-v2/left.glb": "1385bc8df4258cf67fbcab5665e502c0faa5b2d2374d5747125224ab850f6a7f",
+        "webxr-input-profiles/profiles/oculus-touch-v2/profile.json": "69c7bd8eba00c3f9db0d2e924db7c1c659d2460e71f0669e945ab6e1c87141f7",
+        "webxr-input-profiles/profiles/oculus-touch-v2/right.glb": "73c3945e6b001db5503747514c9cc31d0804fefca2e0d9dcff37adb409e55a61",
+        "webxr-input-profiles/profiles/oculus-touch-v3/left.glb": "5a3015792dac074b31607e63eeb75743eac479540a36739e5f94b65335a7f88a",
+        "webxr-input-profiles/profiles/oculus-touch-v3/profile.json": "438acabcdb360998d9e8fd97526292f5df5bfc88de9033dabe5817b5d5b29cc8",
+        "webxr-input-profiles/profiles/oculus-touch-v3/right.glb": "18a2e651328b684d3aeeef9f16c083af1eea9c1f98f78f9da94960432c8a021b"
+      },
+      "homepage": "",
+      "integrity": "sha512-V/8NB4Ywgm//TBVMgo0TgJ9DtxsBoo0iiaF8AdfiP0F0cgbwkuQycEZAIOsplyd/iZ8L3mrFYNJBC6rzQb4tJA==",
+      "license": "",
+      "license_files": [
+        "webxr-input-profiles/LICENSE.md"
+      ],
+      "name": "@webxr-input-profiles/assets",
+      "tarball": "webxr-input-profiles-assets-1.0.20.tgz",
+      "version": "1.0.20"
+    }
+  },
+  "patches": [
+    {
+      "description": "Default controller profile path -> vendored webxr-input-profiles (no CDN at runtime).",
+      "path": "three/examples/jsm/webxr/XRControllerModelFactory.js",
+      "sha256_patched": "54c952cc928690c134129829a0ae3a9cfdde782c5be22e152b821b937b16f182",
+      "sha256_upstream": "401dcb638ca3de94dd0a7744dd7a1c0d20374c73695b3d4e890eac6100e56877"
+    },
+    {
+      "description": "Default hand mesh path -> vendored generic-hand profile (no CDN at runtime).",
+      "path": "three/examples/jsm/webxr/XRHandMeshModel.js",
+      "sha256_patched": "fb8090a78af25ce2510d259a94b5678d53a2b66958dab8c956d8cf4806a54e03",
+      "sha256_upstream": "9bcb2e3f36fcc17c952589f9c40d2e6abe33af1a0bf797bd4b50d5dd311781ae"
+    }
+  ]
+}

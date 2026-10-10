@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "generated": null,
+  "generator": "scripts/pin_models.py",
+  "note": "Exact model pins (commit sha, file sizes, sha256) overlaid onto models/registry.py. Empty until scripts/pin_models.py runs where huggingface.co is reachable.",
+  "models": {}
+}

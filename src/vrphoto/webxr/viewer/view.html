@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>VR Photo Studio - Viewer</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%234f8cff'/%3E%3Cpath d='M12 24h40v18a6 6 0 0 1-6 6h-8l-6-6-6 6h-8a6 6 0 0 1-6-6z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/viewer.css">
+  <!-- All libraries are bundled with the app (vendor/): the viewer works without internet. -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three/build/three.module.js",
+        "three/addons/": "./vendor/three/examples/jsm/",
+        "@sparkjsdev/spark": "./vendor/spark/dist/spark.module.js"
+      }
+    }
+  </script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body class="viewer">
+  <div id="stage"></div>
+
+  <header class="topbar">
+    <a id="back" class="btn ghost" href="./" title="Back to all scenes">&lsaquo; Gallery</a>
+    <div class="title">
+      <h1 id="scene-title">Loading&hellip;</h1>
+      <span id="scene-mode" class="badge hidden"></span>
+    </div>
+    <button id="help-btn" class="btn ghost icon" type="button" aria-label="Help and controls" title="Help and controls">?</button>
+  </header>
+
+  <div id="notices" class="notices hidden" role="note"></div>
+
+  <aside id="help" class="sheet hidden" aria-label="Controls">
+    <h3>On this screen</h3>
+    <ul>
+      <li>Drag to look around, scroll or pinch to zoom.</li>
+      <li><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move, <kbd>Q</kbd>/<kbd>E</kbd> down/up.</li>
+      <li><kbd>Space</kbd> plays / pauses videos.</li>
+    </ul>
+    <h3>In VR (Quest controllers)</h3>
+    <ul>
+      <li><b>Left stick</b>: walk. <b>Right stick</b>: turn in steps.</li>
+      <li><b>Right trigger</b>: hold, aim at the floor, release to jump there (where available).</li>
+      <li><b>Grip</b>: grab objects - use both grips to resize. <b>Stick</b> left/right rotates.</li>
+      <li><b>Y</b> or <b>B</b>: menu (recenter, next scene, passthrough, exit).</li>
+      <li>You can also just walk and lean - your real movement is used.</li>
+    </ul>
+    <h3>With hand tracking</h3>
+    <ul>
+      <li>Pinch to click. Turn your left palm towards you and tap the blue dot for the menu.</li>
+    </ul>
+  </aside>
+
+  <div class="xr-bar" id="xr-bar">
+    <button id="enter-vr" class="btn primary big hidden" type="button">Enter VR</button>
+    <button id="enter-ar" class="btn accent big hidden" type="button">Enter AR (passthrough)</button>
+    <div id="xr-note" class="xr-note hidden" role="note"></div>
+    <p id="xr-status" class="xr-status" aria-live="polite"></p>
+  </div>
+
+  <div id="media-bar" class="media-bar hidden">
+    <button id="media-play" class="btn ghost" type="button">Play</button>
+    <button id="media-mute" class="btn ghost" type="button">Sound</button>
+  </div>
+
+  <div id="loading" class="overlay loading" aria-live="polite">
+    <div class="panel">
+      <div class="spinner" aria-hidden="true"></div>
+      <p id="loading-text">Loading&hellip;</p>
+      <div class="progress"><div id="loading-bar"></div></div>
+    </div>
+  </div>
+
+  <div id="error" class="overlay hidden" role="alert">
+    <div class="panel">
+      <h2 id="error-title">Something went wrong</h2>
+      <p id="error-text"></p>
+      <div class="actions">
+        <button id="error-retry" class="btn primary big" type="button">Try again</button>
+        <a class="btn big" href="./">Back to gallery</a>
+      </div>
+      <details id="error-details" class="hidden">
+        <summary>Technical details</summary>
+        <pre id="error-details-text"></pre>
+      </details>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <noscript>
+    <div class="overlay"><div class="panel"><h2>JavaScript is off</h2><p>The VR viewer needs JavaScript.</p></div></div>
+  </noscript>
+</body>
+</html>

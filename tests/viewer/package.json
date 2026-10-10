@@ -1,0 +1,19 @@
+{
+  "name": "vrphoto-viewer-tests",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Static checks and Playwright browser tests for the VR Photo Studio WebXR viewer (test-only; nothing here ships).",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "check-imports": "node check_imports.mjs",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0",
+    "iwer": "2.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

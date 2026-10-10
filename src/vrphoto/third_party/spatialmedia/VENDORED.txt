@@ -1,0 +1,40 @@
+Vendored third-party code: Google spatial-media (Python package 'spatialmedia')
+Upstream:     https://github.com/google/spatial-media
+Commit:       2308497c39bb604a7c3ba56ac17e302f2b1b6a96
+Commit date:  2026-07-27
+Vendored on:  2026-10-10
+License:      Apache License 2.0 (see LICENSE)
+Reproduce:    python scripts/vendor_spatialmedia.py   (verify: --check)
+Import as:    vrphoto.third_party.spatialmedia
+
+Excluded upstream files:
+  - spatialmedia/gui.py (Tk GUI)
+  - spatialmedia/spatial_media_metadata_injector.spec
+  - spatialmedia/README.md
+  - spatialmedia/LICENSE (identical to the root LICENSE)
+
+Local modifications:
+  - absolute 'spatialmedia.' imports rewritten as relative imports
+  - '_log.py' added; modules that call print() import 'log_print as print' from it
+  - __init__.py: remove sys.path manipulation (package is imported relatively)
+  - __init__.py: relative imports
+  - mpeg/__init__.py: relative imports (sv3d imported explicitly; upstream relied on the absolute import side effect)
+  - mpeg/box.py: Box.set(): NameError (undefined 'contents')
+  - mpeg/container.py: Container.add(): NameError (undefined 'container_leaf')
+  - mpeg/container.py: Container.merge(): NameError (undefined 'container_box')
+  - mpeg/sv3d.py: PRHDBox.load_content(): yaw stored under a misspelled attribute
+  - metadata_utils.py: parse_spherical_xml(): NameError (undefined 'spherical_prefix')
+
+Files (sha256):
+9c14ab2a3fd12431ba59ffbca7bbfc2e8c48f10f4fd142e0e8f24da4f43327f6  LICENSE
+c33813ac993fbe0c531d1f52fcf358fb29591466b3b3410fcfeb21ed820efdaf  __init__.py
+025c8264080a8db9e6174f3d50941cdd0a088d62cffa64bcd142ba8746642ec6  __main__.py
+d8d8ab775020e050989c5121f33dc446993774c02f508b0267b919a3d8640816  _log.py
+266693b0f6211dac37aa59805f05650f2748d5f71ed782cebf525f2013d39a9d  metadata_utils.py
+eb592b187dc3287777dda2f82c9ed3c53aacf50fbe500fd80d261d2272d43c2b  mpeg/__init__.py
+073f7e913eca109f6027bc8d551cf6f0aa730eef36b584b4a02bff9db8252fce  mpeg/box.py
+096ea42c1491b205eb2a9b22fa21b015c1b893567e27d000b3809994a507ebb0  mpeg/constants.py
+4a7b2f7d818224faf2cfbd22ee9910a209d067fb01934067bbe5e51965429326  mpeg/container.py
+f701a8957feef47603d193d02d161c1ae2ca739910e1bb726891900dbd4ab2b8  mpeg/mpeg4_container.py
+bc18515905f92f5343fdf799784fa632f3c7eacb0197ed12e011c0fd30e2bcee  mpeg/sa3d.py
+ad84c4dabe731a7df4b7490c2eed4e22009dddbfc9a776a5181952547907f871  mpeg/sv3d.py

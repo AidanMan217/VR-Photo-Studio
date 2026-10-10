@@ -13,56 +13,89 @@ import numpy as np
 def push_pull_fill(img: np.ndarray, known: np.ndarray, *, min_size: int = 1) -> np.ndarray:
     """Fill pixels where ``known`` is False/0 from their surroundings.
 
-    ``img``: HxW or HxWxC (uint8 or float).  ``known``: HxW bool or float weights in [0,1].
-    Builds a pyramid of (img*w, w) by area downsampling, then on the way back up replaces
-    unknown pixels with the upsampled weighted average.  Known pixels are returned unchanged.
-    Returns the same dtype as ``img``.
+    ``img``: HxW or HxWxC (uint8, uint16 or float).  ``known``: HxW bool or float weights in
+    [0,1].  Builds a pyramid of (img*w, w) by area downsampling, then on the way back up
+    blends each level with the upsampled coarser estimate: ``est = num + up * (1 - w)``
+    (premultiplied form of ``img*w + up*(1-w)``).  Pixels with weight 1 are returned
+    unchanged.  Returns the same dtype and shape as ``img``.
+
+    Only the bounding box of the unknown pixels (plus a generous margin of known context)
+    is processed, with per-channel OpenCV ops, so small holes in big images are cheap.
     """
     if img.ndim not in (2, 3):
         raise ValueError("img must be HxW or HxWxC")
-    dtype = img.dtype
-    x = img.astype(np.float32)
-    squeeze = x.ndim == 2
-    if squeeze:
-        x = x[..., None]
-    w = known.astype(np.float32)
-    if w.shape != x.shape[:2]:
+    if known.shape[:2] != img.shape[:2]:
         raise ValueError("known mask shape must match image")
-    if w.max() <= 0:
-        out = np.zeros_like(x)
-        return out[..., 0].astype(dtype) if squeeze else out.astype(dtype)
+    if known.dtype == bool:
+        w = known
+        unknown = ~known
+    else:
+        w = np.clip(known.astype(np.float32), 0.0, 1.0)
+        unknown = w < 1.0
+    if not unknown.any():
+        return img.copy()
+    if not (w if w.dtype == bool else w > 0).any():
+        return np.zeros_like(img)
 
-    # push: build pyramid
-    levels: list[tuple[np.ndarray, np.ndarray]] = []
-    num = x * w[..., None]
-    den = w.copy()
+    h, wd = unknown.shape
+    rows = np.flatnonzero(unknown.any(axis=1))
+    cols = np.flatnonzero(unknown.any(axis=0))
+    y0, y1, x0, x1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    margin = max(32, ((y1 - y0) + (x1 - x0)) // 4)
+    y0, y1 = max(0, y0 - margin), min(h, y1 + margin)
+    x0, x1 = max(0, x0 - margin), min(wd, x1 + margin)
+
+    out = img.copy()
+    crop_img = img[y0:y1, x0:x1]
+    crop_w = w[y0:y1, x0:x1]
+    if crop_w.dtype == bool and not crop_w.any():  # crop has no context: use whole image
+        y0, y1, x0, x1 = 0, h, 0, wd
+        crop_img, crop_w = img, w
+    filled = _push_pull_core(crop_img, crop_w, min_size)
+    if w.dtype == bool:
+        region = unknown[y0:y1, x0:x1]
+        out[y0:y1, x0:x1][region] = filled[region]
+    else:
+        out[y0:y1, x0:x1] = filled
+        full = w >= 1.0
+        out[full] = img[full]
+    return out
+
+
+def _push_pull_core(img: np.ndarray, known: np.ndarray, min_size: int) -> np.ndarray:
+    dtype = img.dtype
+    w = known.astype(np.float32)
+    if img.ndim == 2:
+        chans = [img]
+    else:
+        chans = [img[..., c] for c in range(img.shape[2])]
+
+    dens: list[np.ndarray] = [w]
+    nums: list[list[np.ndarray]] = [[cv2.multiply(np.ascontiguousarray(c), w, dtype=cv2.CV_32F) for c in chans]]
     while True:
-        levels.append((num, den))
-        h, wd = den.shape
+        h, wd = dens[-1].shape
         if max(h, wd) <= min_size or min(h, wd) <= 1:
             break
-        nh, nw = max(1, (h + 1) // 2), max(1, (wd + 1) // 2)
-        num = cv2.resize(num, (nw, nh), interpolation=cv2.INTER_AREA)
-        if num.ndim == 2:
-            num = num[..., None]
-        den = cv2.resize(den, (nw, nh), interpolation=cv2.INTER_AREA)
+        size = (max(1, (wd + 1) // 2), max(1, (h + 1) // 2))
+        dens.append(cv2.resize(dens[-1], size, interpolation=cv2.INTER_AREA))
+        nums.append([cv2.resize(n, size, interpolation=cv2.INTER_AREA) for n in nums[-1]])
 
-    # pull: from coarsest to finest
-    num_c, den_c = levels[-1]
-    est = num_c / np.maximum(den_c[..., None], 1e-8)
-    for num_l, den_l in reversed(levels[:-1]):
-        h, wd = den_l.shape
-        up = cv2.resize(est, (wd, h), interpolation=cv2.INTER_LINEAR)
-        if up.ndim == 2:
-            up = up[..., None]
-        cur = num_l / np.maximum(den_l[..., None], 1e-8)
-        a = np.clip(den_l, 0.0, 1.0)[..., None]
-        est = cur * a + up * (1.0 - a)
+    d = np.maximum(dens[-1], 1e-8)
+    est = [cv2.divide(n, d) for n in nums[-1]]
+    for lvl in range(len(dens) - 2, -1, -1):
+        den = dens[lvl]
+        h, wd = den.shape
+        inv = 1.0 - den
+        est = [
+            cv2.add(n, cv2.multiply(cv2.resize(e, (wd, h), interpolation=cv2.INTER_LINEAR), inv))
+            for n, e in zip(nums[lvl], est)
+        ]
 
-    out = np.where(w[..., None] >= 0.999, x, est)
-    if squeeze:
-        out = out[..., 0]
     if np.issubdtype(dtype, np.integer):
         info = np.iinfo(dtype)
-        out = np.clip(np.rint(out), info.min, info.max)
-    return out.astype(dtype)
+        est = [np.clip(np.rint(e), info.min, info.max).astype(dtype) for e in est]
+    else:
+        est = [e.astype(dtype, copy=False) for e in est]
+    if img.ndim == 2:
+        return est[0]
+    return np.stack(est, axis=-1)

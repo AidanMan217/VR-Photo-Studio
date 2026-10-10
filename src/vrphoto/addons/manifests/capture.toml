@@ -1,0 +1,64 @@
+# Photo / video capture -> Gaussian splat (COLMAP camera poses + Brush splat training).
+id = "capture"
+title = "Capture to 3D (COLMAP + Brush)"
+description = """Turn many overlapping photos or a slow phone video around a person, object or room \
+into a Gaussian splat you can walk around on the Quest. COLMAP solves the camera positions, \
+Brush trains the splat on any modern GPU (DirectX 12 / Vulkan)."""
+version = "1.0.0"
+experimental = false
+license = "COLMAP: BSD-3-Clause; Brush: Apache-2.0"
+noncommercial = false
+region_restricted = []
+min_vram_gb = 4
+disk_gb = 2
+kind = "binary"
+hf_gated = false
+homepage = "https://github.com/ArthurBrussee/brush"
+tasks = ["capture_to_splat"]
+entry = "vrphoto.addons.capture:run_task"
+platforms = ["win32", "linux"]
+notes = """COLMAP 4.2.1 (CUDA build: feature matching uses an NVIDIA GPU when present, otherwise the CPU) \
+and Brush 0.3.0. On Linux install COLMAP with your package manager (for example: sudo apt install colmap); \
+Brush is downloaded automatically."""
+
+[binaries.colmap]
+patterns = ["colmap/**/bin/colmap.exe", "colmap/**/colmap.exe", "colmap/**/bin/colmap"]
+path_names = ["colmap"]
+check_args = ["help"]
+env_var = "VRPHOTO_COLMAP"
+
+[binaries.brush]
+patterns = ["brush/**/brush_app.exe", "brush/**/brush_app"]
+path_names = ["brush_app"]
+check_args = ["--help"]
+env_var = "VRPHOTO_BRUSH"
+
+[[steps]]
+type = "archive"
+title = "Downloading COLMAP 4.2.1 (CUDA)"
+url = "https://github.com/colmap/colmap/releases/download/4.2.1/colmap-x64-windows-cuda.zip"
+sha256 = "e9c5cbd84c2ea986d2e970a2473fc2d2e6b34a2cdcf5d3df2765c319a63af881"
+dest = "colmap"
+size_mb = 395
+platforms = ["win32"]
+
+[[steps]]
+type = "archive"
+title = "Downloading Brush 0.3.0"
+url = "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-pc-windows-msvc.zip"
+sha256 = "b68e3e9cf052d51bf3ee30776fa5a364de7f2ba13b58443128ff797bb7bcfcd6"
+dest = "brush"
+size_mb = 151
+platforms = ["win32"]
+
+[[steps]]
+type = "archive"
+title = "Downloading Brush 0.3.0"
+url = "https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-x86_64-unknown-linux-gnu.tar.xz"
+sha256 = "4f0f9a8785d1951c62df26aae247c02c5bba32b00f40b06df4e1c9b867399e20"
+dest = "brush"
+size_mb = 42
+platforms = ["linux"]
+
+[[steps]]
+type = "check"

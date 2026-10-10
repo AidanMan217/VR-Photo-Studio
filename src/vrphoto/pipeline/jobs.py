@@ -130,7 +130,7 @@ class ObjectJob(JobBase):
     kind: ClassVar[str] = "object"
     method: str = "billboard"  # billboard | trellis | trellis2 | hunyuan | sharp
     height_m: float = 1.7
-    thickness: float = 0.17
+    thickness: float = 0.11  # median body thickness as a fraction of height
     back: str = "diffuse"  # diffuse | mirror (billboard back texture)
     export_splat: bool = True
     placement: str = "hit-test"  # hit-test | front-floor

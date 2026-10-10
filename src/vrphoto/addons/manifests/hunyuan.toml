@@ -1,0 +1,102 @@
+# Hunyuan3D-2 (Tencent): image -> 3D shape with the 0.6B "mini" DiT (turbo, 5-step) or the
+# Hunyuan3D-2.1 shape model; optional texture painting.  The license (Tencent Hunyuan 3D
+# Community License) does not apply in the EU, the UK and South Korea.
+id = "hunyuan"
+title = "Hunyuan3D-2 (photo to 3D shape)"
+description = """Fast single-photo 3D shape generation with Tencent's Hunyuan3D-2 mini model \
+(about 6 GB VRAM), optionally with texture painting. Not licensed for use in the EU, UK or South Korea."""
+version = "1.0.0"
+experimental = true
+license = "Tencent Hunyuan 3D 2.0 Community License (not valid in the EU, UK and South Korea; commercial use under 1M monthly users)"
+noncommercial = false
+region_restricted = [
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
+    "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+    "GB", "KR",
+]
+min_vram_gb = 6
+disk_gb = 16
+kind = "venv"
+python = "3.11"
+hf_gated = false
+homepage = "https://github.com/Tencent-Hunyuan/Hunyuan3D-2"
+tasks = ["image_to_3d"]
+worker = "hunyuan_worker.py"
+platforms = ["win32", "linux"]
+notes = """Shape generation works out of the box. Texture painting needs the custom_rasterizer CUDA \
+extension, which is compiled during install only when the CUDA Toolkit and C++ build tools are present \
+(optional step); the paint models (about 8 GB) download on first textured run."""
+
+[env]
+PYTORCH_CUDA_ALLOC_CONF = "garbage_collection_threshold:0.65"
+
+[[steps]]
+type = "venv"
+
+[[steps]]
+type = "pip"
+title = "Installing PyTorch 2.8.0 (CUDA 12.8)"
+packages = ["torch==2.8.0", "torchvision==0.23.0"]
+index_url = "https://download.pytorch.org/whl/cu128"
+
+[[steps]]
+type = "pip"
+title = "Installing Hunyuan3D dependencies"
+packages = [
+    "numpy==1.26.4",
+    "scipy==1.14.1",
+    "pillow==10.4.0",
+    "einops==0.8.0",
+    "omegaconf==2.3.0",
+    "pyyaml==6.0.2",
+    "tqdm==4.66.5",
+    "transformers==4.48.3",  # hy3dgen setup.py requires transformers>=4.48.0
+    "diffusers==0.30.0",
+    "accelerate==1.1.1",
+    "huggingface-hub==0.30.2",
+    "safetensors==0.4.4",
+    "opencv-python-headless==4.10.0.84",
+    "scikit-image==0.24.0",
+    "trimesh==4.4.7",
+    "pymeshlab==2023.12.post3",
+    "pygltflib==1.16.3",
+    "xatlas==0.0.9",
+    "rembg==2.0.65",
+    "onnxruntime==1.20.1",
+    "pybind11==2.13.4",
+    "ninja==1.11.1.1",
+    "setuptools==75.8.0",
+    "wheel==0.45.1",
+]
+
+[[steps]]
+type = "github_archive"
+title = "Downloading Hunyuan3D-2"
+repo = "Tencent-Hunyuan/Hunyuan3D-2"
+ref = "f8db63096c8282cb27354314d896feba5ba6ff8a"
+dest = "src/hunyuan3d-2"
+pip_install = true
+no_deps = true
+
+[[steps]]
+# Texture painting rasterizer: compiled from source; needs the CUDA Toolkit (nvcc) and a C++
+# compiler. Skipped with a warning when they are missing (shape generation still works).
+type = "pip"
+title = "Building the texture-painting extension (optional)"
+packages = ["{src}/hunyuan3d-2/hy3dgen/texgen/custom_rasterizer"]
+no_build_isolation = true
+no_deps = true
+optional = true
+
+[[steps]]
+# the turbo DiT plus the FlashVDM turbo VAE that enable_flashvdm() swaps in (otherwise it
+# would be downloaded silently on the first run, breaking offline use)
+type = "hf_download"
+title = "Downloading the Hunyuan3D-2 mini (turbo) shape model"
+repo = "tencent/Hunyuan3D-2mini"
+revision = "main"
+allow_patterns = ["hunyuan3d-dit-v2-mini-turbo/*", "hunyuan3d-vae-v2-mini-turbo/*"]
+size_gb = 3
+
+[[steps]]
+type = "check"

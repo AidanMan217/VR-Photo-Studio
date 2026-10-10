@@ -1,0 +1,268 @@
+# Windows build: PyInstaller onedir bundle + Inno Setup installer, smoke-tested, and
+# published as a GitHub release when a v* tag is pushed.
+name: Build Windows
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUTF8: "1"
+
+jobs:
+  windows:
+    name: Build and test (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      installer: ${{ steps.version.outputs.installer }}
+      zip: ${{ steps.version.outputs.zip }}
+    env:
+      # keep the build's data (logs, settings) out of the runner profile and inspectable
+      VRPHOTO_HOME: ${{ github.workspace }}\.ci-home
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install VR Photo Studio and build tools
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+          python -c "import onnxruntime as o; print('onnxruntime', o.__version__, o.get_available_providers())"
+
+      - name: Determine version
+        id: version
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $v = (python packaging/spec_helpers.py version).Trim()
+          $n = (python packaging/spec_helpers.py numeric-version).Trim()
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            Write-Output "::error::Tag $env:GITHUB_REF_NAME does not match the package version v$v (src/vrphoto/__init__.py). Bump __version__ or re-tag."
+            exit 1
+          }
+          $pre = if ($v -match '[A-Za-z]') { 'true' } else { 'false' }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "numeric=$n" >> $env:GITHUB_OUTPUT
+          "prerelease=$pre" >> $env:GITHUB_OUTPUT
+          "installer=VRPhotoStudio-Setup-$v.exe" >> $env:GITHUB_OUTPUT
+          "zip=VRPhotoStudio-$v-win64.zip" >> $env:GITHUB_OUTPUT
+          Write-Output "Building VR Photo Studio $v ($n), prerelease=$pre"
+
+      - name: Draw icon
+        run: python packaging/make_icon.py
+
+      - name: Bundle with PyInstaller
+        env:
+          VRPHOTO_STRICT_BUNDLE: "1"
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m PyInstaller packaging/vrphoto.spec --noconfirm --distpath dist --workpath build/pyinstaller
+          python packaging/spec_helpers.py check dist/VRPhotoStudio
+
+      - name: Self-test the bundled CLI
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          & dist/VRPhotoStudio/vrphoto-cli.exe --selftest --json
+
+      - name: Build installer (Inno Setup)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $iscc = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 7\ISCC.exe"
+          ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            Write-Output "Inno Setup not preinstalled - installing with Chocolatey"
+            choco install innosetup -y --no-progress
+            $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe", "$env:ProgramFiles\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $iscc) { Write-Output "::error::ISCC.exe not found"; exit 1 }
+          Write-Output "Using $iscc"
+          & $iscc /Q "/DAppVersion=${{ steps.version.outputs.version }}" "/DAppVersionNumeric=${{ steps.version.outputs.numeric }}" `
+            "/DBundleDir=${{ github.workspace }}\dist\VRPhotoStudio" "/DOutputDir=${{ github.workspace }}\out" packaging\installer.iss
+          Get-ChildItem out
+
+      - name: Silent per-user install and test the installed app
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $installer = Join-Path "${{ github.workspace }}" "out\${{ steps.version.outputs.installer }}"
+          $dir = Join-Path $env:RUNNER_TEMP "VR Photo Studio test"
+          $log = Join-Path $env:RUNNER_TEMP "install.log"
+          $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/CURRENTUSER', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"", "/LOG=`"$log`"")
+          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 60; Write-Output "::error::installer exited with $($p.ExitCode)"; exit 1 }
+          $cli = Join-Path $dir "vrphoto-cli.exe"
+          if (-not (Test-Path $cli)) { Get-Content $log -Tail 60; Write-Output "::error::$cli not installed"; exit 1 }
+          if (-not (Test-Path (Join-Path $dir "VRPhotoStudio.exe"))) { Write-Output "::error::GUI exe not installed"; exit 1 }
+          $lnk = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\VR Photo Studio.lnk"
+          if (-not (Test-Path $lnk)) { Write-Output "::error::Start menu shortcut missing: $lnk"; exit 1 }
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{6F3C2B1E-8A47-4D5B-9E21-7C0D4A9B3F58}_is1'
+          if (-not (Test-Path $key)) { Write-Output "::error::per-user uninstall entry missing (not a per-user install?)"; exit 1 }
+          Write-Output "Installed to $dir; running the installed CLI self-test"
+          & $cli --selftest --json
+
+      - name: Firewall rule (only added when Setup runs elevated)
+        run: |
+          $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+          netsh advfirewall firewall show rule name="VR Photo Studio" | Out-Host
+          $found = ($LASTEXITCODE -eq 0)
+          Write-Output "elevated=$admin rule_present=$found"
+          if ($admin -and -not $found) { Write-Output "::warning::Setup ran elevated but the firewall rule was not created" }
+          if (-not $admin -and $found) { Write-Output "::warning::firewall rule exists although Setup was not elevated" }
+          exit 0
+
+      - name: Silent uninstall removes the app but keeps user data
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "VR Photo Studio test"
+          # the uninstaller asks before deleting %LOCALAPPDATA%\VRPhotoStudio; silent mode must answer "No"
+          $data = Join-Path $env:LOCALAPPDATA "VRPhotoStudio"
+          New-Item -ItemType Directory -Force -Path $data | Out-Null
+          Set-Content -Path (Join-Path $data "ci-marker.txt") -Value "keep me"
+          $p = Start-Process -FilePath (Join-Path $dir "unins000.exe") -Wait -PassThru -ArgumentList @(
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
+          if ($p.ExitCode -ne 0) { Write-Output "::error::uninstaller exited with $($p.ExitCode)"; exit 1 }
+          # The uninstaller re-launches itself from %TEMP%; it is completely finished (including the
+          # "delete your data?" step) only once it has removed unins000.exe and the install folder.
+          for ($i = 0; $i -lt 120 -and (Test-Path $dir); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path $dir) {
+            Write-Output "Left in ${dir}:"; Get-ChildItem -Recurse $dir -ErrorAction SilentlyContinue | Select-Object -First 30 | Out-Host
+          }
+          foreach ($f in 'VRPhotoStudio.exe', 'vrphoto-cli.exe', '_internal', 'unins000.exe') {
+            if (Test-Path (Join-Path $dir $f)) { Write-Output "::error::uninstall did not remove $f"; exit 1 }
+          }
+          if (Test-Path $dir) { Write-Output "::warning::the install folder was not removed completely" }
+          if (-not (Test-Path (Join-Path $data "ci-marker.txt"))) { Write-Output "::error::silent uninstall deleted user data"; exit 1 }
+          $lnk = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\VR Photo Studio.lnk"
+          if (Test-Path $lnk) { Write-Output "::error::Start menu shortcut left behind"; exit 1 }
+          netsh advfirewall firewall show rule name="VR Photo Studio" | Out-Null
+          if ($LASTEXITCODE -eq 0) { Write-Output "::warning::firewall rule still present after uninstall" }
+          Remove-Item -Recurse -Force $data
+          Write-Output "Uninstall OK (exit code $($p.ExitCode))"
+          exit 0 # do not let the last netsh exit code fail the step
+
+      - name: Zip the app folder and compute checksums
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $zip = Join-Path "${{ github.workspace }}" "out\${{ steps.version.outputs.zip }}"
+          if (Get-Command 7z -ErrorAction SilentlyContinue) {
+            & 7z a -tzip -mx=7 -bso0 -bsp0 $zip "${{ github.workspace }}\dist\VRPhotoStudio"
+          } else {
+            Compress-Archive -Path dist\VRPhotoStudio -DestinationPath $zip -CompressionLevel Optimal
+          }
+          Push-Location out
+          Get-ChildItem -File | Where-Object { $_.Extension -in '.exe', '.zip' } | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower(), $_.Name
+          } | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+          Pop-Location
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v7
+        with:
+          path: out/${{ steps.version.outputs.installer }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v7
+        with:
+          path: out/${{ steps.version.outputs.zip }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v7
+        with:
+          path: out/SHA256SUMS.txt
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: |
+            build/pyinstaller/**/warn-*.txt
+            build/pyinstaller/**/xref-*.html
+            ${{ runner.temp }}/install.log
+            .ci-home/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: GitHub release
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.windows.outputs.installer }}
+          path: release
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.windows.outputs.zip }}
+          path: release
+          skip-decompress: true # keep the .zip itself (it was uploaded unarchived)
+      - uses: actions/download-artifact@v8
+        with:
+          name: SHA256SUMS.txt
+          path: release
+      - run: ls -la release
+
+      - name: Create release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          name: VR Photo Studio ${{ needs.windows.outputs.version }}
+          prerelease: ${{ needs.windows.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/${{ needs.windows.outputs.installer }}
+            release/${{ needs.windows.outputs.zip }}
+            release/SHA256SUMS.txt
+          body: |
+            ## Download
+
+            * **${{ needs.windows.outputs.installer }}** - the normal installer (recommended). No administrator rights needed.
+            * **${{ needs.windows.outputs.zip }}** - portable version: unzip anywhere and run `VRPhotoStudio.exe`.
+
+            Windows 10/11 64-bit. An NVIDIA GPU with 8 GB+ VRAM is recommended (it also runs on AMD/Intel GPUs and on the CPU, just slower).
+
+            **"Windows protected your PC"?** The app is not code-signed yet, so SmartScreen warns about it.
+            Click **More info**, then **Run anyway**. You can compare the file with `SHA256SUMS.txt` if you like.
+
+            New here? Read the [User Guide](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/USER_GUIDE.md).

@@ -1,0 +1,119 @@
+# TRELLIS v1 (image -> textured 3D mesh + Gaussians), Windows-friendly fp16 fork by
+# IgorAherne (trellis-stable-projectorz): Python 3.11, torch 2.7.0 + CUDA 12.8, prebuilt
+# Windows wheels for spconv / cumm / kaolin / nvdiffrast / diffoctreerast /
+# diff-gaussian-rasterization shipped inside the repository (whl/).
+id = "trellis"
+title = "TRELLIS (photo to 3D object)"
+description = """Generates a complete, textured 3D model (GLB) and a Gaussian splat of a person or \
+object from one photo - including the back side you never photographed. Best results with a \
+single subject on a clean background."""
+version = "1.0.0"
+experimental = false
+license = "TRELLIS code and weights: MIT; nvdiffrast (NVIDIA) and diff-gaussian-rasterization (Inria): research/non-commercial licenses"
+noncommercial = true
+region_restricted = []
+min_vram_gb = 8
+disk_gb = 20
+kind = "venv"
+python = "3.11"
+hf_gated = false
+homepage = "https://github.com/IgorAherne/trellis-stable-projectorz"
+tasks = ["image_to_3d"]
+worker = "trellis_worker.py"
+cwd = "src/trellis"
+platforms = ["win32"]
+notes = "fp16 pipeline (fits 8 GB GPUs); models load to the GPU one at a time. First run compiles nothing."
+
+[env]
+ATTN_BACKEND = "xformers"
+SPCONV_ALGO = "native"
+TRELLIS_MODEL = "microsoft/TRELLIS-image-large"
+PYTORCH_CUDA_ALLOC_CONF = "garbage_collection_threshold:0.65"
+
+[[steps]]
+type = "venv"
+
+[[steps]]
+type = "pip"
+title = "Installing PyTorch 2.7.0 (CUDA 12.8) and xFormers"
+packages = ["torch==2.7.0", "torchvision==0.22.0", "xformers==0.0.30"]
+index_url = "https://download.pytorch.org/whl/cu128"
+
+[[steps]]
+type = "github_archive"
+title = "Downloading TRELLIS (stable-projectorz fork)"
+repo = "IgorAherne/trellis-stable-projectorz"
+ref = "90c829db922cb4a4333442aa583a69e48ddc88bc"
+dest = "src/trellis"
+pip_install = false
+
+[[steps]]
+# git submodule of the fork (GitHub archives do not include submodules)
+type = "github_archive"
+title = "Downloading FlexiCubes (stable-projectorz fork)"
+repo = "IgorAherne/flexicubes-stable-projectorz"
+ref = "ce1dd2536f724f798df4817723fac4a0cf7e8a66"
+dest = "src/trellis/trellis/representations/mesh/flexicubes"
+pip_install = false
+
+[[steps]]
+type = "pip"
+title = "Installing TRELLIS dependencies"
+packages = [
+    "numpy==1.26.4",
+    "pillow==10.4.0",
+    "imageio==2.37.0",
+    "imageio-ffmpeg==0.6.0",
+    "tqdm==4.67.1",
+    "easydict==1.13",
+    "opencv-python-headless==4.11.0.86",
+    "scipy==1.15.2",
+    "ninja==1.11.1.4",
+    "rembg==2.0.65",
+    "onnxruntime==1.21.0",
+    "trimesh==4.6.6",
+    "xatlas==0.0.10",
+    "pyvista==0.44.2",
+    "vtk==9.3.1",
+    "pymeshfix==0.17.0",
+    "igraph==0.11.8",
+    "transformers==4.50.3",
+    "huggingface-hub==0.30.1",
+    "safetensors==0.5.3",
+    "plyfile==1.1",
+    "pygltflib==1.16.3",
+    "warp-lang==1.7.0",
+    "usd-core==25.2.post1",
+    "utils3d @ https://github.com/EasternJournalist/utils3d/archive/9a4eb15e4021b67b12c460c7057d642626897ec8.zip",
+]
+
+[[steps]]
+type = "pip"
+title = "Installing TRELLIS CUDA extensions (prebuilt wheels)"
+platforms = ["win32"]
+packages = [
+    "{src}/trellis/whl/cumm_cu128-0.7.13-cp311-cp311-win_amd64.whl",
+    "{src}/trellis/whl/spconv_cu128-2.3.8-cp311-cp311-win_amd64.whl",
+    "{src}/trellis/whl/nvdiffrast-0.3.3-cp311-cp311-win_amd64.whl",
+    "{src}/trellis/whl/diffoctreerast-0.0.0-cp311-cp311-win_amd64.whl",
+    "{src}/trellis/whl/diff_gaussian_rasterization-0.0.0-cp311-cp311-win_amd64.whl",
+    "{src}/trellis/whl/kaolin-0.17.0-cp311-cp311-win_amd64.whl",
+]
+
+[[steps]]
+type = "hf_download"
+title = "Downloading the TRELLIS-image-large model"
+repo = "microsoft/TRELLIS-image-large"
+revision = "main"
+allow_patterns = ["pipeline.json", "ckpts/*"]
+ignore_patterns = ["ckpts/*_enc_*"]
+size_gb = 3.5
+
+[[steps]]
+# DINOv2 image encoder (torch.hub; about 1.2 GB) - cached under the add-on folder
+type = "worker"
+title = "Downloading the DINOv2 image encoder"
+args = ["--prefetch"]
+
+[[steps]]
+type = "check"

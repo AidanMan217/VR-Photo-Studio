@@ -1,0 +1,75 @@
+# Apple SHARP: one photo -> metric 3D Gaussian splat in under a second (GPU) / a few
+# seconds (CPU).  Research-only weights (Apple Machine Learning Research Model license).
+id = "sharp"
+title = "SHARP (photo to 3D splat, research only)"
+description = """Apple's SHARP turns a single photo into a 3D Gaussian splat scene you can look \
+around in, in about a second on an NVIDIA GPU (also runs on the CPU, slower). The model weights \
+are licensed for non-commercial research only."""
+version = "1.0.0"
+experimental = true
+license = "Code: Apple Sample Code License; model weights: Apple Machine Learning Research Model License (non-commercial research only)"
+noncommercial = true
+region_restricted = []
+min_vram_gb = 6
+disk_gb = 12
+kind = "venv"
+python = "3.11"
+hf_gated = false
+homepage = "https://github.com/apple/ml-sharp"
+tasks = ["image_to_splat"]
+worker = "sharp_worker.py"
+platforms = ["win32", "linux"]
+notes = "Output follows the OpenCV convention (x right, y down, z forward), metric scale."
+
+[env]
+SHARP_CHECKPOINT = "{addon_dir}/models/sharp_2572gikvuh.pt"
+
+[[steps]]
+type = "venv"
+
+[[steps]]
+type = "pip"
+title = "Installing PyTorch 2.8.0 (CUDA 12.8)"
+packages = ["torch==2.8.0", "torchvision==0.23.0"]
+index_url = "https://download.pytorch.org/whl/cu128"
+
+[[steps]]
+type = "pip"
+title = "Installing SHARP dependencies"
+packages = [
+    "numpy==2.3.3",
+    "scipy==1.16.2",
+    "pillow==11.3.0",
+    "pillow-heif==1.1.1",
+    "plyfile==1.1.2",
+    "imageio==2.37.0",
+    "imageio-ffmpeg==0.6.0",
+    "matplotlib==3.10.6",
+    "timm==1.0.20",
+    "huggingface-hub==0.35.3",
+    "safetensors==0.6.2",
+    "jaxtyping==0.3.3",
+    "click==8.3.0",
+    "tqdm==4.67.1",
+    "pyyaml==6.0.3",
+]
+
+[[steps]]
+type = "github_archive"
+title = "Downloading Apple ml-sharp"
+repo = "apple/ml-sharp"
+ref = "aed6527499ef91cba3b54c18d49a870f25947190"
+dest = "src/ml-sharp"
+pip_install = true
+no_deps = true
+
+[[steps]]
+type = "archive"
+title = "Downloading the SHARP model"
+url = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
+dest = "models/sharp_2572gikvuh.pt"
+extract = false
+size_mb = 2600
+
+[[steps]]
+type = "check"

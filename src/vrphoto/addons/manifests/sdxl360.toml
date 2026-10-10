@@ -1,0 +1,74 @@
+# SDXL inpainting used to outpaint the empty parts of VR180 / 360 equirect images
+# ("fill = outpaint").  The horizontal 360 seam is handled by rolling the panorama by half
+# its width and re-inpainting a band around the seam.
+id = "sdxl360"
+title = "AI outpainting for VR180 / 360 (SDXL)"
+description = """Fills the empty surroundings of VR180 and 360 images with AI-generated scenery that \
+matches your photo (Stable Diffusion XL inpainting), with a seamless wrap-around for 360."""
+version = "1.0.0"
+experimental = false
+license = "SDXL inpainting 0.1: CreativeML Open RAIL++-M; SDXL VAE fp16 fix: MIT"
+noncommercial = false
+region_restricted = []
+min_vram_gb = 8
+disk_gb = 17
+kind = "venv"
+python = "3.11"
+hf_gated = false
+homepage = "https://huggingface.co/diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+tasks = ["outpaint_360"]
+worker = "sdxl360_worker.py"
+platforms = ["win32", "linux"]
+notes = "fp16; uses model CPU offload automatically on GPUs with less than 12 GB VRAM."
+
+[env]
+SDXL_INPAINT_MODEL = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+SDXL_VAE_MODEL = "madebyollin/sdxl-vae-fp16-fix"
+
+[[steps]]
+type = "venv"
+
+[[steps]]
+type = "pip"
+title = "Installing PyTorch 2.8.0 (CUDA 12.8)"
+packages = ["torch==2.8.0", "torchvision==0.23.0"]
+index_url = "https://download.pytorch.org/whl/cu128"
+
+[[steps]]
+type = "pip"
+title = "Installing diffusers"
+packages = [
+    "numpy==2.3.3",
+    "pillow==11.3.0",
+    "diffusers==0.35.1",
+    "transformers==4.56.2",
+    "accelerate==1.10.1",
+    "safetensors==0.6.2",
+    "huggingface-hub==0.35.3",
+]
+
+[[steps]]
+type = "hf_download"
+title = "Downloading SDXL inpainting (fp16)"
+repo = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+revision = "main"
+allow_patterns = [
+    "model_index.json",
+    "scheduler/*",
+    "tokenizer/*",
+    "tokenizer_2/*",
+    "*/config.json",
+    "*.fp16.safetensors",
+]
+size_gb = 7
+
+[[steps]]
+type = "hf_download"
+title = "Downloading the SDXL fp16 VAE"
+repo = "madebyollin/sdxl-vae-fp16-fix"
+revision = "main"
+allow_patterns = ["config.json", "diffusion_pytorch_model.safetensors"]
+size_gb = 0.4
+
+[[steps]]
+type = "check"

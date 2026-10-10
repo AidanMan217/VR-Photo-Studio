@@ -43,7 +43,9 @@
         "coverage": { "enum": [180, 360] },
         "layout": { "enum": ["mono", "sbs", "tb"] },
         "depth": { "type": ["string", "null"] },
-        "radius_m": { "type": "number", "exclusiveMinimum": 0 }
+        "radius_m": { "type": "number", "exclusiveMinimum": 0 },
+        "depth_near_m": { "type": "number", "exclusiveMinimum": 0, "description": "distance (m) of depth value 1.0 (white); default 1.5" },
+        "depth_far_m": { "type": "number", "exclusiveMinimum": 0, "description": "distance (m) of depth value 0.0 (black); default radius_m" }
       }
     },
     "object": {
@@ -56,7 +58,8 @@
         "pivot": { "enum": ["base", "center"] },
         "placement": { "enum": ["hit-test", "front-floor"] },
         "distance_m": { "type": "number", "exclusiveMinimum": 0 },
-        "alt_assets": { "type": "array", "items": { "type": "string" } }
+        "alt_assets": { "type": "array", "items": { "type": "string" } },
+        "up": { "enum": ["y", "-y", "z"], "description": "up axis of the asset; default y (glTF)" }
       }
     },
     "splat": {

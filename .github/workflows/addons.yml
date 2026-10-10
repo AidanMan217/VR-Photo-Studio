@@ -1,0 +1,108 @@
+# Add-on install check on a real Windows machine: creates each add-on's uv virtual
+# environment (PyTorch/CUDA wheels etc.) and verifies its packages import.  The runners
+# have no NVIDIA GPU, so nothing is executed on CUDA ("--no-check-gpu", import-only check).
+# Experimental add-ons may fail without failing the workflow.
+name: Add-ons
+
+on:
+  workflow_dispatch:
+    inputs:
+      addon:
+        description: 'Add-on id to test (for example "capture", "trellis", "sharp"), several ids separated by commas, or "all"'
+        type: string
+        default: all
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUTF8: "1"
+
+jobs:
+  plan:
+    name: Select add-ons
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build matrix from the add-on manifests
+        id: matrix
+        env:
+          ADDON: ${{ inputs.addon }}
+        run: python packaging/ci/addon_matrix.py "$ADDON" --github-output "$GITHUB_OUTPUT"
+
+  install:
+    name: ${{ matrix.id }}${{ matrix.experimental && ' (experimental)' || '' }}
+    needs: plan
+    runs-on: windows-latest
+    timeout-minutes: 180
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install VR Photo Studio
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --upgrade pip
+          python -m pip install .
+          vrphoto-cli --help
+
+      - name: Use the runner's temp drive for add-ons and caches
+        run: |
+          # add-on environments are several GB; keep them (and uv's cache) off the system drive
+          "VRPHOTO_HOME=$env:RUNNER_TEMP\vrphoto-home" >> $env:GITHUB_ENV
+          "UV_CACHE_DIR=$env:RUNNER_TEMP\uv-cache" >> $env:GITHUB_ENV
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free / 1GB, 1)}}
+
+      - name: Install add-on "${{ matrix.id }}"
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          vrphoto-cli addons install "${{ matrix.id }}" --no-check-gpu
+
+      - name: Check add-on "${{ matrix.id }}" (import-only, no CUDA)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          vrphoto-cli addons check "${{ matrix.id }}"
+
+      - name: Disk usage
+        if: always()
+        run: |
+          $d = Join-Path $env:VRPHOTO_HOME "addons"
+          if (Test-Path $d) {
+            Get-ChildItem $d -Directory | ForEach-Object {
+              $size = (Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+              "{0,-20} {1,8:N1} GB" -f $_.Name, ($size / 1GB)
+            }
+          }
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: addon-logs-${{ matrix.id }}
+          path: ${{ env.VRPHOTO_HOME }}/logs/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>VR Photo Studio - Gallery</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%234f8cff'/%3E%3Cpath d='M12 24h40v18a6 6 0 0 1-6 6h-8l-6-6-6 6h-8a6 6 0 0 1-6-6z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/viewer.css">
+  <script type="module" src="js/gallery.js"></script>
+</head>
+<body class="gallery-page">
+  <header class="gallery-header">
+    <div class="logo" aria-hidden="true">VR</div>
+    <div>
+      <h1>VR Photo Studio</h1>
+      <div class="sub">Your 3D photos, videos and objects - pick one to view it in VR</div>
+    </div>
+    <div class="spacer"></div>
+    <button id="refresh" class="btn big" type="button" title="Check for new scenes">Refresh</button>
+  </header>
+
+  <main class="gallery-main">
+    <div id="secure-banner" class="banner hidden" role="note">
+      <div class="icon" aria-hidden="true">&#9888;</div>
+      <div>
+        <strong>Browsing works, but VR needs a secure connection.</strong>
+        This page was opened over plain <code>http://</code>. To enter VR on your Quest, open the
+        <b>https://</b> link (or scan the QR code) shown in the VR Photo Studio desktop app and accept the
+        certificate warning once (<i>Advanced &rarr; Proceed</i>). Or connect the Quest with a USB cable,
+        choose <b>USB mode</b> in the desktop app and use <code>http://localhost</code>.
+      </div>
+    </div>
+
+    <div id="loading" class="state" aria-live="polite">
+      <div class="spinner" aria-hidden="true"></div>
+      <p>Loading your scenes&hellip;</p>
+    </div>
+
+    <div id="error" class="state hidden" role="alert">
+      <div class="big-icon" aria-hidden="true">&#128268;</div>
+      <h2>Can't reach VR Photo Studio</h2>
+      <p id="error-text" class="muted">Make sure the app is running on your PC and the VR viewer server is started.</p>
+      <div class="actions">
+        <button id="retry" class="btn primary big" type="button">Try again</button>
+      </div>
+    </div>
+
+    <div id="empty" class="empty hidden">
+      <div class="big-icon" aria-hidden="true">&#128247;</div>
+      <h2>No scenes yet</h2>
+      <p class="muted">Scenes you export from the desktop app show up here automatically.</p>
+      <ol>
+        <li>On your PC, open <b>VR Photo Studio</b> and add a photo (or video).</li>
+        <li>Pick an output such as <b>3D Scene (look behind)</b>, <b>Object / person</b>, <b>VR180</b>
+          or <b>3D photo</b>, and keep <b>&ldquo;Add to VR viewer&rdquo;</b> ticked.</li>
+        <li>Press <b>Start</b>. When it finishes, the scene appears on this page within a few seconds.</li>
+        <li>Tap a scene, then press <b>Enter VR</b> (or <b>Enter AR</b> to see it in your room).</li>
+      </ol>
+    </div>
+
+    <section id="grid" class="grid hidden" aria-label="Scenes"></section>
+
+    <details class="help">
+      <summary>How do I open this on my Quest?</summary>
+      <ol>
+        <li>Put the Quest on the same Wi-Fi network as your PC.</li>
+        <li>In the desktop app, open the <b>VR Viewer</b> page and press <b>Start viewer</b>.</li>
+        <li>On the Quest, open the <b>Browser</b> and type the <b>https://</b> address shown in the app
+          (or scan the QR code with the Quest camera).</li>
+        <li>The first time, the browser warns that the connection is not private. That is expected for a
+          home server: choose <i>Advanced</i> &rarr; <i>Proceed</i>.</li>
+        <li>No Wi-Fi? Connect the Quest with a USB cable, choose <b>USB mode</b> in the app and open
+          <code>http://localhost:8080</code> on the Quest.</li>
+      </ol>
+    </details>
+  </main>
+</body>
+</html>

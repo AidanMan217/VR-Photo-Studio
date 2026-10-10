@@ -14,6 +14,11 @@ Stubs (all opset 17, deterministic):
 * moge2-vitl:  image [1,3,H,W], num_tokens (int64 scalar) -> points [1,H,W,3] (a plane at
                z=2m seen through a 60 deg camera), normal [1,H,W,3], mask [1,H,W],
                metric_scale [1].
+* da3-mono-large: pixel_values [1,3,280,280] (static) -> depth [1,280,280]
+               = 1 / (relu(mean over RGB) + 0.5)  (DEPTH: brighter = nearer = smaller).
+Extra helpers (not in build_all): ``make_da2_fp16`` (float16 I/O variant of the da2 stub),
+``make_nan`` (da2 I/O, outputs NaN - for fallback tests), ``make_da3(..., rank5=True)``,
+``make_slow`` (long MatMul chain, for inference-cancel tests).
 """
 
 from __future__ import annotations
@@ -132,6 +137,93 @@ def make_moge(path: Path, h: int = 256, w: int = 256) -> Path:
     return _save(m, path)
 
 
+def make_da2_fp16(path: Path) -> Path:
+    """da2 stub with float16 input and output (exercises OrtModel dtype casting)."""
+    from onnx import TensorProto, helper
+
+    x = helper.make_tensor_value_info("pixel_values", TensorProto.FLOAT16, [1, 3, "height", "width"])
+    y = helper.make_tensor_value_info("predicted_depth", TensorProto.FLOAT16, [1, "height", "width"])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [1])
+    nodes = [
+        helper.make_node("Cast", ["pixel_values"], ["xf"], to=TensorProto.FLOAT),
+        helper.make_node("ReduceMean", ["xf", "axes"], ["m"], keepdims=0),
+        helper.make_node("Relu", ["m"], ["r"]),
+        helper.make_node("Cast", ["r"], ["predicted_depth"], to=TensorProto.FLOAT16),
+    ]
+    g = helper.make_graph(nodes, "da2_fp16_stub", [x], [y], initializer=[axes])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 18)])
+    m.ir_version = 8
+    return _save(m, path)
+
+
+def make_nan(path: Path) -> Path:
+    """da2 I/O names, but every output value is NaN."""
+    from onnx import TensorProto, helper
+
+    x = helper.make_tensor_value_info("pixel_values", TensorProto.FLOAT, [1, 3, "height", "width"])
+    y = helper.make_tensor_value_info("predicted_depth", TensorProto.FLOAT, [1, "height", "width"])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [1])
+    nan = helper.make_tensor("nan", TensorProto.FLOAT, [], [float("nan")])
+    nodes = [
+        helper.make_node("ReduceMean", ["pixel_values", "axes"], ["m"], keepdims=0),
+        helper.make_node("Mul", ["m", "nan"], ["predicted_depth"]),
+    ]
+    g = helper.make_graph(nodes, "nan_stub", [x], [y], initializer=[axes, nan])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 18)])
+    m.ir_version = 8
+    return _save(m, path)
+
+
+def make_da3(path: Path, h: int = 280, w: int = 280, *, rank5: bool = False, output: str = "depth") -> Path:
+    """DA3-mono stand-in: outputs relative DEPTH = 1 / (relu(mean RGB) + 0.5)."""
+    from onnx import TensorProto, helper
+
+    in_shape = [1, 1, 3, h, w] if rank5 else [1, 3, h, w]
+    x = helper.make_tensor_value_info("pixel_values", TensorProto.FLOAT, in_shape)
+    y = helper.make_tensor_value_info(output, TensorProto.FLOAT, [1, h, w])
+    axes = helper.make_tensor("axes", TensorProto.INT64, [1], [2 if rank5 else 1])
+    half = helper.make_tensor("half", TensorProto.FLOAT, [], [0.5])
+    one = helper.make_tensor("one", TensorProto.FLOAT, [], [1.0])
+    nodes = [helper.make_node("ReduceMean", ["pixel_values", "axes"], ["m"], keepdims=0)]
+    src = "m"
+    if rank5:
+        sq = helper.make_tensor("sq_axes", TensorProto.INT64, [1], [1])
+        nodes.append(helper.make_node("Squeeze", ["m", "sq_axes"], ["m2"]))
+        src = "m2"
+    nodes += [
+        helper.make_node("Relu", [src], ["r"]),
+        helper.make_node("Add", ["r", "half"], ["d"]),
+        helper.make_node("Div", ["one", "d"], [output]),
+    ]
+    inits = [axes, half, one] + ([sq] if rank5 else [])
+    g = helper.make_graph(nodes, "da3_stub", [x], [y], initializer=inits)
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 18)])
+    m.ir_version = 8
+    return _save(m, path)
+
+
+def make_slow(path: Path, n_nodes: int = 2000, size: int = 384) -> Path:
+    """da2-style I/O names, but a long chain of MatMul nodes (~0.7 s on CPU) for cancel tests.
+
+    ``pixel_values`` [1, size, size] -> ``predicted_depth`` [1, size, size] (identity
+    weights, so the output equals the input).
+    """
+    from onnx import TensorProto, helper, numpy_helper
+
+    x = helper.make_tensor_value_info("pixel_values", TensorProto.FLOAT, [1, size, size])
+    y = helper.make_tensor_value_info("predicted_depth", TensorProto.FLOAT, [1, size, size])
+    w = numpy_helper.from_array(np.eye(size, dtype=np.float32), "w")
+    nodes, src = [], "pixel_values"
+    for i in range(n_nodes):
+        out = "predicted_depth" if i == n_nodes - 1 else f"t{i}"
+        nodes.append(helper.make_node("MatMul", [src, "w"], [out]))
+        src = out
+    g = helper.make_graph(nodes, "slow_stub", [x], [y], initializer=[w])
+    m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+    m.ir_version = 8
+    return _save(m, path)
+
+
 def build_all(out_dir: str | Path) -> dict[str, Path]:
     out = Path(out_dir)
     return {
@@ -139,6 +231,7 @@ def build_all(out_dir: str | Path) -> dict[str, Path]:
         "lama": make_lama(out / "lama.onnx"),
         "birefnet-lite": make_birefnet(out / "birefnet-lite.onnx"),
         "moge2-vitl": make_moge(out / "moge2-vitl.onnx"),
+        "da3-mono-large": make_da3(out / "da3-mono-large.onnx"),
     }
 
 

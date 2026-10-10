@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "AidanMan217" }]
 dependencies = [
     "numpy>=1.26",
-    "opencv-python-headless>=4.9",
+    "opencv-python-headless>=5.0,<6",
     "pillow>=10.0",
     "pillow-heif>=0.18",
     "onnxruntime-directml==1.24.4; sys_platform == 'win32'",
@@ -21,11 +21,11 @@ dependencies = [
     "cryptography>=42",
     "qrcode>=7.4",
     "PySide6==6.11.2",
-    "uv>=0.5",
+    "uv>=0.8",
+    "fast-simplification>=0.1.7",
 ]
 
 [project.optional-dependencies]
-mesh = ["fast-simplification>=0.1.7"]
 dev = [
     "pytest>=8",
     "pytest-qt>=4.4",
@@ -51,6 +51,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 vrphoto = [
     "webxr/viewer/**/*",
+    "models/*.json",
     "addons/manifests/*.toml",
     "addons/workers/*.py",
     "third_party/**/*",

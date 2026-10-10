@@ -721,7 +721,9 @@ def test_cancel_takes_effect_while_connection_stalls(fake_registry, server):
         ensure_model("t-hf", cancel=tok)
     assert time.monotonic() - t0 < 5.0  # not the 30 s socket timeout
     part = model_dir("t-hf") / "onnx" / "model.onnx.part"
-    assert part.exists() and part.stat().st_size == 200_000  # kept for resuming
+    # kept for resuming; on Windows the socket is closed hard, so bytes still in the
+    # receive buffer may be dropped - any prefix is fine because resume uses the file size
+    assert part.exists() and 0 < part.stat().st_size <= 200_000
     server.routes[path] = Behaviour()
     assert ensure_model("t-hf").read_bytes() == PAYLOAD
 

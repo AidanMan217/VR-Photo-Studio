@@ -1,0 +1,1 @@
+"""vrphoto.inpaint package."""

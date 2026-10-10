@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "vrphoto.scene/1",
+  "title": "VR Photo Studio scene manifest",
+  "type": "object",
+  "required": ["schema", "id", "title", "mode"],
+  "properties": {
+    "schema": { "const": "vrphoto.scene/1" },
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,80}$" },
+    "title": { "type": "string", "maxLength": 200 },
+    "created": { "type": "string" },
+    "thumbnail": { "type": "string" },
+    "mode": { "enum": ["photo3d", "stereo", "sphere", "object", "splat"] },
+    "units": { "const": "m" },
+    "source": { "type": "string" },
+    "photo3d": {
+      "type": "object",
+      "required": ["meshes"],
+      "properties": {
+        "meshes": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "anchor_distance_m": { "type": "number", "exclusiveMinimum": 0 },
+        "eye_height_m": { "type": "number" }
+      }
+    },
+    "stereo": {
+      "type": "object",
+      "required": ["media", "kind", "layout"],
+      "properties": {
+        "media": { "type": "string" },
+        "kind": { "enum": ["image", "video"] },
+        "layout": { "enum": ["sbs", "tb", "mono"] },
+        "aspect": { "type": "number", "exclusiveMinimum": 0 },
+        "screen_width_m": { "type": "number", "exclusiveMinimum": 0 },
+        "distance_m": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "sphere": {
+      "type": "object",
+      "required": ["media", "kind", "coverage", "layout"],
+      "properties": {
+        "media": { "type": "string" },
+        "kind": { "enum": ["image", "video"] },
+        "coverage": { "enum": [180, 360] },
+        "layout": { "enum": ["mono", "sbs", "tb"] },
+        "depth": { "type": ["string", "null"] },
+        "radius_m": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "object": {
+      "type": "object",
+      "required": ["asset", "format"],
+      "properties": {
+        "asset": { "type": "string" },
+        "format": { "enum": ["glb", "ply", "splat", "spz"] },
+        "height_m": { "type": "number", "exclusiveMinimum": 0 },
+        "pivot": { "enum": ["base", "center"] },
+        "placement": { "enum": ["hit-test", "front-floor"] },
+        "distance_m": { "type": "number", "exclusiveMinimum": 0 },
+        "alt_assets": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "splat": {
+      "type": "object",
+      "required": ["asset", "format"],
+      "properties": {
+        "asset": { "type": "string" },
+        "format": { "enum": ["ply", "splat", "spz"] },
+        "up": { "enum": ["y", "-y", "z"] },
+        "scale": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "env": {
+      "type": "object",
+      "properties": {
+        "prefer": { "enum": ["ar", "vr"] },
+        "background": { "type": "string" }
+      }
+    },
+    "notices": { "type": "array", "items": { "type": "string" } }
+  },
+  "allOf": [
+    { "if": { "properties": { "mode": { "const": "photo3d" } } }, "then": { "required": ["photo3d"] } },
+    { "if": { "properties": { "mode": { "const": "stereo" } } }, "then": { "required": ["stereo"] } },
+    { "if": { "properties": { "mode": { "const": "sphere" } } }, "then": { "required": ["sphere"] } },
+    { "if": { "properties": { "mode": { "const": "object" } } }, "then": { "required": ["object"] } },
+    { "if": { "properties": { "mode": { "const": "splat" } } }, "then": { "required": ["splat"] } }
+  ]
+}

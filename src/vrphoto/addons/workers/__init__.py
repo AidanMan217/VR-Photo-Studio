@@ -1,0 +1,1 @@
+"""vrphoto.addons.workers package."""

@@ -1,0 +1,1 @@
+"""vrphoto.pipeline package."""

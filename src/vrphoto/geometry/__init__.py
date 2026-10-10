@@ -1,0 +1,1 @@
+"""vrphoto.geometry package."""

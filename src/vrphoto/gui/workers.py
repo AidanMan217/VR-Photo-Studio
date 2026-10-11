@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QObject, QThreadPool, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThreadPool, Signal, Slot
 
 from ..core.errors import Cancelled
 from ..core.log import get_logger
@@ -39,6 +39,24 @@ PROGRESS_INTERVAL_S = 0.04
 #: detached (see :meth:`TaskRunner.shutdown`) instead of freezing the window.
 DIALOG_CLOSE_WAIT_MS = 300
 _ORPHAN_POOLS: set[QThreadPool] = set()
+
+
+def _keep_signals_alive(w: Worker) -> None:
+    """Re-home a still-running worker's signals object before its runner goes away.
+
+    The runner (its Qt parent) may be deleted with its dialog while the task keeps
+    running; deleting the signals object then would crash the worker thread on its next
+    emit.  Parent it to the application object instead and let it delete itself (on the
+    UI thread) when the worker emits ``finished``.
+    """
+    app = QCoreApplication.instance()
+    if app is None:
+        return
+    try:
+        w.signals.setParent(app)
+        w.signals.finished.connect(w.signals.deleteLater, Qt.ConnectionType.QueuedConnection)
+    except RuntimeError:  # already deleted
+        pass
 
 
 def _prune_orphans() -> None:
@@ -63,6 +81,13 @@ class Worker:
 
     A plain Python object whose :meth:`run` is handed to ``QThreadPool.start`` as a
     callable, so Qt never holds a pointer to an object Python may garbage-collect.
+
+    Its :class:`_Signals` QObject is created on the UI thread with a Qt *parent* (the
+    :class:`TaskRunner`), so its C++ lifetime is owned by Qt, not by Python: whichever
+    thread drops the last Python reference to the Worker (often the pool thread, right
+    after :meth:`run` returns) never deletes a QObject that belongs to the UI thread or
+    that another thread may still be emitting from.  The runner deletes it on the UI
+    thread (``deleteLater``) once the ``finished`` signal has been delivered.
     """
 
     def __init__(
@@ -74,6 +99,7 @@ class Worker:
         pass_progress: bool = True,
         pass_cancel: bool = True,
         name: str = "",
+        parent: QObject | None = None,
     ) -> None:
         self.id = next(_ids)
         self.name = name or getattr(fn, "__name__", "task")
@@ -83,7 +109,7 @@ class Worker:
         self.pass_progress = pass_progress
         self.pass_cancel = pass_cancel
         self.cancel_token = CancelToken()
-        self.signals = _Signals()
+        self.signals = _Signals(parent)
         self.started = threading.Event()
         self.done = threading.Event()
         self.callbacks: dict[str, Callable[..., Any] | None] = {}
@@ -166,7 +192,9 @@ class TaskRunner(QObject):
     ) -> Worker:
         """Run ``fn(*args, **kwargs)`` in the pool; returns the :class:`Worker` handle."""
         _prune_orphans()
-        w = Worker(fn, args, kwargs, pass_progress=pass_progress, pass_cancel=pass_cancel, name=name)
+        w = Worker(
+            fn, args, kwargs, pass_progress=pass_progress, pass_cancel=pass_cancel, name=name, parent=self
+        )
         w.callbacks = {
             "result": on_result,
             "error": on_error,
@@ -216,6 +244,8 @@ class TaskRunner(QObject):
         finished = self.wait(msecs)
         for w in list(self._workers.values()):
             w.callbacks = {}
+            if not w.done.is_set():
+                _keep_signals_alive(w)
         if not finished:
             # harmless (the detached pool ends on its own) - not worth a line in the Log panel
             log.debug("Background task(s) still stopping: %s", ", ".join(w.name for w in self.active()))
@@ -257,4 +287,8 @@ class TaskRunner(QObject):
     @Slot(int)
     def _on_finished(self, wid: int) -> None:
         self._call(wid, "finished")
-        self._workers.pop(wid, None)
+        w = self._workers.pop(wid, None)
+        if w is not None:
+            # "finished" is the worker's last emit: delete its signals object here, on the
+            # UI thread that owns it (never from the pool thread or the garbage collector)
+            w.signals.deleteLater()

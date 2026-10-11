@@ -256,3 +256,24 @@ def test_trellis2_birefnet_dependencies_and_pin():
     rembg = [s for s in m.steps if s["type"] == "hf_download" and s.get("local_dir") == "MODELS/RMBG-2.0"]
     assert len(rembg) == 1 and rembg[0]["repo"] == "ZhengPeng7/BiRefNet"
     assert re.fullmatch(r"[0-9a-f]{40}", rembg[0]["revision"])
+
+
+@pytest.mark.parametrize("path", BUNDLED, ids=lambda p: p.stem)
+def test_torch_manifests_pin_setuptools(path: Path):
+    """torch.utils.cpp_extension (imported by nvdiffrast and other prebuilt CUDA extension
+    wheels) imports setuptools, which uv venvs do not include: the TRELLIS install check
+    failed with "No module named 'setuptools'"."""
+    m = load_manifest(path)
+    pip_steps = [s for s in m.steps if s["type"] == "pip"]
+    if not any(p.startswith("torch==") for s in pip_steps for p in s["packages"]):
+        return
+    pins = [p for s in pip_steps if not s.get("optional") and not s.get("platforms") for p in s["packages"]
+            if p.startswith("setuptools")]
+    assert pins, f"{m.id}: pins torch but not setuptools"
+    assert all(re.fullmatch(r"setuptools==\d+(\.\d+)+", p) for p in pins), pins
+
+
+def test_all_torch_addons_are_covered_by_the_setuptools_rule():
+    torch_ids = {m.id for m in map(load_manifest, BUNDLED)
+                 if any(p.startswith("torch==") for s in m.steps if s["type"] == "pip" for p in s["packages"])}
+    assert torch_ids == {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360"}

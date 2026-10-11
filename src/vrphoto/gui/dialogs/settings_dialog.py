@@ -339,10 +339,25 @@ class SettingsDialog(QDialog):
                 set_settings(self.settings)
         except Exception:  # pragma: no cover - defensive
             log.debug("set_settings failed", exc_info=True)
+        if "device" in changed:
+            self._reset_models_for_new_device()
         log.info("Settings saved%s", f" ({', '.join(sorted(changed))} changed)" if changed else "")
         self.saved.emit(changed)
         self.accept()
         return True
+
+    @staticmethod
+    def _reset_models_for_new_device() -> None:
+        """Another GPU (or the CPU) was chosen: forget the sticky CPU fallbacks and drop
+        every cached ONNX session, so models are loaded again on the new device.  Never
+        blocks on a running inference (those models are closed when it finishes)."""
+        try:
+            from ...models import ort
+
+            ort.reset_cpu_fallbacks()
+            ort.unload_model(wait=False)
+        except Exception:
+            log.warning("Could not reset the loaded AI models after the device change", exc_info=True)
 
     def done(self, result: int) -> None:  # noqa: D401 - QDialog API
         self.tasks.shutdown(DIALOG_CLOSE_WAIT_MS)

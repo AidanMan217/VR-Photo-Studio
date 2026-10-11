@@ -38,12 +38,24 @@ def test_dxgi_struct_layout_matches_windows_x64():
     assert DXGI_ADAPTER_DESC1.Flags.offset == 304
 
 
-def _desc(name: str, vendor: int, vram_mb: int, flags: int = 0) -> DXGI_ADAPTER_DESC1:
+def _desc(
+    name: str,
+    vendor: int,
+    vram_mb: int,
+    flags: int = 0,
+    *,
+    luid: tuple[int, int] = (0, 0),
+    device_id: int = 0,
+    subsys: int = 0,
+) -> DXGI_ADAPTER_DESC1:
     d = DXGI_ADAPTER_DESC1()
     raw = name.encode("utf-16-le")
     ctypes.memmove(d.Description, raw, len(raw))
     d.VendorId = vendor
+    d.DeviceId = device_id
+    d.SubSysId = subsys
     d.DedicatedVideoMemory = vram_mb * 1024 * 1024
+    d.AdapterLuid.HighPart, d.AdapterLuid.LowPart = luid
     d.Flags = flags
     return d
 
@@ -51,9 +63,13 @@ def _desc(name: str, vendor: int, vram_mb: int, flags: int = 0) -> DXGI_ADAPTER_
 class FakeDxgi:
     def __init__(self, descs):
         self.descs = descs
+        self.closed = False
 
     def desc(self, i):
         return self.descs[i] if i < len(self.descs) else None
+
+    def close(self):
+        self.closed = True
 
 
 def test_dxgi_enumeration_skips_software_and_keeps_dxgi_index():
@@ -202,3 +218,143 @@ def test_run_quiet_uses_no_window_and_no_shell(monkeypatch):
     cmd, kw = calls[0]
     assert kw.get("shell", False) is False and kw["creationflags"] & 0x08000000
     assert kw["encoding"] == "utf-8" and kw["errors"] == "replace"
+
+
+# --------------------------------------------------------------------------- duplicate adapters (v0.1.1)
+GTX1080 = "NVIDIA GeForce GTX 1080"
+
+
+def _gtx1080(luid, **kw):
+    return _desc(GTX1080, 0x10DE, 8192, luid=luid, device_id=0x1B80, subsys=0x33011462, **kw)
+
+
+def _no_smi():
+    raise AssertionError("nvidia-smi must not be queried")
+
+
+def test_same_luid_listed_twice_is_one_gpu_with_its_first_dxgi_index():
+    api = FakeDxgi(
+        [
+            _desc("Intel(R) UHD Graphics 630", 0x8086, 128, luid=(0, 0x1111)),
+            _desc("Microsoft Basic Render Driver", 0x1414, 0, flags=gpu.DXGI_ADAPTER_FLAG_SOFTWARE),
+            _gtx1080((0, 0xC0DE)),
+            _gtx1080((0, 0xC0DE)),
+        ]
+    )
+    devs = gpu._dxgi_devices(api, nvsmi=_no_smi)
+    assert devs == [
+        Device(0, "Intel(R) UHD Graphics 630", 128, "intel"),
+        Device(2, GTX1080, 8192, "nvidia", aliases=(3,)),  # index 2 = DirectML device_id
+    ]
+    assert devs[1].label == "NVIDIA GeForce GTX 1080 (8 GB)"  # one GPU: no "GPU n:" prefix
+
+
+def test_negative_luid_high_part_is_compared_correctly():
+    devs = gpu._dxgi_devices(FakeDxgi([_gtx1080((-1, 5)), _gtx1080((-1, 5))]), nvsmi=_no_smi)
+    assert [(d.index, d.aliases) for d in devs] == [(0, (1,))]
+
+
+def test_phantom_nvidia_entry_dropped_when_nvidia_smi_reports_fewer_gpus():
+    """The user's PC: one GTX 1080, listed twice by DXGI with different LUIDs."""
+    calls = []
+    api = FakeDxgi([_gtx1080((0, 0xA)), _gtx1080((0, 0xB))])
+    devs = gpu._dxgi_devices(api, nvsmi=lambda: calls.append(1) or [8192])
+    assert devs == [Device(0, GTX1080, 8192, "nvidia", aliases=(1,))]
+    assert calls == [1]
+
+
+def test_two_identical_real_gpus_are_both_kept_with_unique_labels():
+    api = FakeDxgi([_gtx1080((0, 0xA)), _gtx1080((0, 0xB))])
+    devs = gpu._dxgi_devices(api, nvsmi=lambda: [8192, 8192])
+    assert [d.index for d in devs] == [0, 1]
+    assert [d.label for d in devs] == [
+        "GPU 0: NVIDIA GeForce GTX 1080 (8 GB)",
+        "GPU 1: NVIDIA GeForce GTX 1080 (8 GB)",
+    ]
+    # nvidia-smi unavailable: nothing can be proven, so both stay (and stay distinguishable)
+    devs = gpu._dxgi_devices(FakeDxgi([_gtx1080((0, 0xA)), _gtx1080((0, 0xB))]), nvsmi=list)
+    assert [d.label.split(":")[0] for d in devs] == ["GPU 0", "GPU 1"]
+
+
+def test_phantom_dropped_next_to_a_different_nvidia_gpu():
+    api = FakeDxgi(
+        [
+            _desc("NVIDIA GeForce RTX 4090", 0x10DE, 24564, luid=(0, 1), device_id=0x2684, subsys=1),
+            _gtx1080((0, 2)),
+            _gtx1080((0, 3)),
+            _gtx1080((0, 4)),
+        ]
+    )
+    devs = gpu._dxgi_devices(api, nvsmi=lambda: [24564, 8192, 8192])  # 3 real GPUs, 4 entries
+    assert [(d.index, d.aliases) for d in devs] == [(0, ()), (1, (3,)), (2, ())]  # first ones kept
+    assert [d.label for d in devs][1:] == [
+        "GPU 1: NVIDIA GeForce GTX 1080 (8 GB)",
+        "GPU 2: NVIDIA GeForce GTX 1080 (8 GB)",
+    ]
+    assert devs[0].label == "NVIDIA GeForce RTX 4090 (24 GB)"
+
+
+def test_nvidia_smi_not_queried_without_duplicate_hardware_ids():
+    api = FakeDxgi(
+        [
+            _desc("NVIDIA GeForce RTX 3060", 0x10DE, 12288, luid=(0, 1), device_id=0x2504),
+            _desc("NVIDIA GeForce RTX 4070", 0x10DE, 12282, luid=(0, 2), device_id=0x2786),
+        ]
+    )
+    assert [d.index for d in gpu._dxgi_devices(api, nvsmi=_no_smi)] == [0, 1]
+
+
+def test_adapter_details_logged_at_debug(caplog):
+    api = FakeDxgi([_gtx1080((0, 0xC0DE)), _gtx1080((0, 0xC0DE))])
+    with caplog.at_level("DEBUG", logger="vrphoto.models.gpu"):
+        gpu._dxgi_devices(api, nvsmi=_no_smi)
+    debug = [r.getMessage() for r in caplog.records if r.levelname == "DEBUG"]
+    assert len(debug) == 2
+    msg = debug[1]
+    for part in ("adapter 1", "LUID=00000000:0000C0DE", "VendorId=0x10DE", "DeviceId=0x1B80"):
+        assert part in msg
+    assert "SubSysId=0x33011462" in msg and "Flags=0x0" in msg
+    assert any("same LUID" in r.getMessage() for r in caplog.records if r.levelname == "INFO")
+
+
+def test_repeated_wmi_names_get_unique_labels():
+    item = {"Name": GTX1080, "AdapterRAM": 4293918720, "PNPDeviceID": "PCI\\VEN_10DE&DEV_1B80"}
+    devs = gpu.parse_cim_json(json.dumps([item, item]))
+    assert [d.label for d in devs] == ["GPU 0: NVIDIA GeForce GTX 1080", "GPU 1: NVIDIA GeForce GTX 1080"]
+
+
+def test_canonical_index_maps_hidden_duplicates(monkeypatch):
+    devs = [Device(0, "Intel UHD", 128, "intel"), Device(2, GTX1080, 8192, "nvidia", aliases=(1, 3))]
+    monkeypatch.setattr(gpu, "list_devices", lambda **k: devs)
+    assert gpu.canonical_index(2) == 2
+    assert gpu.canonical_index(1) == 2 and gpu.canonical_index(3) == 2
+    assert gpu.canonical_index(0) == 0 and gpu.canonical_index(7) == 7
+
+
+def test_canonical_index_logs_a_hidden_duplicate_once(monkeypatch, caplog):
+    """It runs on every model load: the mapping is logged once, not on every call."""
+    devs = [Device(0, GTX1080, 8192, "nvidia", aliases=(1,))]
+    monkeypatch.setattr(gpu, "list_devices", lambda **k: devs)
+    monkeypatch.setattr(gpu, "_alias_logged", set())
+    with caplog.at_level("INFO", logger="vrphoto.models.gpu"):
+        assert [gpu.canonical_index(1) for _ in range(3)] == [0, 0, 0]
+    assert sum("duplicate entry" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_list_devices_dedupes_and_runs_nvidia_smi_once(monkeypatch):
+    """Windows path end to end (fake DXGI): one GTX 1080 listed twice -> one device."""
+    smi_calls = []
+    api = FakeDxgi(
+        [
+            _desc(GTX1080, 0x10DE, 0, luid=(0, 0xA), device_id=0x1B80),
+            _desc(GTX1080, 0x10DE, 0, luid=(0, 0xB), device_id=0x1B80),
+        ]
+    )
+    monkeypatch.setattr(gpu.sys, "platform", "win32")
+    monkeypatch.setattr(gpu, "_DxgiApi", lambda: api)
+    monkeypatch.setattr(gpu, "nvidia_vram_list", lambda: smi_calls.append(1) or [8192])
+    monkeypatch.setattr(gpu, "_cached", None)
+    devs = gpu.list_devices(refresh=True)
+    assert devs == [Device(0, GTX1080, 8192, "nvidia", aliases=(1,))]  # VRAM from nvidia-smi
+    assert smi_calls == [1] and api.closed
+    assert gpu.device_choices()[2:] == [("0", "NVIDIA GeForce GTX 1080 (8 GB)")]

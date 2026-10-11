@@ -27,7 +27,13 @@ Fixes from the first test on a real PC (Windows 11, GeForce GTX 1080 8 GB).
 ### Added
 
 - PyTorch add-ons check at install time that the installed PyTorch build supports your graphics
-  card and say so clearly if it doesn't.
+  card and say so clearly if it doesn't (SHARP falls back to the CPU instead).
+
+### Notes
+
+- Installed TRELLIS, TRELLIS.2, SHARP and SDXL 360 add-ons re-run from their dependency step the
+  next time you click *Install* (one package was added); downloaded models are kept.
+- When two graphics cards have the same name, the device list now shows "GPU 0: …", "GPU 1: …".
 
 ## [0.1.0] - 2026-10-11
 

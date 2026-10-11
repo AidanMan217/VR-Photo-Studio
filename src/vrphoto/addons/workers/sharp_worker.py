@@ -19,7 +19,19 @@ import os
 import sys
 from pathlib import Path
 
-from _common import Progress, WorkerError, addon_dir, cuda_info, free_cuda, param, require_input, run
+from _common import (
+    Progress,
+    WorkerError,
+    addon_dir,
+    cuda_info,
+    free_cuda,
+    gpu_arch_problem,
+    log,
+    param,
+    require_input,
+    require_supported_gpu,
+    run,
+)
 
 VERSION = "1.0"
 INTERNAL_SHAPE = (1536, 1536)
@@ -37,10 +49,18 @@ def _device(choice: str) -> str:
     import torch
 
     if choice in ("cuda", "cpu"):
-        if choice == "cuda" and not torch.cuda.is_available():
-            raise WorkerError("CUDA was requested but no NVIDIA GPU is available.")
+        if choice == "cuda":
+            if not torch.cuda.is_available():
+                raise WorkerError("CUDA was requested but no NVIDIA GPU is available.")
+            require_supported_gpu()
         return choice
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    if not torch.cuda.is_available():
+        return "cpu"
+    problem = gpu_arch_problem()
+    if problem is not None:  # the PyTorch build has no kernels for this GPU: CPU still works
+        log(f"{problem[0]} Running SHARP on the CPU instead (slower).", "warning")
+        return "cpu"
+    return "cuda"
 
 
 def _predict(predictor, image, f_px: float, device: str):
@@ -107,6 +127,9 @@ def check(require_gpu: bool) -> dict:
     # an install failure - the info just reports cuda = False
     info = cuda_info(require=False)
     info["gpu_required"] = require_gpu
+    if info.get("gpu_supported") is False:  # unsupported GPU architecture: jobs use the CPU
+        info["warnings"] = [f"{info.get('gpu_problem')} SHARP will run on the CPU (slower)."]
+        log(info["warnings"][0], "warning")
     for mod in ("sharp.models", "sharp.utils.gaussians", "sharp.utils.io", "timm", "plyfile"):
         try:
             importlib.import_module(mod)

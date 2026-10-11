@@ -97,6 +97,15 @@ CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
 ShowLanguageDialog=no
+; Inno Setup 6.7+ enables Windows' RedirectionGuard by default.  It is suspected of carrying over
+; to the app started from the finish page ("Launch VR Photo Studio"), where uv then refused its own
+; Python folder junction (os error 448, "untrusted mount point") and add-on installs failed.
+; Inno's help says it only affects Setup's own process, so this is a precaution; the add-on
+; installer also avoids that junction.  Older compilers do not know the directive, hence the
+; version check.
+#if VER >= EncodeVer(6, 7, 0)
+RedirectionGuard=no
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

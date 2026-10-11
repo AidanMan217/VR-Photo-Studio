@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
+import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,6 +19,16 @@ from vrphoto.core.types import CancelToken
 from vrphoto.models import ort
 from vrphoto.models.gpu import Device
 from vrphoto.models.ort import CPU, CUDA, DML, OrtModel, load_model, parse_device, select_providers
+
+
+class _NodeArg:
+    """Like onnxruntime's ``NodeArg``: it keeps the session that returned it alive (pybind11
+    ``reference_internal``), so holding one prevents the session (and its GPU memory) from
+    being freed."""
+
+    def __init__(self, session, arg):
+        self._session = session
+        self.name, self.shape, self.type = arg.name, arg.shape, arg.type
 
 
 class FakeOrt:
@@ -32,8 +45,14 @@ class FakeOrt:
         internal_fallback=False,
         hang_run=False,
         run_error="DXGI_ERROR_DEVICE_REMOVED",
+        run_hook=None,
+        create_hook=None,
     ):
         self.available = list(available)
+        self.run_hook = run_hook  # (provider, file name) -> None, may raise
+        self.create_hook = create_hook  # (provider, file name) -> None, may raise
+        self.runs: list[tuple[str, str]] = []  # (provider, file name) per session.run
+        self.freed: list[tuple[str, str]] = []  # (provider, file name) of garbage-collected sessions
         self.hang_run = hang_run
         self.run_error = run_error
         self.fail_create = set(fail_create)
@@ -56,23 +75,30 @@ class FakeOrt:
                 outer.calls.append(("create", prov, dict(provider_options[0]), sess_options))
                 if prov in outer.fail_create:
                     raise RuntimeError(f"{prov}: D3D12CreateDevice failed")
+                self._name = Path(path).name
+                if outer.create_hook is not None:
+                    outer.create_hook(prov, self._name)
                 self._p = [CPU] if outer.internal_fallback else list(providers)
                 self._real = real_ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+                weakref.finalize(self, outer.freed.append, (self._p[0], self._name))
 
             def get_providers(self):
                 return self._p
 
             def get_inputs(self):
-                return self._real.get_inputs()
+                return [_NodeArg(self, a) for a in self._real.get_inputs()]
 
             def get_outputs(self):
-                return self._real.get_outputs()
+                return [_NodeArg(self, a) for a in self._real.get_outputs()]
 
             def disable_fallback(self):
                 outer.calls.append(("disable_fallback",))
 
             def run(self, names, feeds, run_options=None):
                 outer.calls.append(("run", self._p[0]))
+                outer.runs.append((self._p[0], self._name))
+                if outer.run_hook is not None:
+                    outer.run_hook(self._p[0], self._name)
                 if outer.hang_run:  # a long inference: only RunOptions.terminate stops it
                     while not (run_options is not None and run_options.terminate):
                         time.sleep(0.01)
@@ -552,3 +578,316 @@ def test_gpu_failure_of_fp16_model_switches_to_fp32_file_on_cpu(monkeypatch, fak
     out = m.run({"pixel_values": _x()})
     assert m.provider == CPU and not m.fp16 and m.path == stub_models["da2-small"]
     assert out["predicted_depth"].dtype == np.float32 and not m.has_fp16_io
+
+
+# --------------------------------------------------------------------------- out of GPU memory (v0.1.1)
+OOM = "[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : bad allocation"
+
+
+def _oom_on(fail: dict[tuple[str, str], int]):
+    """run/create hook: raise an out-of-memory error ``fail[(provider, file)]`` times."""
+
+    def hook(prov, name):
+        left = fail.get((prov, name), 0)
+        if left:
+            fail[(prov, name)] = left - 1
+            raise RuntimeError(OOM)
+
+    return hook
+
+
+def _moge_feeds():
+    return {"image": np.zeros((1, 3, 256, 256), np.float32), "num_tokens": np.array(1800)}
+
+
+@pytest.fixture
+def stub_env(monkeypatch, stub_models):
+    from vrphoto.models.registry import env_var_for
+
+    for mid in ("da2-small", "moge2-vitl", "birefnet-lite"):
+        monkeypatch.setenv(env_var_for(mid), str(stub_models[mid]))
+    return stub_models
+
+
+def test_gpu_oom_releases_other_models_and_retries_on_the_gpu(fake, stub_env, no_adapters):
+    """A GPU out-of-memory error frees the other cached sessions and retries on the GPU:
+    no slow CPU run and nothing sticky; the released model reloads transparently."""
+    fail = {(DML, "da2-small.onnx"): 1}
+    f = fake(run_hook=_oom_on(fail))
+    other = load_model("moge2-vitl")
+    m = load_model("da2-small")
+    assert other.provider == DML and m.provider == DML
+    x = _x()
+    out = m.run({"pixel_values": x})
+    np.testing.assert_allclose(out["predicted_depth"][0], np.maximum(x[0].mean(0), 0), rtol=1e-5, atol=1e-6)
+    assert m.provider == DML and not ort._is_cpu_sticky(m.path)
+    assert [r for r in f.runs if r[1] == "da2-small.onnx"] == [(DML, "da2-small.onnx")] * 2
+    # the other model's GPU session was really dropped, but the object stays cached and usable
+    assert (DML, "moge2-vitl.onnx") in f.freed
+    assert other.released and not other.closed
+    assert ("moge2-vitl", f"auto|{get_settings().device}", DML) in ort.cached_models()
+    assert load_model("moge2-vitl") is other
+    creates = len(f.creates())
+    assert other.run(_moge_feeds())["points"].shape == (1, 256, 256, 3)
+    assert f.creates()[creates:] == [DML]  # re-created on the GPU on next use
+    assert not other.released and other.provider == DML
+
+
+def test_gpu_oom_twice_runs_only_this_call_on_the_cpu(fake, stub_env, no_adapters):
+    fail = {(DML, "da2-small.onnx"): 99}
+    f = fake(run_hook=_oom_on(fail))
+    load_model("moge2-vitl")
+    m = load_model("da2-small")
+    x = _x()
+    out = m.run({"pixel_values": x})
+    np.testing.assert_allclose(out["predicted_depth"][0], np.maximum(x[0].mean(0), 0), rtol=1e-5, atol=1e-6)
+    da2 = [r[0] for r in f.runs if r[1] == "da2-small.onnx"]
+    assert da2 == [DML, DML, CPU]  # GPU, GPU after freeing the other model, then CPU
+    # not sticky: the model keeps its GPU session and the next call tries the GPU first
+    assert m.provider == DML and not m.released and not ort._is_cpu_sticky(m.path)
+    m.run({"pixel_values": x})
+    da2 = [r[0] for r in f.runs if r[1] == "da2-small.onnx"]
+    assert da2 == [DML, DML, CPU, DML, CPU]  # nothing left to free: no pointless GPU retry
+    assert OrtModel(stub_env["da2-small"]).provider == DML
+    fail.clear()  # memory available again -> back on the GPU
+    m.run({"pixel_values": x})
+    assert [r[0] for r in f.runs if r[1] == "da2-small.onnx"][-1] == DML
+
+
+def test_gpu_oom_on_the_cpu_retry_raises_a_memory_hint(fake, stub_env, no_adapters):
+    fake(run_hook=_oom_on({(DML, "da2-small.onnx"): 99, (CPU, "da2-small.onnx"): 99}))
+    m = load_model("da2-small")
+    with pytest.raises(InferenceError, match="GPU and on the CPU") as ei:
+        m.run({"pixel_values": _x()})
+    assert "memory" in (ei.value.hint or "").lower()
+    assert m.provider == DML and not ort._is_cpu_sticky(m.path)
+
+
+def test_gpu_oom_of_fp16_model_uses_the_fp32_file_on_the_cpu_once(fake, stub_models, no_adapters):
+    f = fake(run_hook=_oom_on({(DML, "da2-fp16.onnx"): 99}))
+    m = OrtModel(stub_models["da2-fp16"], fp16=True, fallback_path=lambda: stub_models["da2-small"])
+    out = m.run({"pixel_values": _x()})
+    assert out["predicted_depth"].dtype == np.float32
+    assert f.runs[-1] == (CPU, "da2-small.onnx")
+    # the model itself is unchanged: still the fp16 file on the GPU
+    assert m.provider == DML and m.fp16 and m.path == stub_models["da2-fp16"]
+
+
+def test_non_oom_failure_after_oom_retry_is_sticky(fake, stub_env, no_adapters):
+    calls = {"n": 0}
+
+    def hook(prov, name):
+        if prov == DML and name == "da2-small.onnx":
+            calls["n"] += 1
+            raise RuntimeError(OOM if calls["n"] == 1 else "DXGI_ERROR_DEVICE_REMOVED")
+
+    fake(run_hook=hook)
+    load_model("moge2-vitl")
+    m = load_model("da2-small")
+    m.run({"pixel_values": _x()})
+    assert m.provider == CPU and ort._is_cpu_sticky(m.path)
+
+
+def test_gpu_oom_while_loading_releases_others_and_is_not_sticky(fake, stub_env, no_adapters):
+    fail = {(DML, "birefnet-lite.onnx"): 1}
+    f = fake(create_hook=_oom_on(fail))
+    other = load_model("moge2-vitl")
+    m = load_model("birefnet-lite")
+    assert m.provider == DML and other.released
+    assert f.creates() == [DML, DML, DML]  # moge, birefnet (out of memory), birefnet again
+    # nothing left to free: this session falls back to the CPU, but only for the next run
+    ort.unload_model()
+    fail[(DML, "birefnet-lite.onnx")] = 1
+    m2 = load_model("birefnet-lite")
+    assert m2.provider == CPU and not ort._is_cpu_sticky(m2.path)
+    feeds = {"input_image": np.zeros((1, 3, 1024, 1024), np.float32)}
+    m2.run(feeds)
+    assert f.runs[-1] == (CPU, "birefnet-lite.onnx")
+    assert m2.released  # the CPU stand-in is dropped after its run
+    m2.run(feeds)
+    assert m2.provider == DML and f.runs[-1] == (DML, "birefnet-lite.onnx")  # GPU tried again
+
+
+def test_gpu_oom_while_recreating_runs_one_call_on_the_cpu_then_retries_the_gpu(
+    fake, stub_models, no_adapters
+):
+    fail: dict[tuple[str, str], int] = {}
+    f = fake(create_hook=_oom_on(fail))
+    m = OrtModel(stub_models["da2-fp16"], fp16=True, fallback_path=lambda: stub_models["da2-small"])
+    assert m.provider == DML and m.release()
+    fail[(DML, "da2-fp16.onnx")] = 1  # no other model to free: the GPU stays full
+    out = m.run({"pixel_values": _x()})
+    assert out["predicted_depth"].dtype == np.float32
+    # the stand-in CPU session used the fp32 file; the model itself is unchanged
+    assert f.runs[-1] == (CPU, "da2-small.onnx")
+    assert m.fp16 and m.path == stub_models["da2-fp16"] and not ort._is_cpu_sticky(m.path)
+    assert m.released
+    m.run({"pixel_values": _x()})
+    assert m.provider == DML and f.runs[-1] == (DML, "da2-fp16.onnx") and m.has_fp16_io
+
+
+def test_release_and_close_free_the_native_session(stub_models):
+    """Real onnxruntime: the model must not keep anything (e.g. a ``NodeArg``) that holds
+    the native session, or releasing a model would not give its memory back."""
+    m = OrtModel(stub_models["moge2-vitl"], "cpu")
+    native = getattr(m._sess, "_sess", None)
+    if native is None:  # pragma: no cover - onnxruntime internals changed
+        pytest.skip("onnxruntime.InferenceSession has no native _sess")
+    ref = weakref.ref(native)
+    del native
+    assert m.release()
+    gc.collect()
+    assert ref() is None
+    # the metadata survives the release and the model reloads on use
+    assert m.input_names() == ["image", "num_tokens"] and m.input_shapes()[1] == []
+    assert m.input_types() == ["tensor(float)", "tensor(int64)"]
+    assert m.run(_moge_feeds())["points"].shape == (1, 256, 256, 3)
+    ref = weakref.ref(m._sess._sess)
+    m.close()
+    gc.collect()
+    assert ref() is None
+
+
+def test_release_keeps_model_usable_close_does_not(fake, stub_models, no_adapters):
+    f = fake()
+    m = OrtModel(stub_models["da2-small"], title="Depth Anything V2 Small")
+    assert m.release() is True and m.release() is False
+    assert m.released and not m.closed
+    assert m.input_names() == ["pixel_values"] and m.output_names() == ["predicted_depth"]
+    assert m.run({"pixel_values": _x()})["predicted_depth"].shape == (1, 28, 42)
+    assert f.creates() == [DML, DML] and not m.released
+    m.close()
+    assert m.closed and not m.released and m.release() is False
+    with pytest.raises(ModelUnavailable, match="Depth Anything V2 Small"):
+        m.run({"pixel_values": _x()})
+
+
+def test_release_does_not_wait_for_a_busy_model(fake, stub_models, no_adapters):
+    gate, started = threading.Event(), threading.Event()
+
+    def hook(prov, name):
+        started.set()
+        gate.wait(10)
+
+    fake(run_hook=hook)
+    m = OrtModel(stub_models["da2-small"])
+    t = threading.Thread(target=lambda: m.run({"pixel_values": _x()}))
+    t.start()
+    try:
+        assert started.wait(10)
+        assert m.release(wait=False) is False and m.close(wait=False) is False
+        assert not m.released and not m.closed
+    finally:
+        gate.set()
+        t.join(10)
+    assert m.release(wait=False) is True
+
+
+def test_estimator_holding_a_released_model_keeps_working(fake, stub_env, no_adapters):
+    """Depth / cut-out wrappers keep their OrtModel: a session released by another model's
+    out-of-memory recovery must be re-created on use, not fail as "unloaded"."""
+    from vrphoto.depth.moge import MoGeEstimator
+
+    fake(run_hook=_oom_on({(DML, "da2-small.onnx"): 1}))
+    est = MoGeEstimator("moge2-vitl")
+    held = est._load(None, None)
+    load_model("da2-small").run({"pixel_values": _x()})  # out of memory -> releases MoGe
+    assert held.released
+    img = np.full((120, 160, 3), 90, np.uint8)
+    res = est.estimate(img)
+    assert res is not None and est._model is held and not held.released
+
+
+def test_big_model_releases_other_gpu_sessions_only_when_needed(fake, stub_env, monkeypatch):
+    devs = [Device(0, "NVIDIA GeForce GTX 1080", 8192, "nvidia")]
+    monkeypatch.setattr("vrphoto.models.gpu.list_devices", lambda **k: devs)
+    f = fake()
+    monkeypatch.setattr(ort, "BIG_MODEL_BYTES", 100)  # the stubs count as "big"
+    cpu_model = load_model("birefnet-lite", device="cpu")
+    other = load_model("moge2-vitl")
+    assert other.provider == DML and f.creates()[-1] == DML
+    monkeypatch.setattr(ort, "VRAM_FOOTPRINT", 1.0)  # fits next to the other model
+    load_model("da2-small")
+    assert not other.released
+    ort.unload_model("da2-small")
+    monkeypatch.setattr(ort, "VRAM_FOOTPRINT", 1e9)  # does not fit: free the GPU first
+    m = load_model("da2-small")
+    assert m.provider == DML and other.released
+    assert not cpu_model.released  # CPU sessions do not use GPU memory
+
+
+def test_big_model_with_unknown_vram_does_not_release(fake, stub_env, no_adapters, monkeypatch):
+    fake()
+    monkeypatch.setattr(ort, "BIG_MODEL_BYTES", 100)
+    monkeypatch.setattr(ort, "VRAM_FOOTPRINT", 1e9)
+    other = load_model("moge2-vitl")
+    load_model("da2-small")
+    assert not other.released  # no adapter list: only the out-of-memory retry applies
+
+
+def test_two_models_out_of_memory_at_once_do_not_deadlock(fake, stub_env, no_adapters):
+    barrier = threading.Barrier(2, timeout=10)
+    first = {(DML, "da2-small.onnx"): 1, (DML, "moge2-vitl.onnx"): 1}
+
+    def hook(prov, name):
+        if first.get((prov, name)):
+            first[(prov, name)] = 0
+            barrier.wait()  # both models are inside run() holding their own lock
+            raise RuntimeError(OOM)
+
+    fake(run_hook=hook)
+    a, b = load_model("da2-small"), load_model("moge2-vitl")
+    errors: list[BaseException] = []
+
+    def go(fn):
+        try:
+            fn()
+        except BaseException as e:  # pragma: no cover
+            errors.append(e)
+
+    ts = [
+        threading.Thread(target=go, args=(lambda: a.run({"pixel_values": _x()}),)),
+        threading.Thread(target=go, args=(lambda: b.run(_moge_feeds()),)),
+    ]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(20)
+    assert not any(t.is_alive() for t in ts) and not errors
+    assert not ort._is_cpu_sticky(a.path) and not ort._is_cpu_sticky(b.path)
+
+
+def test_unload_without_waiting_closes_busy_models_after_their_run(fake, stub_env, no_adapters):
+    gate, started = threading.Event(), threading.Event()
+
+    def hook(prov, name):
+        if name == "da2-small.onnx":
+            started.set()
+            gate.wait(10)
+
+    fake(run_hook=hook)
+    busy, idle = load_model("da2-small"), load_model("moge2-vitl")
+    t = threading.Thread(target=lambda: busy.run({"pixel_values": _x()}))
+    t.start()
+    try:
+        assert started.wait(10)
+        t0 = time.monotonic()
+        ort.unload_model(wait=False)
+        assert time.monotonic() - t0 < 1.0  # never blocks the GUI thread
+        assert ort.cached_models() == [] and idle.closed and not busy.closed
+    finally:
+        gate.set()
+        t.join(10)
+    deadline = time.monotonic() + 10
+    while not busy.closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert busy.closed
+
+
+def test_hidden_duplicate_adapter_index_maps_to_the_real_gpu(monkeypatch):
+    """A device saved as "1" before the duplicate GTX 1080 entry was hidden still uses it."""
+    devs = [Device(0, "NVIDIA GeForce GTX 1080", 8192, "nvidia", aliases=(1,))]
+    monkeypatch.setattr("vrphoto.models.gpu.list_devices", lambda **k: devs)
+    assert select_providers(1, available=[DML, CPU])[0] == (DML, {"device_id": "0"})
+    assert select_providers("dml:3", available=[DML, CPU])[0] == (DML, {"device_id": "3"})  # unknown: as is
+    assert select_providers(1, available=[CUDA, CPU])[0] == (CUDA, {"device_id": "0"})

@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -138,6 +139,10 @@ def track(iterable: Iterable[Any], progress: Progress, total: int | None = None,
             total = len(iterable)  # type: ignore[arg-type]
         except TypeError:
             total = None
+    try:  # a tensor / numpy count must not be evaluated as a boolean below
+        total = int(total) if total is not None else None
+    except (TypeError, ValueError, OverflowError):  # OverflowError: total=float("inf")
+        total = None
     for i, item in enumerate(iterable):
         if total:
             progress(i / total, msg)
@@ -155,18 +160,26 @@ def tqdm_factory(progress: Progress, msg: str = "") -> Callable[..., Any]:
 
     class _Tqdm:
         def __init__(self, iterable: Iterable[Any] | None = None, *args: Any, **kwargs: Any):
+            # ``iterable`` may be a torch tensor or a numpy array (e.g. a sampler's timesteps):
+            # never evaluate it as a boolean - bool() of a multi-element tensor/array raises
             self.iterable = iterable
-            self.total = kwargs.get("total")
-            if self.total is None and iterable is not None:
+            total = kwargs.get("total")
+            if total is None and iterable is not None:
                 try:
-                    self.total = len(iterable)  # type: ignore[arg-type]
-                except TypeError:
-                    self.total = None
+                    total = len(iterable)  # type: ignore[arg-type]
+                except TypeError:  # generators, 0-d tensors / arrays
+                    total = None
+            try:
+                self.total = int(total) if total is not None else None
+            except (TypeError, ValueError, OverflowError):  # OverflowError: total=float("inf")
+                self.total = None
             self.n = 0
             self.desc = kwargs.get("desc") or msg
 
         def __iter__(self) -> Iterator[Any]:
-            for item in self.iterable or ():
+            if self.iterable is None:
+                return
+            for item in self.iterable:
                 yield item
                 self.update(1)
 
@@ -247,8 +260,106 @@ def require_input(inputs: dict[str, Any], name: str) -> Path:
     return p
 
 
+_ARCH_RE = re.compile(r"(sm|compute)_(\d{2,})([a-z]?)")
+
+
+def _parse_arch(entry: Any) -> tuple[str, int, int, str] | None:
+    """``"sm_86"`` -> ``("sm", 8, 6, "")``; ``"compute_120"`` -> ``("compute", 12, 0, "")``;
+    ``"sm_90a"`` -> ``("sm", 9, 0, "a")``.  None for anything else (e.g. ROCm ``gfx90a``)."""
+    m = _ARCH_RE.fullmatch(str(entry).strip().lower())
+    if m is None:
+        return None
+    digits = m.group(2)
+    return m.group(1), int(digits[:-1]), int(digits[-1]), m.group(3)
+
+
+def gpu_arch_supported(capability: Iterable[int], arch_list: Iterable[str]) -> bool | None:
+    """Whether CUDA code built for ``arch_list`` (``torch.cuda.get_arch_list()``) runs on a
+    GPU of compute ``capability`` ``(major, minor)``.  None when ``arch_list`` has no CUDA
+    entries (unknown: do not block).
+
+    * ``sm_XY`` (SASS machine code) runs on GPUs of the same major version with a minor
+      version >= Y (``sm_61`` runs on 6.1 and 6.2, not on 6.0 or 7.0);
+    * ``compute_XY`` (PTX) is compiled by the driver for any GPU >= X.Y;
+    * ``sm_XYa`` / ``compute_XYa`` (architecture-specific features) run on exactly X.Y;
+      ``sm_XYf`` / ``compute_XYf`` (family-specific) on the same major with minor >= Y.
+    """
+    cap = tuple(int(c) for c in capability)
+    major, minor = cap[0], cap[1]
+    known = False
+    for entry in arch_list:
+        parsed = _parse_arch(entry)
+        if parsed is None:
+            continue
+        known = True
+        kind, a_major, a_minor, suffix = parsed
+        if suffix == "f" or (kind == "sm" and not suffix):
+            ok = a_major == major and a_minor <= minor
+        elif kind == "compute" and not suffix:
+            ok = (a_major, a_minor) <= (major, minor)
+        else:  # "a" (or an unknown suffix): this exact architecture only
+            ok = (a_major, a_minor) == (major, minor)
+        if ok:
+            return True
+    return False if known else None
+
+
+def gpu_arch_problem(device: int = 0) -> tuple[str, str] | None:
+    """``(message, hint)`` when the installed PyTorch has no CUDA code for the GPU, else None
+    (also when there is no GPU or it cannot be determined)."""
+    import torch
+
+    try:
+        if not torch.cuda.is_available():
+            return None
+        cap = tuple(int(c) for c in torch.cuda.get_device_capability(device))
+        archs = [str(a) for a in torch.cuda.get_arch_list()]
+    except Exception:
+        return None
+    if gpu_arch_supported(cap, archs) is not False:
+        return None
+    try:
+        name = str(torch.cuda.get_device_name(device))
+    except Exception:
+        name = "NVIDIA GPU"
+    sm = f"sm_{cap[0]}{cap[1]}"
+    built = ", ".join(archs)
+    message = (
+        f"This GPU ({name}, {sm}) is not supported by the installed PyTorch build "
+        f"(torch {getattr(torch, '__version__', '?')}, built for {built})."
+    )
+    versions = sorted((p[1], p[2]) for p in map(_parse_arch, archs) if p is not None)
+    oldest, newest = versions[0], versions[-1]
+    if (cap[0], cap[1]) < oldest:
+        hint = (
+            f"This graphics card is too old for this add-on: it needs an NVIDIA GPU of compute capability "
+            f"{oldest[0]}.{oldest[1]} or newer. Use another method, or a PC with a newer NVIDIA GPU."
+        )
+    elif (cap[0], cap[1]) > newest:
+        hint = ("This graphics card is newer than this add-on's PyTorch build supports. "
+                "Update VR Photo Studio and reinstall the add-on.")
+    else:  # between the built architectures (e.g. sm_80 + sm_90 builds on a 7.5 card)
+        hint = ("This add-on's PyTorch build has no code for this graphics card's generation. "
+                "Use another method, or update VR Photo Studio and reinstall the add-on.")
+    return message, hint
+
+
+def require_supported_gpu(device: int = 0) -> None:
+    """Raise :class:`WorkerError` naming the GPU and its ``sm_XY`` when the installed PyTorch
+    build has no CUDA code for it (otherwise the first kernel fails mid-job with "no kernel
+    image is available for execution on the device")."""
+    problem = gpu_arch_problem(device)
+    if problem is not None:
+        raise WorkerError(problem[0], hint=problem[1])
+
+
 def cuda_info(require: bool = True) -> dict[str, Any]:
-    """Describe torch/CUDA; raise :class:`WorkerError` when ``require`` and CUDA is missing."""
+    """Describe torch/CUDA.
+
+    With ``require``, raise :class:`WorkerError` when CUDA is missing or the installed PyTorch
+    build does not support the GPU's architecture (:func:`require_supported_gpu`); without
+    it, an unsupported GPU is reported as ``gpu_supported = False`` plus ``gpu_problem``.
+    """
     import torch
 
     info: dict[str, Any] = {
@@ -261,6 +372,12 @@ def cuda_info(require: bool = True) -> dict[str, Any]:
         info["gpu"] = props.name
         info["vram_gb"] = round(props.total_memory / 1024**3, 1)
         info["capability"] = f"{props.major}.{props.minor}"
+        problem = gpu_arch_problem(0)
+        if problem is not None:
+            if require:
+                raise WorkerError(problem[0], hint=problem[1])
+            info["gpu_supported"] = False
+            info["gpu_problem"] = problem[0]
     elif require:
         raise WorkerError(
             "CUDA is not available: PyTorch cannot see an NVIDIA GPU.",
@@ -463,9 +580,12 @@ __all__ = [
     "cuda_info",
     "emit",
     "free_cuda",
+    "gpu_arch_problem",
+    "gpu_arch_supported",
     "log",
     "param",
     "require_input",
+    "require_supported_gpu",
     "run",
     "setup_streams",
     "src_dir",

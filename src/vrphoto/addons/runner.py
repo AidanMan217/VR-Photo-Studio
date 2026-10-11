@@ -308,7 +308,19 @@ def _fmt_duration(sec: float) -> str:
 
 
 # --------------------------------------------------------------------------- error hints
+#: Shown for Windows' "untrusted mount point" error (os error 448): a process started from an
+#: installer with Inno Setup's RedirectionGuard may not follow folder junctions (uv's Python).
+REDIRECTION_GUARD_HINT = (
+    "Windows blocked a folder shortcut. Restart VR Photo Studio from the Start menu (not from the installer) "
+    "and try again."
+)
+NETWORK_HINT = "A download failed. Check your internet connection (and proxy/firewall) and try again."
+
 _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"os error 448|WinError 448\]|untrusted mount point", re.I),
+        REDIRECTION_GUARD_HINT,
+    ),
     (
         re.compile(r"out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation", re.I),
         "The GPU ran out of memory. Lower the quality settings (resolution, steps, texture size), "
@@ -342,8 +354,13 @@ _HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
         f"The add-on installation looks incomplete or broken. Reinstall it from the {UI_ADDONS}.",
     ),
     (
-        re.compile(r"ConnectionError|Max retries exceeded|Temporary failure in name resolution|getaddrinfo failed", re.I),
-        "A download failed. Check your internet connection (and proxy/firewall) and try again.",
+        re.compile(
+            r"ConnectionError|Max retries exceeded|Temporary failure in name resolution|getaddrinfo failed|"
+            r"Failed to fetch|error sending request|dns error|timed out|Connection ?reset|\btls\b|"
+            r"Connection (?:aborted|broken|refused)|IncompleteRead|check your (?:internet )?connection",
+            re.I,
+        ),
+        NETWORK_HINT,
     ),
 )
 
@@ -563,7 +580,9 @@ _LEVELS = {"debug": 10, "info": 20, "warning": 30, "warn": 30, "error": 40, "cri
 
 
 __all__ = [
+    "NETWORK_HINT",
     "PARENT_PID_ENV",
+    "REDIRECTION_GUARD_HINT",
     "LogSink",
     "ProcResult",
     "WorkerRun",

@@ -45,6 +45,7 @@ packages = [
     "accelerate==1.10.1",
     "safetensors==0.6.2",
     "huggingface-hub==0.35.3",
+    "setuptools==75.8.0",  # torch.utils.cpp_extension imports it; uv venvs do not include it
 ]
 
 [[steps]]

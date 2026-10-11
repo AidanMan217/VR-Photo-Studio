@@ -208,3 +208,46 @@ def test_firewall_task_removes_stale_program_block_rules(iss):
     code = "\n".join(_sections(iss)["Code"])
     assert code.count("delete rule name=all program=") == 2  # GUI and CLI executables
     assert "{#AppExe}" in code and "{#CliExe}" in code
+
+
+def test_preprocessor_conditionals_are_balanced(iss):
+    """Every ISPP #if/#ifdef/#ifndef is closed by an #endif (#elif/#else only inside one)."""
+    depth = 0
+    for n, raw in enumerate(iss.splitlines(), 1):
+        m = re.match(r"\s*#\s*(\w+)", raw)
+        if not m:
+            continue
+        word = m.group(1)
+        if word in ("if", "ifdef", "ifndef", "ifexist", "ifnexist"):
+            depth += 1
+        elif word in ("elif", "else"):
+            assert depth > 0, f"line {n}: #{word} outside #if"
+        elif word == "endif":
+            depth -= 1
+            assert depth >= 0, f"line {n}: #endif without #if"
+    assert depth == 0, "unclosed #if"
+
+
+def test_redirection_guard_disabled_on_inno_6_7(iss):
+    """Inno Setup 6.7+ enables Windows' RedirectionGuard by default; it is suspected of reaching
+    the app started from the finish page, where uv then failed with os error 448 ("untrusted
+    mount point") on its own Python folder junction and add-on installs failed.  Older compilers
+    reject the unknown directive, so it must sit inside [Setup] behind an ISPP version check."""
+    assert _setup(iss).get("RedirectionGuard") == "no"
+    assert iss.count("RedirectionGuard=") == 1
+    lines = [line.strip() for line in iss.splitlines()]
+    i = lines.index("RedirectionGuard=no")
+    m = re.fullmatch(r"#if VER >= EncodeVer\((\d+), ?(\d+), ?(\d+)\)", lines[i - 1])
+    assert m, f"RedirectionGuard=no must be guarded by '#if VER >= EncodeVer(6, 7, 0)', got {lines[i - 1]!r}"
+    assert tuple(int(g) for g in m.groups()) == (6, 7, 0)
+    assert lines[i + 1] == "#endif"
+    section = next(line for line in reversed(lines[:i]) if re.fullmatch(r"\[\w+\]", line))
+    assert section == "[Setup]"
+    # the reason is documented right above the guard
+    comment = []
+    for line in reversed(lines[: i - 1]):
+        if not line.startswith(";"):
+            break
+        comment.append(line)
+    text = " ".join(comment)
+    assert "448" in text and "uv" in text and "6.7" in text

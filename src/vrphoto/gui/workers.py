@@ -217,7 +217,8 @@ class TaskRunner(QObject):
         for w in list(self._workers.values()):
             w.callbacks = {}
         if not finished:
-            log.info("Background task(s) still stopping: %s", ", ".join(w.name for w in self.active()))
+            # harmless (the detached pool ends on its own) - not worth a line in the Log panel
+            log.debug("Background task(s) still stopping: %s", ", ".join(w.name for w in self.active()))
             self.pool.setParent(None)
             _ORPHAN_POOLS.add(self.pool)
             _prune_orphans()

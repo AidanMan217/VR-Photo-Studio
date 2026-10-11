@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 from collections.abc import Callable
@@ -303,6 +304,10 @@ _PIP_HINTS = (
 )
 
 
+#: Fallback hint when no known error pattern matched (not every failure is a network problem).
+INSTALL_LOG_HINT = "Installation failed - details are in install.log (Add-ons window > Open folder)."
+
+
 def _pip_hint(text: str) -> str | None:
     h = error_hint(text)
     if h:
@@ -310,7 +315,7 @@ def _pip_hint(text: str) -> str | None:
     for pat, hint in _PIP_HINTS:
         if pat.search(text):
             return hint
-    return "Check your internet connection and retry; the install resumes where it stopped. Details are in install.log."
+    return INSTALL_LOG_HINT
 
 
 # --------------------------------------------------------------------------- step runners
@@ -397,6 +402,94 @@ def _require_venv(ctx: InstallContext) -> None:
         )
 
 
+def _is_link(path: Path) -> bool:
+    """True for a symlink, a Windows junction or any other reparse point - and, to be safe,
+    whenever it cannot be determined.  Never follows the link itself."""
+    try:
+        if path.is_symlink():
+            return True
+        isjunction = getattr(os.path, "isjunction", None)  # Python 3.12+
+        if isjunction is not None and isjunction(path):
+            return True
+        st = os.lstat(path)
+    except (OSError, ValueError):
+        return True
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if getattr(st, "st_file_attributes", 0) & reparse:  # Windows only
+        return True
+    try:
+        os.readlink(path)  # also reads junctions on Windows
+    except (OSError, ValueError, NotImplementedError):
+        return False
+    return True
+
+
+def find_managed_python(install_dir: Path, minor: str) -> str | None:
+    """Exact version (``"3.11.13"``) of the newest uv-managed CPython ``minor`` (``"3.11"``)
+    installed in ``install_dir`` as a *real* folder, or None.
+
+    uv also keeps a ``cpython-3.11-<platform>`` link (a junction on Windows) to the newest
+    patch release; such links are skipped.
+    """
+    pat = re.compile(r"cpython-" + re.escape(minor) + r"\.(\d+)-", re.IGNORECASE)
+    best: int | None = None
+    try:
+        entries = list(os.scandir(install_dir))
+    except OSError:
+        return None
+    for entry in entries:
+        m = pat.match(entry.name)
+        if m is None:
+            continue
+        p = Path(entry.path)
+        if _is_link(p):
+            continue
+        try:
+            if not stat.S_ISDIR(os.lstat(p).st_mode):
+                continue
+        except OSError:
+            continue
+        patch = int(m.group(1))
+        if best is None or patch > best:
+            best = patch
+    return f"{minor}.{best}" if best is not None else None
+
+
+def _managed_python_request(ctx: InstallContext, progress: ProgressReporter) -> str:
+    """Install the manifest's managed Python and return the exact ``x.y.N`` to create the
+    venv from (falls back to ``x.y`` when the installed version cannot be determined).
+
+    ``uv venv --python 3.11`` points the venv at uv's ``cpython-3.11-*`` minor-version link,
+    a directory junction on Windows.  Under Windows' RedirectionGuard (which some processes
+    run with) Windows refuses to follow such a junction ("untrusted mount point", os error
+    448); an exact ``--python 3.11.N`` request uses the real folder instead.
+    """
+    want = ctx.manifest.python
+    env = ctx.uv_env()
+    title = f"Installing Python {want}"
+    progress(0.02, title)
+    require_uv(ctx.uv)
+    res = run_process(
+        [ctx.uv, "python", "install", "--no-bin", "--no-registry", want],
+        env=env,
+        cwd=ctx.addon_dir,
+        log_sink=ctx.sink,
+        on_line=_UvProgress(progress, title),
+        cancel=ctx.cancel,
+        title=title,
+    )
+    if not res.ok:
+        ctx.sink.write(f"WARNING: uv python install failed ({_uv_error_line(res.tail) or res.returncode}); "
+                       "creating the environment directly")
+    install_dir = env.get("UV_PYTHON_INSTALL_DIR")
+    exact = find_managed_python(Path(install_dir), want) if install_dir else None
+    if exact is None:
+        ctx.sink.write(f"No installed Python {want}.N folder found in {install_dir}; using --python {want}")
+        return want
+    ctx.sink.write(f"Using the managed Python {exact} (exact version, not the {want} folder link)")
+    return exact
+
+
 def step_venv(ctx: InstallContext, step: dict, progress: ProgressReporter) -> None:
     """Create ``<addon_dir>/venv`` with uv (managed Python, or ``VRPHOTO_ADDON_PYTHON``)."""
     override = os.environ.get(PYTHON_ENV, "").strip()
@@ -406,15 +499,18 @@ def step_venv(ctx: InstallContext, step: dict, progress: ProgressReporter) -> No
             raise AddonError(f"{PYTHON_ENV} points to a missing interpreter: {override}")
         args += ["--python", override, "--no-python-downloads"]
         ctx.sink.write(f"Using interpreter from {PYTHON_ENV}: {override}")
+        venv_progress = progress
     else:
-        args += ["--managed-python", "--python", ctx.manifest.python]
+        request = _managed_python_request(ctx, progress.sub(0.0, 0.6))
+        args += ["--managed-python", "--python", request]
+        venv_progress = progress.sub(0.6, 1.0)
     if step.get("seed"):
         args.append("--seed")
     if ctx.venv.exists():
         args.append("--clear")
     args.append(str(ctx.venv))
-    progress(0.1, f"Creating Python {ctx.manifest.python} environment")
-    _run_uv(ctx, args, "Creating the Python environment", progress)
+    venv_progress(0.1, f"Creating Python {ctx.manifest.python} environment")
+    _run_uv(ctx, args, "Creating the Python environment", venv_progress)
     _require_venv(ctx)
     res = run_process(
         [str(ctx.python), "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
@@ -587,7 +683,7 @@ def step_hf_download(ctx: InstallContext, step: dict, progress: ProgressReporter
             "(read) and enter it in Settings.",
         )
     raise AddonError(f"Downloading {repo} failed: {message[:300]}", hint=error_hint(message, res.tail_text())
-                     or "Check your internet connection and retry; downloads resume.")
+                     or INSTALL_LOG_HINT)
 
 
 def step_check(ctx: InstallContext, step: dict, progress: ProgressReporter) -> None:
@@ -782,9 +878,11 @@ def run_steps(
 
 __all__ = [
     "HF_SNIPPET",
+    "INSTALL_LOG_HINT",
     "PYTHON_ENV",
     "STEP_RUNNERS",
     "InstallContext",
+    "find_managed_python",
     "run_steps",
     "step_applies",
     "step_key",

@@ -61,6 +61,9 @@ packages = [
     "easydict==1.13",
     "opencv-python-headless==4.13.0.92",
     "ninja==1.13.0",
+    # torch.utils.cpp_extension (imported by the prebuilt CUDA extension wheels) imports
+    # setuptools; uv venvs do not include it
+    "setuptools==75.8.0",
     "trimesh==4.10.1",
     "transformers==4.57.3",
     "accelerate==1.12.0",

@@ -5,9 +5,13 @@ On Windows the hardware adapters are enumerated with DXGI
 through raw COM vtable calls via ``ctypes``.  :attr:`Device.index` is the DXGI
 enumeration ordinal, which is exactly the ``device_id`` the DirectML execution provider
 passes to ``EnumAdapters1``; software adapters (Microsoft Basic Render Driver) are
-skipped.  If DXGI fails, ``Get-CimInstance Win32_VideoController`` (PowerShell) is used
-as a fallback (its order is *usually* the DXGI order; its AdapterRAM is capped at 4 GB,
-so NVIDIA VRAM is taken from ``nvidia-smi``).  Other platforms return ``[]``.
+skipped.  An adapter that DXGI lists more than once (same ``AdapterLuid``, or more
+NVIDIA entries with identical hardware ids than ``nvidia-smi`` reports GPUs) is listed
+once, under the index of its first entry; the dropped indexes are kept as
+:attr:`Device.aliases`.  If DXGI fails, ``Get-CimInstance Win32_VideoController``
+(PowerShell) is used as a fallback (its order is *usually* the DXGI order; its AdapterRAM
+is capped at 4 GB, so NVIDIA VRAM is taken from ``nvidia-smi``).  Other platforms return
+``[]``.
 """
 
 from __future__ import annotations
@@ -19,8 +23,9 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections import Counter
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from ..core.log import get_logger
@@ -42,13 +47,16 @@ class Device:
     name: str
     vram_mb: int | None
     vendor: str  # "nvidia" | "amd" | "intel" | "other" | "cpu"
+    # several adapters share ``name``: the label starts with "GPU <index>: " to tell them apart
+    show_index: bool = False
+    # DXGI indexes of duplicate entries of this adapter that were dropped from the list
+    aliases: tuple[int, ...] = field(default=())
 
     @property
     def label(self) -> str:
-        """Human-readable label for a device picker."""
-        if self.vram_mb:
-            return f"{self.name} ({self.vram_mb / 1024:.0f} GB)"
-        return self.name
+        """Human-readable label for a device picker (unique within :func:`list_devices`)."""
+        text = f"{self.name} ({self.vram_mb / 1024:.0f} GB)" if self.vram_mb else self.name
+        return f"GPU {self.index}: {text}" if self.show_index else text
 
 
 def vendor_name(vendor_id: int) -> str:
@@ -154,24 +162,109 @@ class _DxgiApi:
             self.factory = ctypes.c_void_p()
 
 
-def _dxgi_devices(api: Any = None, max_adapters: int = 64) -> list[Device]:
-    """Enumerate hardware adapters through ``api.desc(i)`` (default: real DXGI)."""
+def _dxgi_devices(
+    api: Any = None, max_adapters: int = 64, nvsmi: Callable[[], list[int]] | None = None
+) -> list[Device]:
+    """Enumerate hardware adapters through ``api.desc(i)`` (default: real DXGI).
+
+    Each physical adapter is listed once, under its first DXGI index (the DirectML
+    device_id): entries repeating an ``AdapterLuid`` are dropped, and so are surplus NVIDIA
+    entries with identical VendorId/DeviceId/SubSysId when ``nvsmi()`` (default:
+    :func:`nvidia_vram_list`, only called in that case) reports fewer NVIDIA GPUs.
+    """
     own = api is None
     if own:
         api = _DxgiApi()
-    devs: list[Device] = []
+    found: list[tuple[Device, tuple[int, int, int]]] = []
+    by_luid: dict[tuple[int, int], Device] = {}
     try:
         for i in range(max_adapters):
             d = api.desc(i)
             if d is None:
                 break
+            luid = (int(d.AdapterLuid.HighPart) & 0xFFFFFFFF, int(d.AdapterLuid.LowPart) & 0xFFFFFFFF)
+            log.debug(
+                "DXGI adapter %d: %r LUID=%08X:%08X VendorId=0x%04X DeviceId=0x%04X SubSysId=0x%08X "
+                "Flags=0x%X VRAM=%d MB",
+                i,
+                d.description,
+                luid[0],
+                luid[1],
+                d.VendorId,
+                d.DeviceId,
+                d.SubSysId,
+                d.Flags,
+                int(d.DedicatedVideoMemory) // (1024 * 1024),
+            )
             if d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE or d.VendorId == MICROSOFT_VENDOR_ID:
                 continue
+            first = by_luid.get(luid) if luid != (0, 0) else None  # 0 = unknown (never a real LUID)
+            if first is not None:
+                log.info(
+                    "GPU adapter %d (%s) is listed again as adapter %d (same LUID); ignoring the duplicate",
+                    first.index,
+                    first.name,
+                    i,
+                )
+                first.aliases += (i,)
+                continue
             vram = int(d.DedicatedVideoMemory) // (1024 * 1024)
-            devs.append(Device(i, d.description or f"GPU {i}", vram or None, vendor_name(d.VendorId)))
+            dev = Device(i, d.description or f"GPU {i}", vram or None, vendor_name(d.VendorId))
+            if luid != (0, 0):
+                by_luid[luid] = dev
+            found.append((dev, (int(d.VendorId), int(d.DeviceId), int(d.SubSysId))))
     finally:
         if own:
             api.close()
+    devs = _drop_surplus_nvidia(found, nvsmi or nvidia_vram_list)
+    return _mark_repeated_names(devs)
+
+
+def _drop_surplus_nvidia(
+    found: list[tuple[Device, tuple[int, int, int]]], nvsmi: Callable[[], list[int]]
+) -> list[Device]:
+    """Drop NVIDIA entries that repeat another entry's hardware ids (VendorId, DeviceId,
+    SubSysId) while DXGI lists more NVIDIA adapters than ``nvidia-smi`` reports GPUs (a
+    leftover / virtual adapter).  The first entries (lowest DXGI index) are kept."""
+    devs = [dev for dev, _ in found]
+    groups: dict[tuple[int, int, int], list[Device]] = {}
+    for dev, hw in found:
+        if dev.vendor == "nvidia":
+            groups.setdefault(hw, []).append(dev)
+    if all(len(g) < 2 for g in groups.values()):
+        return devs
+    try:
+        real = len(nvsmi())
+    except Exception as e:  # pragma: no cover - nvidia_vram_list never raises
+        log.debug("nvidia-smi query failed: %s", e)
+        real = 0
+    excess = sum(len(g) for g in groups.values()) - real
+    if real <= 0 or excess <= 0:  # unknown count, or every entry is a real GPU
+        return devs
+    dropped: set[int] = set()
+    for g in groups.values():
+        for extra in reversed(g[1:]):
+            if excess <= 0:
+                break
+            log.info(
+                "GPU adapter %d (%s) has the same hardware id as adapter %d, but nvidia-smi reports "
+                "only %d NVIDIA GPU(s); ignoring it",
+                extra.index,
+                extra.name,
+                g[0].index,
+                real,
+            )
+            g[0].aliases += (extra.index, *extra.aliases)
+            dropped.add(extra.index)
+            excess -= 1
+    return [d for d in devs if d.index not in dropped]
+
+
+def _mark_repeated_names(devs: list[Device]) -> list[Device]:
+    """Make labels unique: adapters sharing a name are shown as "GPU <index>: <name>"."""
+    counts = Counter(d.name.casefold() for d in devs)
+    for d in devs:
+        d.show_index = counts[d.name.casefold()] > 1
     return devs
 
 
@@ -232,7 +325,7 @@ def parse_cim_json(text: str) -> list[Device]:
         vendor = vendor_name(vid) if vid is not None else _vendor_from_name(name)
         devs.append(Device(idx, name or f"GPU {idx}", vram, vendor))
         idx += 1
-    return devs
+    return _mark_repeated_names(devs)
 
 
 def _vendor_from_name(name: str) -> str:
@@ -325,7 +418,14 @@ def list_devices(*, refresh: bool = False) -> list[Device]:
     with _lock:
         if _cached is not None and not refresh:
             return list(_cached)
-        devs = _enumerate_windows(_dxgi_devices, _cim_devices, nvidia_vram_list)
+        smi: list[list[int]] = []
+
+        def nvsmi() -> list[int]:  # nvidia-smi is slow: run it at most once per enumeration
+            if not smi:
+                smi.append(nvidia_vram_list())
+            return smi[0]
+
+        devs = _enumerate_windows(lambda: _dxgi_devices(nvsmi=nvsmi), _cim_devices, nvsmi)
         _cached = devs
         return list(devs)
 
@@ -357,6 +457,34 @@ def _enumerate_windows(
     return devs
 
 
+def canonical_index(index: int) -> int:
+    """The listed adapter that DXGI index ``index`` refers to.
+
+    A duplicate entry dropped from :func:`list_devices` (see :attr:`Device.aliases`) maps
+    to the adapter it duplicates, so a device chosen before the duplicate was hidden keeps
+    working; any other index is returned unchanged.
+    """
+    devs = list_devices()
+    if any(d.index == index for d in devs):
+        return index
+    for d in devs:
+        if index in d.aliases:
+            if index not in _alias_logged:  # called for every model load: say it once
+                _alias_logged.add(index)
+                log.info(
+                    "GPU %d is a duplicate entry of GPU %d (%s); using GPU %d",
+                    index,
+                    d.index,
+                    d.name,
+                    d.index,
+                )
+            return d.index
+    return index
+
+
+_alias_logged: set[int] = set()
+
+
 def device_choices() -> list[tuple[str, str]]:
     """``(value, label)`` pairs for a Settings device picker (value fits ``Settings.device``)."""
     out = [("auto", "Automatic (fastest GPU)"), ("cpu", "CPU only")]
@@ -379,6 +507,7 @@ def system_info() -> dict[str, Any]:
 __all__ = [
     "Device",
     "list_devices",
+    "canonical_index",
     "nvidia_vram_mb",
     "nvidia_vram_list",
     "device_choices",

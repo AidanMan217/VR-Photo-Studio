@@ -11,7 +11,9 @@ Per job the event order is always ``queued`` -> (``started`` -> ``progress``* ->
 ``finished`` | ``failed`` | ``cancelled``) or ``queued`` -> ``cancelled``.  A runner
 exception becomes a ``failed`` event whose ``error`` is the friendly message (a
 :class:`~vrphoto.core.errors.VRPhotoError`'s text plus its hint); the traceback goes to
-the log.  Any exception raised after the job was asked to cancel counts as ``cancelled``.
+the log (at DEBUG level for a ``VRPhotoError``, an expected error, so the Log panel shows
+one readable line).  Any exception raised after the job was asked to cancel counts as
+``cancelled``.
 """
 
 from __future__ import annotations
@@ -350,7 +352,10 @@ class JobQueue:
             else:
                 msg = error_message(e)
                 if isinstance(e, VRPhotoError):
-                    log.error("Job %s failed: %s", job_id, msg, exc_info=e)
+                    # an expected, user-facing error (bad input, missing add-on...): one readable
+                    # line in the Log panel; the traceback only helps debugging
+                    log.error("Job %s failed: %s", job_id, msg)
+                    log.debug("Traceback of failed job %s", job_id, exc_info=e)
                 else:
                     log.error("Job %s failed with an unexpected error", job_id, exc_info=e)
                 with self._lock:

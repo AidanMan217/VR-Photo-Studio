@@ -346,3 +346,251 @@ def test_hunyuan_manifest_explains_texture_option():
     m = load_manifest(manifests_dir() / "hunyuan.toml")
     assert "Paint texture" in m.notes and "first textured run" in m.notes
     assert any(s.get("optional") and "custom_rasterizer" in " ".join(s.get("packages", [])) for s in m.steps)
+
+
+# ------------------------------------------------------------------ _common: tqdm stand-in with tensors
+class _TensorLike:
+    """Behaves like a multi-element torch tensor: iterable and sized, but bool() raises."""
+
+    def __init__(self, values):
+        self.values = list(values)
+
+    def __len__(self):
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __bool__(self):
+        raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous")
+
+
+class _CountLike:
+    """A tensor-like 0-d count (e.g. total=torch.tensor(4)): int() works, bool() raises."""
+
+    def __init__(self, n):
+        self.n = n
+
+    def __int__(self):
+        return self.n
+
+    def __index__(self):
+        return self.n
+
+    def __bool__(self):
+        raise RuntimeError("Boolean value of Tensor with more than one value is ambiguous")
+
+
+@pytest.fixture
+def common(monkeypatch):
+    monkeypatch.syspath_prepend(str(workers_dir()))
+    mod = importlib.import_module("_common")
+    sent: list[tuple[str, dict]] = []
+    monkeypatch.setattr(mod, "emit", lambda t, **kw: sent.append((t, kw)))
+    mod.sent = sent  # type: ignore[attr-defined]
+    return mod
+
+
+def _fracs(common):
+    return [kw["frac"] for t, kw in common.sent if t == "progress"]
+
+
+def test_tqdm_factory_iterates_tensor_like_timesteps(common):
+    """Hunyuan3D passes a torch tensor of timesteps to tqdm: iterating must never call
+    bool() on it ("Boolean value of Tensor ... is ambiguous" crashed every shape job)."""
+    tq = common.tqdm_factory(common.Progress(), "Generating the shape")
+    steps = _TensorLike([999, 749, 499, 249, 0])
+    bar = tq(steps, desc="Diffusion Sampling:", disable=False)
+    assert len(bar) == 5
+    assert list(bar) == [999, 749, 499, 249, 0]
+    assert _fracs(common)[-1] == pytest.approx(1.0)
+
+
+def test_tqdm_factory_iterates_numpy_arrays(common):
+    tq = common.tqdm_factory(common.Progress(), "loop")
+    arr = np.array([3.0, 2.0, 1.0])
+    assert [float(x) for x in tq(arr)] == [3.0, 2.0, 1.0]
+    assert _fracs(common)[-1] == pytest.approx(1.0)
+    assert list(tq(np.array([], dtype=np.float32))) == []
+
+
+def test_tqdm_factory_counts_and_manual_updates(common):
+    tq = common.tqdm_factory(common.Progress(), "loop")
+    assert list(tq()) == []  # no iterable: empty, no crash
+    with tq(total=_CountLike(4)) as bar:  # tensor-like total
+        assert len(bar) == 4
+        bar.update(2)
+        bar.update(2)
+    assert _fracs(common)[-1] == pytest.approx(1.0)
+    assert list(tq((i for i in range(3)), total=np.int64(3))) == [0, 1, 2]
+    assert len(tq(np.array(5.0))) == 0  # 0-d array: no len, no crash
+
+
+def test_tqdm_factory_and_track_accept_infinite_total(common):
+    """tqdm documents total=float("inf") for unbounded loops; int() of it raises OverflowError."""
+    tq = common.tqdm_factory(common.Progress(), "loop")
+    bar = tq(iter([1, 2]), total=float("inf"))
+    assert bar.total is None and len(bar) == 0
+    assert list(bar) == [1, 2]
+    assert list(common.track(iter([1, 2]), common.Progress(), total=float("inf"))) == [1, 2]
+
+
+def test_track_with_tensor_like_inputs(common):
+    p = common.Progress()
+    assert list(common.track(_TensorLike([1, 2]), p)) == [1, 2]
+    assert list(common.track(iter([1, 2, 3]), p, total=_CountLike(3))) == [1, 2, 3]
+    assert _fracs(common)[-1] == pytest.approx(1.0)
+
+
+def test_trellis_stage_tqdm_with_tensor_like(common, monkeypatch):
+    sys.modules.pop("trellis_worker", None)
+    tw = importlib.import_module("trellis_worker")
+    p = common.Progress()
+    stages = tw._StageTqdm([(p.sub(0.0, 0.5), "shape"), (p.sub(0.5, 1.0), "details")])
+    make = stages.factory()
+    assert list(make(_TensorLike([1, 2]), desc="Sampling")) == [1, 2]
+    assert list(make(np.arange(3))) == [0, 1, 2]
+    assert _fracs(common)[-1] == pytest.approx(1.0)
+
+
+# ------------------------------------------------------------------ _common: GPU architecture guard
+WIN_TORCH_270_CU128 = ["sm_50", "sm_60", "sm_61", "sm_70", "sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
+WIN_TORCH_280_CU128 = ["sm_61", "sm_70", "sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
+LINUX_TORCH_280_CU128 = ["sm_70", "sm_75", "sm_80", "sm_86", "sm_90", "sm_100", "sm_120"]
+
+
+@pytest.mark.parametrize(
+    "cap, archs, expect",
+    [
+        ((6, 1), WIN_TORCH_270_CU128, True),  # GTX 1080 with the TRELLIS torch build
+        ((6, 1), WIN_TORCH_280_CU128, True),
+        ((6, 1), LINUX_TORCH_280_CU128, False),  # Pascal dropped from the Linux cu128 builds
+        ((6, 0), WIN_TORCH_280_CU128, False),  # sm_61 SASS does not run on 6.0
+        ((5, 2), WIN_TORCH_280_CU128, False),
+        ((6, 2), ["sm_61"], True),  # SASS: same major, higher minor
+        ((7, 0), ["sm_75", "sm_80"], False),  # same major is not enough
+        ((8, 9), ["sm_80", "sm_86", "sm_90"], True),
+        ((9, 0), ["sm_80", "sm_86"], False),  # SASS never runs on another major
+        ((12, 0), ["sm_80", "compute_90"], True),  # PTX: any newer GPU
+        ((13, 0), ["sm_120"], False),
+        ((13, 0), ["sm_120", "compute_120"], True),
+        ((6, 1), ["compute_70"], False),  # PTX does not run on older GPUs
+        ((6, 1), ["compute_60"], True),
+        ((9, 0), ["sm_90a"], True),
+        ((10, 0), ["sm_90a", "compute_90a"], False),  # arch-specific: exactly 9.0 only
+        ((10, 3), ["sm_100f"], True),  # family-specific
+        ((10, 0), ["sm_103f"], False),
+        ((12, 0), ["SM_120 "], True),
+    ],
+)
+def test_gpu_arch_supported(common, cap, archs, expect):
+    assert common.gpu_arch_supported(cap, archs) is expect
+
+
+def test_gpu_arch_supported_unknown(common):
+    assert common.gpu_arch_supported((6, 1), []) is None
+    assert common.gpu_arch_supported((9, 0), ["gfx90a", "gfx1100"]) is None  # ROCm: do not block
+
+
+def _fake_torch(cap=(6, 1), archs=LINUX_TORCH_280_CU128, name="NVIDIA GeForce GTX 1080", cuda=True):
+    import types
+
+    torch = types.ModuleType("torch")
+    torch.__version__ = "2.8.0+cu128"
+    torch.version = types.SimpleNamespace(cuda="12.8")
+
+    def props(i=0):
+        return types.SimpleNamespace(name=name, total_memory=8 * 1024**3, major=cap[0], minor=cap[1])
+
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: cuda,
+        get_device_properties=props,
+        get_device_capability=lambda device=0: cap,
+        get_arch_list=lambda: list(archs),
+        get_device_name=lambda device=0: name,
+        empty_cache=lambda: None,
+    )
+    return torch
+
+
+def test_cuda_info_rejects_unsupported_gpu(common, monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch())
+    with pytest.raises(common.WorkerError) as ei:
+        common.cuda_info(require=True)
+    msg = str(ei.value)
+    assert "NVIDIA GeForce GTX 1080" in msg and "sm_61" in msg
+    assert "not supported by the installed PyTorch build" in msg and "sm_70" in msg
+    assert "7.0 or newer" in ei.value.hint
+    with pytest.raises(common.WorkerError, match="sm_61"):
+        common.require_supported_gpu()
+    info = common.cuda_info(require=False)  # --no-gpu checks report instead of failing
+    assert info["gpu_supported"] is False and "sm_61" in info["gpu_problem"]
+
+
+def test_cuda_info_accepts_supported_gpu(common, monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(archs=WIN_TORCH_270_CU128))
+    info = common.cuda_info(require=True)
+    assert info["gpu"] == "NVIDIA GeForce GTX 1080" and info["capability"] == "6.1"
+    assert "gpu_supported" not in info
+    common.require_supported_gpu()
+    assert common.gpu_arch_problem() is None
+
+
+def test_gpu_arch_problem_newer_gpu_and_unknown(common, monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cap=(13, 0), archs=["sm_90", "sm_120"], name="Future GPU"))
+    msg, hint = common.gpu_arch_problem()
+    assert "Future GPU, sm_130" in msg and "newer" in hint
+    # between the built architectures (sm_61 SASS does not run on 7.x): neither "too old" nor "newer"
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cap=(7, 5), archs=["sm_61", "sm_80", "sm_90"],
+                                                          name="NVIDIA GeForce RTX 2080"))
+    msg, hint = common.gpu_arch_problem()
+    assert "RTX 2080, sm_75" in msg and "too old" not in hint and "newer" not in hint and "generation" in hint
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(archs=[]))  # unknown build: do not block
+    assert common.gpu_arch_problem() is None
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda=False))
+    assert common.gpu_arch_problem() is None
+
+
+def _import_worker(name: str):
+    sys.modules.pop(name, None)
+    return importlib.import_module(name)
+
+
+@pytest.mark.parametrize("name", ["trellis_worker", "trellis2_worker", "hunyuan_worker", "sdxl360_worker"])
+def test_worker_check_rejects_unsupported_gpu(common, monkeypatch, tmp_path, name):
+    """The install check fails with a readable message instead of a mid-job "no kernel image"."""
+    monkeypatch.setenv("VRPHOTO_ADDON_DIR", str(tmp_path))
+    monkeypatch.setenv("HY3DGEN_MODELS", str(tmp_path / "models"))
+    worker = _import_worker(name)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch())
+    with pytest.raises(worker.WorkerError) as ei:
+        worker.check(require_gpu=True)
+    assert "This GPU (NVIDIA GeForce GTX 1080, sm_61) is not supported" in str(ei.value)
+    assert ei.value.hint
+    # a supported GPU passes the guard (the check then fails later on the missing packages)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(archs=WIN_TORCH_280_CU128))
+    with pytest.raises(worker.WorkerError) as ei:
+        worker.check(require_gpu=True)
+    assert "not supported" not in str(ei.value)
+
+
+def test_sharp_falls_back_to_cpu_on_unsupported_gpu(common, monkeypatch, tmp_path):
+    """SHARP also runs on the CPU: an unsupported GPU is a warning, not an install failure."""
+    import types
+
+    ckpt = tmp_path / "sharp.pt"
+    ckpt.write_bytes(b"x")
+    monkeypatch.setenv("SHARP_CHECKPOINT", str(ckpt))
+    for mod in ("sharp.models", "sharp.utils.gaussians", "sharp.utils.io", "timm", "plyfile"):
+        monkeypatch.setitem(sys.modules, mod, types.ModuleType(mod))
+    sharp = _import_worker("sharp_worker")
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch())
+    info = sharp.check(require_gpu=True)
+    assert info["gpu_supported"] is False and "sm_61" in info["warnings"][0] and "CPU" in info["warnings"][0]
+    assert sharp._device("auto") == "cpu"
+    assert any(t == "log" and "sm_61" in kw["msg"] for t, kw in common.sent)
+    with pytest.raises(sharp.WorkerError, match="sm_61"):
+        sharp._device("cuda")
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(archs=WIN_TORCH_280_CU128))
+    assert sharp._device("auto") == "cuda"
+    assert "warnings" not in sharp.check(require_gpu=True)

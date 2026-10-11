@@ -903,6 +903,71 @@ def test_settings_dialog_token_toggle_and_devices(qtbot, settings, monkeypatch):
     dlg.reject()
 
 
+def test_settings_dialog_device_change_resets_loaded_models(qtbot, settings, monkeypatch):
+    """A new device forgets the sticky CPU fallbacks and drops every cached ONNX session
+    (without blocking on a running inference), so models reload on the chosen GPU."""
+    from vrphoto.gui.dialogs.settings_dialog import SettingsDialog
+    from vrphoto.models import ort
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(ort, "reset_cpu_fallbacks", lambda: calls.append(("reset",)))
+    monkeypatch.setattr(
+        ort, "unload_model", lambda model_id=None, *, wait=True: calls.append(("unload", model_id, wait))
+    )
+    dlg = SettingsDialog(settings=settings)
+    qtbot.addWidget(dlg)
+    dlg.max_px.setValue(2048)
+    assert dlg.save()
+    assert calls == []  # the device did not change: keep the loaded models
+    dlg = SettingsDialog(settings=settings)
+    qtbot.addWidget(dlg)
+    dlg.device.setCurrentIndex(dlg.device.findData("cpu"))
+    with qtbot.waitSignal(dlg.saved, timeout=2000) as blocker:
+        assert dlg.save()
+    assert "device" in blocker.args[0]
+    assert calls == [("reset",), ("unload", None, False)]
+
+
+def test_settings_dialog_device_change_unloads_real_cache(qtbot, settings, monkeypatch, tmp_path):
+    from vrphoto.gui.dialogs.settings_dialog import SettingsDialog
+    from vrphoto.models import ort
+
+    class Cached:
+        closed = False
+        provider = ort.CPU
+
+        def close(self, *, wait=True):
+            self.closed = True
+            return True
+
+    m = Cached()
+    monkeypatch.setitem(ort._cache, ("da2-small", "auto|auto", "x"), m)
+    ort._mark_cpu(tmp_path / "model.onnx")
+    try:
+        dlg = SettingsDialog(settings=settings)
+        qtbot.addWidget(dlg)
+        dlg.device.setCurrentIndex(dlg.device.findData("cpu"))
+        assert dlg.save()
+        assert m.closed and ort.cached_models() == []
+        assert not ort._is_cpu_sticky(tmp_path / "model.onnx")
+    finally:
+        ort.reset_cpu_fallbacks()
+
+
+def test_settings_dialog_device_reset_failure_does_not_break_saving(qtbot, settings, monkeypatch):
+    from vrphoto.gui.dialogs.settings_dialog import SettingsDialog
+    from vrphoto.models import ort
+
+    def boom():
+        raise RuntimeError("no onnxruntime")
+
+    monkeypatch.setattr(ort, "reset_cpu_fallbacks", boom)
+    dlg = SettingsDialog(settings=settings)
+    qtbot.addWidget(dlg)
+    dlg.device.setCurrentIndex(dlg.device.findData("cpu"))
+    assert dlg.save() and settings.device == "cpu"
+
+
 def test_main_window_applies_saved_settings(make_window, qtbot, settings):
     from PySide6.QtWidgets import QApplication
 

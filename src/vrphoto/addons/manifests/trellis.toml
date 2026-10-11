@@ -69,6 +69,9 @@ packages = [
     "opencv-python-headless==4.11.0.86",
     "scipy==1.15.2",
     "ninja==1.11.1.4",
+    # torch.utils.cpp_extension (imported by the prebuilt nvdiffrast wheel) imports setuptools;
+    # uv venvs do not include it
+    "setuptools==75.8.0",
     "rembg==2.0.65",
     "onnxruntime==1.21.0",
     "trimesh==4.6.6",

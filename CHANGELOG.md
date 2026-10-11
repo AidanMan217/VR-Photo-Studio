@@ -4,6 +4,31 @@ All notable changes to VR Photo Studio are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-10-11
+
+Fixes from the first test on a real PC (Windows 11, GeForce GTX 1080 8 GB).
+
+### Fixed
+
+- **Hunyuan3D add-on:** jobs crashed with "Boolean value of Tensor with more than one value is
+  ambiguous" (a bug in the add-on progress reporting; also affected TRELLIS/TRELLIS.2 samplers).
+- **TRELLIS add-on:** the install check failed with "No module named 'setuptools'"; all PyTorch
+  add-ons now install setuptools.
+- **Add-on install "untrusted mount point" (os error 448):** Python environments are created from
+  the exact Python folder, and the installer no longer passes Windows' RedirectionGuard to the app
+  when it is started from Setup's last page.
+- **Graphics memory:** when an AI model runs out of GPU memory, other loaded models are released
+  and it tries again on the GPU instead of switching to the (much slower) CPU for the rest of the
+  session.
+- **One graphics card listed twice** in the log and the Settings device list.
+- Add-on errors no longer tell you to check your internet connection when the problem is
+  something else; expected errors are logged as one line instead of a long traceback.
+
+### Added
+
+- PyTorch add-ons check at install time that the installed PyTorch build supports your graphics
+  card and say so clearly if it doesn't.
+
 ## [0.1.0] - 2026-10-11
 
 First public version.
@@ -44,4 +69,5 @@ First public version.
   portable zip, command-line tool `vrphoto-cli` with `--selftest`.
 - User guide, Quest 3 test checklist and developer documentation.
 
+[0.1.1]: https://github.com/AidanMan217/VR-Photo-Studio/releases/tag/v0.1.1
 [0.1.0]: https://github.com/AidanMan217/VR-Photo-Studio/releases/tag/v0.1.0

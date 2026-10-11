@@ -551,7 +551,8 @@ Then choose **Capture**, add all the photos (or the video) as one job, and click
   On laptops, plug in and set Windows *Settings → Display → Graphics* to "High performance" for
   VRPhotoStudio.exe.
 * **"Out of memory":** lower *Max processing size* (e.g. 2048), close games/other GPU apps, use a smaller
-  model (V2 Small, MI-GAN), or for videos lower *Processing size*.
+  model (V2 Small, MI-GAN), or for videos lower *Processing size*. On 8 GB cards the *Max quality* cut-out
+  (BiRefNet portrait) is large; the default preset uses the smaller model and is usually just as good.
 
 ### Downloads
 
@@ -599,9 +600,16 @@ Then choose **Capture**, add all the photos (or the video) as one job, and click
 
 ### Add-ons
 
-* **Install fails:** free up disk space (see the table in [section 8](#8-add-ons)), update the NVIDIA driver,
-  check the internet connection and retry. The error message and the log
-  (`%LOCALAPPDATA%\VRPhotoStudio\logs`) say what went wrong.
+* **Install fails:** free up disk space (see the table in [section 8](#8-add-ons)), update the NVIDIA driver
+  and retry - installs resume where they stopped. The error message and the add-on's `install.log`
+  (*Add-ons* window → *Open folder*) say what went wrong.
+* **"untrusted mount point" / os error 448:** close VR Photo Studio and start it again from the Start menu
+  (not from the installer's last page), then retry the install.
+* **"This GPU is not supported by the installed PyTorch build":** the add-on's PyTorch version has no code
+  for your graphics card generation. Update to the latest VR Photo Studio and reinstall the add-on.
+* **GeForce GTX 10-series (e.g. GTX 1080, 8 GB):** TRELLIS and Hunyuan3D shape generation are supported but
+  slow (several minutes per object) and close to the memory limit - close games, browsers with many tabs
+  and other GPU programs first. Texture painting (Hunyuan3D) and TRELLIS.2 need more memory than 8 GB.
 * **"CUDA out of memory":** close other GPU programs; use lower quality settings; some add-ons need more VRAM
   than your GPU has.
 

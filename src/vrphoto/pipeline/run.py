@@ -123,6 +123,9 @@ ADDON_METHODS: dict[str, tuple[str, str]] = {
     "trellis2": ("trellis2", "image_to_3d"),
     "hunyuan": ("hunyuan", "image_to_3d"),
     "sharp": ("sharp", "image_to_splat"),
+    # SHARP 360: SHARP's photo front + a predicted back (pipeline/sharp360.py); the back
+    # sources are optional and fall back with a warning, so only SHARP is required
+    "sharp360": ("sharp", "image_to_splat"),
 }
 
 STEREO_LAYOUTS = ("sbs", "half_sbs", "tb", "half_tb", "anaglyph", "anaglyph_gray", "cross")
@@ -135,6 +138,10 @@ VIDEO_OUTPUTS = ("sbs", "half_sbs", "tb", "half_tb", "vr180")
 OBJECT_METHODS = ("billboard", *ADDON_METHODS)
 PLACEMENTS = ("hit-test", "front-floor")
 BACKS = ("diffuse", "mirror")
+#: SHARP 360 options (see pipeline/sharp360.py).
+BACK_SOURCES = ("auto", "shell")
+BACK_QUALITIES = ("fast", "balanced", "best")
+SIZE_FROM = ("auto", "height", "photo")
 QUEST_MODELS = ("quest3", "quest2", "pcvr")
 
 _MODEL_ALIASES = {

@@ -128,14 +128,20 @@ class ObjectJob(JobBase):
     """Person / object you can walk around (passthrough AR on Quest 3)."""
 
     kind: ClassVar[str] = "object"
-    method: str = "billboard"  # billboard | trellis | trellis2 | hunyuan | sharp
+    method: str = "billboard"  # billboard | trellis | trellis2 | hunyuan | sharp | sharp360
     height_m: float = 1.7
-    thickness: float = 0.11  # median body thickness as a fraction of height
-    back: str = "diffuse"  # diffuse | mirror (billboard back texture)
+    thickness: float = 0.11  # median body thickness as a fraction of height (billboard, sharp360 back)
+    back: str = "diffuse"  # diffuse | mirror (billboard back texture, sharp360 built-in back)
     export_splat: bool = True
     placement: str = "hit-test"  # hit-test | front-floor
     seed: int = 0
     hunyuan_texture: bool = False  # Hunyuan3D add-on: also paint a texture (slower, more VRAM)
+    # SHARP 360 (method "sharp360"): SHARP's photo front + a predicted back (docs/design/SHARP360.md)
+    back_source: str = "auto"  # auto | shell (built-in); more sources in later versions
+    back_quality: str = "balanced"  # fast | balanced | best
+    seam_deg: float = 60.0  # the photo is used where the surface faces the camera within this angle
+    size_from: str = "auto"  # auto | height | photo (SHARP's own metric size)
+    save_extras: bool = False  # also save front/back parts, PLY and a debug JSON
 
 
 @dataclass

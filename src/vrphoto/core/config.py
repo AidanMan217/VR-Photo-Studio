@@ -133,6 +133,8 @@ class Settings:
     show_experimental: bool = False
     gui_state: dict = field(default_factory=dict)  # window geometry, last options per mode, ...
     depth_cache_mb: int = 1024
+    # add-ons
+    brush_test: dict = field(default_factory=dict)  # last capture.brush_selftest() result ({} = never run)
 
     # ---------------------------------------------------------------- derived paths
     @property
@@ -178,9 +180,15 @@ class Settings:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 names = {f.name for f in dataclasses.fields(cls)}
                 for k, v in data.items():
-                    if k in names:
-                        setattr(s, k, v)
-            except (OSError, ValueError):
+                    if k not in names:
+                        continue
+                    default = getattr(s, k)
+                    # a hand-edited or damaged entry must not turn a dict / list into
+                    # something the app then crashes on
+                    if isinstance(default, (dict, list)) and not isinstance(v, type(default)):
+                        continue
+                    setattr(s, k, v)
+            except (OSError, ValueError, AttributeError):
                 pass  # corrupt settings -> defaults
         return s
 

@@ -138,6 +138,24 @@ def local_thickness(dt: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return np.maximum(rloc, np.where(mask, dt, 0.0)).astype(np.float32)
 
 
+def inflation_profile(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Inflation profile of a silhouette (step 3 above, without ``kappa`` / ``mpp``).
+
+    ``dt_eff = max(dt - 1, 0)`` is the distance (pixels) to the boundary, with image borders
+    counting as outside, minus the boundary pixel itself; ``prof = sqrt(max(dt_eff * (2 *
+    Rloc - dt_eff), 0))`` is the height of a circular cross-section of radius ``Rloc``
+    (:func:`local_thickness` of ``dt_eff``) over the pixel, in pixels.  Both are full-grid
+    float32 maps, 0 outside ``mask``.  Also used by the SHARP 360 shell back on its mould
+    grid, so a change here changes both."""
+    m = np.asarray(mask, dtype=bool)
+    dt = _dist(m)
+    dt_eff = np.maximum(dt - 1.0, 0.0)  # boundary pixels (dt ~ 1) are the silhouette itself
+    rloc = local_thickness(dt_eff, m)
+    prof = np.sqrt(np.maximum(dt_eff * (2.0 * rloc - dt_eff), 0.0))
+    prof[~m] = 0.0
+    return prof.astype(np.float32, copy=False), dt_eff.astype(np.float32, copy=False)
+
+
 def _edge_counts(faces: np.ndarray, n: int) -> np.ndarray:
     """Per face and edge (M x 3): how many faces use that edge."""
     e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
@@ -266,10 +284,8 @@ def billboard(
 
     # ---- inflation (algorithm I)
     rep(0.35, "Inflating")
-    dt = _dist(used_grid)
-    dt_eff = np.maximum(dt - 1.0, 0.0)  # boundary pixels (dt ~ 1) are the silhouette itself
-    rloc = local_thickness(dt_eff, used_grid)
-    prof = np.sqrt(np.maximum(dt_eff * (2.0 * rloc - dt_eff), 0.0))[rows, cols]
+    prof_map, dt_eff = inflation_profile(used_grid)
+    prof = prof_map[rows, cols]
     prof[bnd] = 0.0
     r_min, r_max = int(rows.min()), int(rows.max())
     if r_max <= r_min:
@@ -372,4 +388,4 @@ def billboard(
     return [front, back_mesh]
 
 
-__all__ = ["billboard", "local_thickness", "BACK_MODES"]
+__all__ = ["billboard", "inflation_profile", "local_thickness", "BACK_MODES"]

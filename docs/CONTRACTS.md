@@ -471,3 +471,161 @@ left = right = 0x40000000). JPEG gets GPano XMP. Filenames carry Quest tokens (`
   only describes it). `sphere` accepts `depth_near_m` / `depth_far_m`. The thumbnail is
   `thumb.jpg` and may be absent (`thumbnail: null` in `/api/scenes`). Asset names must be plain
   file names (no separators, no `..`).
+* **SHARP 360 (0.2.0-beta)** - details in section 13:
+  * `pipeline.run`: object method `sharp360` (`ADDON_METHODS["sharp360"] = ("sharp",
+    "image_to_splat")`, so a missing SHARP fails fast exactly like `sharp`); constants
+    `BACK_SOURCES = ("auto", "shell")`, `BACK_QUALITIES = ("fast", "balanced", "best")`,
+    `SIZE_FROM = ("auto", "height", "photo")`, `OBJECT_ENV`; helpers `_free_app_gpu()` (closes
+    the app's ONNX Runtime sessions before **every** add-on: at the start of each
+    `_run_addon` and of `_mode_capture` (COLMAP / Brush, which do not go through
+    `_run_addon`); later in-process Brush runs must call it too; failures only logged), `_sharp_inputs(run, item, photo) -> (image_path, params)` (shared by `sharp`
+    and `sharp360`; plain `sharp` is unchanged byte for byte) and `_save_cutout(...)`.
+  * `ObjectJob` fields `back_source="auto"`, `back_quality="balanced"`, `seam_deg=60.0`,
+    `size_from="auto"`, `save_extras=False`; `thickness` and `back` also apply to `sharp360`.
+  * `geometry.splat`: `transform_splats(sc, R, t, s=1.0)` (proper rotations only; rotates
+    quaternions and SH), `scale_splats(sc, k)`, `concat_splats(clouds)`, `subset_splats(sc, idx)`,
+    `fit_plane_ransac(pts, tol, *, seed=0, iters=256) -> (normal, offset, inlier_frac)` (plane
+    `normal . p == offset`, sign of the normal arbitrary).
+  * `geometry.billboard.inflation_profile(mask) -> (prof, dt_eff)` (`billboard()` unchanged).
+  * `addons.capture`: `brush_args(..., extra=())`, `write_colmap_text(dataset_dir, cams, points=None,
+    colors=None) -> Path` (`cams` = `(name, K, R, t[, (w, h)])`, world-to-camera OpenCV),
+    `train_splat(dataset, out_dir, *, steps, max_splats, extra_args=(), export_name="splat.ply",
+    seed=0, progress=None, cancel=None, timeout=None, log_name="brush.log", log_sink=None, cwd=None,
+    label=...) -> Path`, `brush_selftest(progress=None, cancel=None, *, work_dir=None) -> dict`
+    (`vrphoto-cli addons brush-test`; result kept in `Settings.brush_test`), `brush_test_verdict`.
+    The self-test stops at the first run that works: masks at `--sh-degree` 0, then 1; no masks
+    at 0, then 1; then Brush's defaults (no `--sh-degree`, no masks). `sh0` is True / False
+    (an SH-0 run failed and SH 1 worked with the same masks setting) / None (only the
+    defaults run worked); `sh_option` says whether Brush accepted `--sh-degree`.
+
+## 13. SHARP 360 (object method `sharp360`, 0.2.0-beta)
+
+Design and rationale: `docs/design/SHARP360.md`. This version ships the fusion core and the
+built-in `shell` back; TRELLIS, back photos, MV-Adapter, Qwen/ComfyUI, the CPU renderer,
+previews, Brush polish and the seed option arrive in later milestones behind the same
+interfaces.
+
+**Frames and grids.**
+
+* **C** - SHARP's camera frame: OpenCV axes, metres, camera at the origin. Continuous pixel
+  coordinates `u = f*X/Z + W/2`, `v = f*Y/Z + H/2` (`f = outs["f_px"]`, `W x H` = SHARP's
+  `width x height`); the pixel index is `floor(u)` (= `round(u - 0.5)` of `_subject_splats`).
+  `geometry.camera` puts pixel centres at integers: subtract 0.5 before its `project`/`unproject`.
+* **SHARP grid** `G x G` (anisotropic over the photo): `G = 768` when `N ~= L * 768**2`
+  (L in 1..3, within 2 %), else `round(sqrt(N / 2))` with 2 layers (logged). Used only for the
+  front z-buffer.
+* **Mould grid** `Hm x Wm` (isotropic, `splat_fusion.MouldGrid`): long side 512 / 768 / 1024
+  cells by `back_quality`; cell `k` covers photo pixels `[k*cell_px, (k+1)*cell_px)`, its centre
+  ray is `((u - W/2)/f, (v - H/2)/f, 1)`. Distance transforms, normals, the back height field and
+  back Gaussians live here.
+* **S** - upright subject frame (`Canon`): columns `R = [x^ y^ z^]` in C with `y^ = -up` (down),
+  `z^` = horizontal viewing direction, `x^ = y^ x z^`; `P_S = R.T @ (P_C - c)`, `c` on the
+  orbit axis at the bounding-box centre height.
+* **Azimuth** `phi`: direction of a viewing camera from the subject, 0 = the photo's camera,
+  90 = "you walked to your right", 180 = behind. `forward(phi) = cos(phi) z^ - sin(phi) x^`,
+  `right(phi) = cos(phi) x^ + sin(phi) z^`, `down = y^`; orthographic view with `m` metres per
+  pixel and size `N`: `u = (P_S - a).right/m + N/2`, `v = (P_S - a).y^/m + N/2`, `a` = orbit axis.
+* Depth tolerance `tau(z) = max(2 cm, 1 % z)` (`splat_fusion.depth_tol`).
+
+**Interfaces (all numpy / OpenCV, CPU, `progress=`/`cancel=` on the long ones).**
+
+```python
+# geometry/splat_fusion.py
+@dataclass(frozen=True) class SharpCam: f, width, height, n_raw=0, grid=768, layers=2
+    from_outputs(outs, params, *, n_raw, shape) -> SharpCam   # f_px, else params["hfov_deg"] (65)
+    project(P) -> (u, v, z); rays(u, v) -> ...x3 (z = 1); sharp_cell(u, v) -> flat cell | -1
+@dataclass(frozen=True) class MouldGrid: Wm, Hm, cell_px
+    for_photo(width, height, long_side); centers(); cell_of(u, v); resize(img, *, interpolation=None)
+@dataclass class FrontModel: sc (C), cam, grid, matte, ring, D_f, D_near, D_far, D_ext, A_f,
+    normals, cos_theta, dt, rgb, cell, theta_deg, rim, stats, src
+@dataclass class Canon: R, c, up_C, up_source, height_s, width_s, T_prior, z_axis, pitch_deg,
+    cut_top=False, cut_bottom=False, diag={}; to_S(P); to_C(P)
+def sharp_front(sc_full, alpha, cam, rgb=None, *, mould_long=768, progress=None, cancel=None) -> FrontModel
+def canonical_frame(front, sc_full, alpha, *, thickness=0.11) -> Canon
+# geometry/back_mould.py
+@dataclass class BackPart: sc (C, generated only), kind="mould"|"cloud", source, ok=True, reason="",
+    normals=None, back_z=None, hull=None, views=None, diag=None,     # diag["warning"]: for the user
+    spacing_m=None                                    # typical distance between its Gaussians (m)
+@dataclass class HullIntervals: z_in, z_out, valid
+def inflation_prior(front, canon, *, thickness) -> (Z_prior, T)
+def poisson_heightfield(target, mask, z_rim, *, weights=None, lam_rim=10, lam_target=0.01, iters=150,
+                        levels=3, anchor=None, lam_anchor=10, init=None, cancel=None) -> FloatMap
+def gaussians_from_heightfield(z, mask, front, colors, *, stride=1, opacity=0.95, cancel=None)
+    -> (SplatCloud, normals)
+def rim_wall(front, z_rim, *, colors_front, colors_back=None, spacing_cells=1.0, cancel=None) -> SplatCloud
+def mould_back(front, canon, target, *, colors, z_rim=None, clip=None, stride=1, weights=None,
+               source="mould", hull=None, progress=None, cancel=None) -> BackPart
+def shell_back(front, canon, *, thickness=0.11, back="diffuse", stride=1, clip=None,
+               progress=None, cancel=None) -> BackPart          # the built-in back source
+# geometry/splat_merge.py
+def seam_weights(cos_theta, seam_deg=60) -> weights   # smoothstep(cos(seam+10), cos(seam-10), cos)
+def merge_parts(front, part, *, seam_deg=60, seed=0, budget=750_000, cancel=None, progress=None)
+    -> (cloud, is_front, diag)                          # part None / ok=False -> the front alone
+def add_underlayer(sc, is_front, front, canon, part, *, thickness=None, cancel=None) -> (sc, is_front)
+def feather_colors(sc, is_front, *, radius_m=0.03, cancel=None) -> SplatCloud
+def voxel_components(P, voxel, *, cancel=None) -> labels   # 26-connected, -1 for non-finite rows
+def remove_floaters(sc, is_front, front, canon, *, hull=None, seam_deg=60, spacing_m=None, cancel=None,
+                    progress=None) -> (sc, is_front, diag)   # voxel = max(1.5 cm, 1.5 spacing_m)
+def to_life_size(sc, *, mode, height_m, cut=False) -> (sc, height, box, used_mode)   # glTF frame
+# pipeline/sharp360.py
+QUALITY: dict[str, Quality(mould_long, stride, auto)]; Opts; SOURCES: dict[str, fn(ctx, rep) -> BackPart]
+def resolve_options(spec, *, installed: Callable[[str], bool]) -> Opts   # InputError before any work;
+    # thickness clamped to THICKNESS_RANGE = (0.06, 0.18) (Opts.thickness_asked; the job warns)
+def run_sources(ctx, rep, attempts) -> BackPart | None                   # the fallback chain
+def mode_sharp360(run, item, photo, alpha, spec, *, placement, height, rep, opts=None) -> None
+```
+
+**Front guarantee.** A SHARP Gaussian that faces the photo camera at less than `seam_deg - 10`
+or lies in the protected outline band (`FrontModel.rim`) is output bit-identical (before the
+export transform) and is never recoloured or removed. The only exceptions: "card" Gaussians
+slid along their own ray (sizes rescaled, so they look the same from the photo's camera),
+removal of the hidden layer / background in `sharp_front`, the opacity < 0.04 prune of the final
+decimation, and a front that alone exceeds 80 % of the 750k budget (decimated, logged). The
+export's box crop never removes front rows.
+
+**Clean-up and merge details (authoritative where they differ from the design).**
+
+* `sharp_front`: a SHARP cell is "background seen through a gap" when it lies more than
+  `max(3 tau, 15 % of the subject's size)` behind its 5x5 median (size = longer side of the
+  matte's bounding box at the median front depth; the design's fixed 25 cm floor let a wall
+  close behind a small subject through). The fallback to the plain matte filter happens below
+  `max(500, 25 % of the SHARP-grid cells inside the matte)` kept Gaussians (1 % of SHARP's
+  two-layer whole-photo cloud made small full-body figures fall back). A collapsed card gets
+  the covariance `M Sigma M`, `M = k (I - r r^T) + c r r^T` (`k = D_near / z`, `r` the unit
+  ray, `c` so the extent along the ray is `1.5 k s2`), re-diagonalised: the photo-view
+  footprint is kept for cards tilted off their ray too (for a card on its ray this is the
+  design's `s1' = 1.5 s2'`, `s2, s3` times `k`).
+* `merge_parts`: for a `"mould"` part, generated Gaussians on the photographed surface whose
+  centre cell is in the protected outline band are not dithered (they are the rim wall and
+  outermost back cells closing the side; depth-map normals make that band look
+  camera-facing). `"cloud"` parts are dithered everywhere.
+* `remove_floaters`: the voxel edge is `max(1.5 cm, 1.5 * spacing_m)` with `spacing_m` from the
+  back part (`shell_back` / `mould_back`: `stride` mould cells at the back's median depth), so a
+  strided ("fast") back of a subject several metres away is not removed as isolated Gaussians;
+  "near the largest component" is `max(5 cm, 1 voxel)`.
+
+**Fallbacks.** SHARP is the only required add-on (a SHARP failure fails the job as for `sharp`).
+Back sources are tried in `Opts.sources` order (`auto` -> the quality's installed sources, then
+`shell`; an explicit source -> it, then `shell`); a missing, failing or unusable source is one
+plain warning naming what is used instead. `except Cancelled: raise` always comes first
+(`Cancelled` is a `VRPhotoError`). If even the shell fails, or stitching / exporting the back
+fails, the cleaned front is exported alone with a warning; if the front cannot be cleaned at
+all, plain SHARP's matte-filtered result is saved (no `scale`, fitted to `height_m` by the
+viewer). Once SHARP has succeeded only a cancel fails the job.
+
+**Export (design 3.12).** `run._splats_cv_to_gltf` -> `normalize_orientation(up=cv_to_gltf(canon.up_C))`
+(floor = P0.5, x/z centred on the median) -> `to_life_size` (`h = P99.8(y | opacity > 0.5)`;
+`height`: `k = height_m / h`; `photo`: `k = 1`; `auto`: height unless the matte touches the top
+or bottom border over > 15 % of the subject width, then photo with a warning) ->
+box crop of the generated rows (front rows are kept even outside the box) ->
+`decimate_splats(750k)` -> `write_splats`.
+
+**Outputs.** `<base>_cutout.png`, `<base>_sharp360.splat` (feet at y = 0, front facing +z,
+life-size); with `save_extras` also `<base>_sharp360.ply`, `_sharp360_front.splat` (the cleaned
+SHARP front alone), `_sharp360_back.splat` (the generated part alone; both in the main splat's
+frame and size) and `_sharp360_debug.json`. The debug data (options, camera, front stats,
+frame, source attempts, merge / floater counts, sizes, timings, warnings) is always written to
+the job's work folder and summarised in one log line. None of these names ends in a Quest
+player token. Scene block (always `scale: 1.0`):
+`{"asset": "object.splat", "format": "splat", "height_m": h, "scale": 1.0, "pivot": "base",
+"placement": ...}`.

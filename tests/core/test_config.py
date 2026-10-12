@@ -92,3 +92,53 @@ def test_settings_save_waits_out_a_brief_windows_lock(tmp_path, monkeypatch):
     assert calls["n"] == 3
     assert config.Settings.load(path).output_dir == str(tmp_path / "out")
     assert sorted(p.name for p in tmp_path.iterdir()) == ["settings.json"]
+
+
+# --------------------------------------------------------------------------- SHARP 360: brush_test
+def test_settings_round_trip_with_brush_test(tmp_path):
+    path = tmp_path / "settings.json"
+    s = config.Settings()
+    assert s.brush_test == {}  # never tested
+    s.save(path)
+    assert config.Settings.load(path).brush_test == {}
+    s.brush_test = {
+        "ok": True,
+        "sh0": False,
+        "masks": True,
+        "steps_per_s": 21.5,
+        "attempts": [{"sh_degree": 0}],
+    }
+    s.save(path)
+    loaded = config.Settings.load(path)
+    assert loaded.brush_test == s.brush_test
+    assert loaded.to_dict() == s.to_dict()
+
+
+def test_old_settings_without_brush_test_still_load(tmp_path):
+    import json
+
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"device": "cpu", "show_experimental": True, "retired_option": 3}), encoding="utf-8"
+    )
+    s = config.Settings.load(path)
+    assert s.device == "cpu" and s.show_experimental is True
+    assert s.brush_test == {}
+    other = config.Settings.load(path)
+    other.brush_test["ok"] = True  # each instance has its own dict
+    assert s.brush_test == {}
+
+
+def test_damaged_container_settings_fall_back_to_defaults(tmp_path):
+    import json
+
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps({"brush_test": "passed", "accepted_licenses": {"x": 1}, "gui_state": [], "theme": "dark"}),
+        encoding="utf-8",
+    )
+    s = config.Settings.load(path)
+    assert s.brush_test == {} and s.accepted_licenses == [] and s.gui_state == {}
+    assert s.theme == "dark"  # the good entries are kept
+    path.write_text("[1, 2, 3]", encoding="utf-8")  # valid JSON, but not an object
+    assert config.Settings.load(path).to_dict() == config.Settings().to_dict()

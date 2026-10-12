@@ -82,7 +82,7 @@ def fake_manager(monkeypatch):
 
 
 # --------------------------------------------------------------------------- object add-ons
-@pytest.mark.parametrize("method", ["trellis", "trellis2", "hunyuan", "sharp"])
+@pytest.mark.parametrize("method", ["trellis", "trellis2", "hunyuan", "sharp", "sharp360"])
 def test_object_addon_not_installed_fails_fast(make_job, gradient_photo, fake_manager, monkeypatch, method):
     from vrphoto.pipeline import context
 
@@ -371,6 +371,36 @@ def test_capture_with_fake_reconstruction(
     block = m["object" if as_object else "splat"]
     assert block["format"] == "splat"
     assert m.get("thumbnail") == "thumb.jpg"
+
+
+def test_capture_releases_the_app_models_first(make_job, gradient_photo, tmp_path, monkeypatch):
+    """COLMAP's GPU SIFT and Brush do not run through ``_run_addon``: the app's ONNX Runtime
+    sessions (a depth model from an earlier job in the GUI) must still be closed first."""
+    from vrphoto.addons import capture
+    from vrphoto.geometry.splat import write_splats
+    from vrphoto.models import ort
+
+    events: list[str] = []
+    monkeypatch.setattr(ort, "unload_model", lambda model_id=None, *, wait=True: events.append("unload"))
+
+    def fake_capture(inputs, out_dir_, *, name=None, progress=None, cancel=None, **kw):
+        events.append("capture")
+        sc = SplatCloud(
+            np.zeros((4, 3), np.float32),
+            np.full((4, 3), 0.02, np.float32),
+            np.tile([1, 0, 0, 0], (4, 1)).astype(np.float32),
+            np.zeros((4, 3), np.float32),
+            np.ones(4, np.float32),
+        )
+        return write_splats(sc, Path(out_dir_) / f"{name}.splat")
+
+    monkeypatch.setattr(capture, "capture_to_splat", fake_capture)
+    folder = tmp_path / "walk"
+    folder.mkdir()
+    for i in range(3):
+        (folder / f"img{i}.jpg").write_bytes(gradient_photo.read_bytes())
+    run_job(make_job("capture", [folder], common_extra={"export_scene": False}))
+    assert events[:2] == ["unload", "capture"]
 
 
 # --------------------------------------------------------------------------- GLB fitting

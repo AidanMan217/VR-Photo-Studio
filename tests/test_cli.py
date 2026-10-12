@@ -504,6 +504,87 @@ def test_addons_check_failure_exit_1(monkeypatch):
     assert code == 1 and "CUDA is not available" in err and "NVIDIA driver" in err
 
 
+def _brush_result(ok: bool) -> dict:
+    attempts = [{"sh_degree": 0, "masks": True, "ok": ok, "seconds": 9.5}]
+    if not ok:
+        attempts[0]["error"] = "Brush training failed (exit code 101)."
+    r = {
+        "ok": ok,
+        "sh0": ok,
+        "masks": ok,
+        "steps_per_s": 31.6 if ok else None,
+        "seconds": 9.5,
+        "splats": 2000 if ok else 0,
+        "steps": 300,
+        "brush_version": "0.3.0",
+        "attempts": attempts,
+        "date": "2026-10-12T10:00:00",
+        "log": "brush_test.log",
+    }
+    if not ok:
+        r["error"] = "Brush training failed (exit code 101)."
+    return r
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_addons_brush_test_exit_codes(monkeypatch, ok):
+    """``addons brush-test``: plain verdict, exit 0 on pass / 1 on fail, result remembered."""
+    from vrphoto.addons import capture
+    from vrphoto.core.config import Settings, get_settings
+
+    seen = {}
+
+    def fake_selftest(progress=None, cancel=None):
+        seen["called"] = progress is not None and cancel is not None
+        progress(0.5, "Testing Brush (step 150/300)")
+        return _brush_result(ok)
+
+    monkeypatch.setattr(capture, "brush_selftest", fake_selftest)
+    code, out, err = run_cli(["addons", "brush-test"])
+    assert code == (0 if ok else 1), err
+    assert seen["called"]
+    assert ("Brush works on this PC" in out) is ok and ("could not train" in out) is (not ok)
+    assert "Brush version: 0.3.0" in out and "SH degree 0, with masks" in out
+    assert get_settings().brush_test["ok"] is ok
+    assert Settings.load().brush_test == _brush_result(ok)  # saved to settings.json
+    code, out, _ = run_cli(["addons", "brush-test", "--json"])
+    assert code == (0 if ok else 1)
+    last = json_lines(out)[-1]
+    assert last["type"] == "result" and last["ok"] is ok and last["steps_per_s"] == (31.6 if ok else None)
+
+
+def test_addons_brush_test_with_the_fake_brush(monkeypatch):
+    """End to end through capture.brush_selftest with the fake Brush (no GPU)."""
+    pytest.importorskip("vrphoto.geometry.splat")
+    fakes = Path(__file__).parent / "addons" / "fakes"
+    monkeypatch.setenv("VRPHOTO_BRUSH", str(fakes / "fake_brush.py"))
+    for k in (
+        "FAKE_TOOL_LOG",
+        "FAKE_BRUSH_FAIL",
+        "FAKE_BRUSH_SLEEP",
+        "FAKE_BRUSH_PLY",
+        "FAKE_BRUSH_ECHO_INIT",
+    ):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("FAKE_BRUSH_FAIL_SH0", "1")
+    code, out, err = run_cli(["addons", "brush-test"])
+    assert code == 0, err
+    assert "Brush works on this PC" in out and "SH degree 1" in out
+    monkeypatch.setenv("FAKE_BRUSH_FAIL", "1")
+    code, out, _ = run_cli(["addons", "brush-test"])
+    assert code == 1 and "could not train" in out
+    assert "Brush's defaults, without masks: failed" in out  # the last try leaves --sh-degree out
+
+
+def test_addons_brush_test_without_brush(monkeypatch):
+    from vrphoto.addons import manager
+
+    monkeypatch.delenv("VRPHOTO_BRUSH", raising=False)
+    monkeypatch.setattr(manager.shutil, "which", lambda name: None)
+    code, _, err = run_cli(["addons", "brush-test"])
+    assert code == 1 and "brush was not found" in err and "Capture" in err  # with the install hint
+
+
 # --------------------------------------------------------------------------- misc commands
 def test_devices_and_version():
     code, out, _ = run_cli(["devices", "--json", "--no-encoders"])
@@ -581,6 +662,58 @@ def test_choices_follow_the_runner():
     assert t[("object", "back")] == R.BACKS
     ns = cli.build_parser().parse_args(["video", "clip.mp4", "--output", "half_tb"])
     assert ns.job__output == "half_tb"
+    assert t[("object", "back_source")] == R.BACK_SOURCES
+    assert t[("object", "back_quality")] == R.BACK_QUALITIES
+    assert t[("object", "size_from")] == R.SIZE_FROM
+    assert "sharp360" in t[("object", "method")]
+
+
+def test_sharp360_options_parse(tmp_path):
+    """docs/design/SHARP360.md §1.6: the SHARP 360 flags reach the ObjectJob (no job is run)."""
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    args = ["object", str(tmp_path / "x.jpg"), "--method", "sharp360", "--back-source", "shell"]
+    args += ["--back-quality", "best", "--seam-deg", "55", "--size-from", "photo", "--save-extras"]
+    spec = cli.spec_from_namespace("object", cli.build_parser().parse_args(args))
+    assert isinstance(spec, ObjectJob)
+    assert (spec.method, spec.back_source, spec.back_quality, spec.size_from) == (
+        "sharp360",
+        "shell",
+        "best",
+        "photo",
+    )
+    assert spec.seam_deg == 55.0 and spec.save_extras is True
+    assert spec.inputs == [str(tmp_path / "x.jpg")]
+    # the first §1.6 example: everything else keeps the job defaults
+    spec = cli.spec_from_namespace(
+        "object", cli.build_parser().parse_args(["object", "me.jpg", "--method", "sharp360"])
+    )
+    assert job_to_dict(spec) == job_to_dict(ObjectJob(inputs=[os.path.abspath("me.jpg")], method="sharp360"))
+    spec = cli.spec_from_namespace(
+        "object",
+        cli.build_parser().parse_args(["object", "me.jpg", "--method", "sharp360", "--no-save-extras"]),
+    )
+    assert spec.save_extras is False
+
+
+def test_sharp360_dry_run_prints_the_job(tmp_path):
+    code, out, err = run_cli(
+        ["object", tmp_path / "x.jpg", "--method", "sharp360", "--back-quality", "fast", "--dry-run"]
+    )
+    assert code == 0, err
+    d = json.loads(out)
+    assert d["method"] == "sharp360" and d["back_quality"] == "fast" and d["back_source"] == "auto"
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [("--back-source", "mvadapter"), ("--back-quality", "ultra"), ("--size-from", "guess")],
+)
+def test_sharp360_bad_choices_are_rejected(flag, value):
+    code, _, err = run_cli(["object", "x.jpg", "--method", "sharp360", flag, value])
+    assert code == 2 and "invalid choice" in err and value in err
+    code, _, err = run_cli(["object", "x.jpg", "--seam-deg", "steep"])
+    assert code == 2
 
 
 def test_main_without_stdout_does_not_crash(monkeypatch, isolated_home):

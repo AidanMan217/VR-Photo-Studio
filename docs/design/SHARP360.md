@@ -342,7 +342,7 @@ vrphoto-cli object front.jpg --method sharp360 --back-source images --back-image
   `u = (P_S − a)·right/m + N/2`, `v = (P_S − a)·ŷ/m + N/2`, where `a = (x0, y0, z_axis)` is the orbit axis and projects to the image centre.
 
 ### 3.1 SHARP
-1. Free the app's GPU memory: `_free_app_gpu()`, which is `ort.unload_model(wait=True)` wrapped in try/log. It is placed inside `_run_addon`, so it runs before every add-on, and also before Brush.
+1. Free the app's GPU memory: `_free_app_gpu()`, which is `ort.unload_model(wait=True)` wrapped in try/log. It is placed inside `_run_addon`, so it runs before every add-on, and also before Brush (the Capture mode calls it itself: its COLMAP and Brush do not go through `_run_addon`).
 2. Factor `run.py` 1713-1720 into `_sharp_inputs(run, item, photo) -> (image_path, params)`, shared with `sharp`.
 3. `outs = _run_addon(run, item, "sharp", "image_to_splat", …)`, then `sc_full = read_splats(outs["ply"])`.
 4. A SHARP failure fails the job, as today.
@@ -371,11 +371,12 @@ vrphoto-cli object front.jpg --method sharp360 --back-source images --back-image
 5. **Ring Gaussians.** Keep a ring Gaussian iff `|z − D_ext| ≤ 3τ` (hair wisps and soft edges at subject depth). This keeps plain SHARP's outline but drops background.
 6. **Collapse cards.** Slide each card along its own ray onto `D_near(cell)` (or `D_ext` in the ring): `μ' = μ·D_near/μ_z`.
    - Set `s1' = 1.5·s2`, and multiply `s2, s3` by `D_near/μ_z`, so the angular footprint and the original-view look are unchanged.
+   - *Implemented as a covariance collapse* (review of 0.2.0-beta): `Σ' = M Σ M`, `M = k(I − r̂r̂ᵀ) + c·r̂r̂ᵀ` with `k = D_near/μ_z` and `c` making the extent along the ray `1.5·k·s2`, then re-diagonalised. It equals the rule above for a card lying on its ray and also keeps the footprint of a card tilted up to 37° off it (the rule above loses the across-ray part of `s1`).
 7. **Mould-grid maps.** Compute `D_f_m`, `D_ext_m`, the matte, the boundary ring and `dt`.
    - Normals `n_f`: unproject the 4-neighbours, take the cross product, orient toward the camera.
    - `cosθ = n_f·(−r̂)`.
    - Per Gaussian: `θ` from its mould cell, and `rim = dist_to_matte_boundary ≤ max(2 cells, 0.4 % of the long side)`. The outline band is **protected**.
-8. **Fallback.** If fewer than max(500, 1 %) Gaussians remain, use the `_subject_splats` result as F (with the same maps from its z-buffer) and warn.
+8. **Fallback.** If fewer than max(500, 25 % of the SHARP-grid cells inside the matte) Gaussians remain, use the `_subject_splats` result as F (with the same maps from its z-buffer) and warn. (The first version used 1 % of all Gaussians; the clean-up keeps about one per subject cell, so small full-body figures fell back.)
 9. **Stats** go to `debug.json`: kept, hidden dropped, cards collapsed, wisps kept, detected G, and `N_raw` vs L·768².
 
 ### 3.3 Canonical frame: `canonical_frame(front, sc_full, alpha, *, thickness) -> Canon`
@@ -589,6 +590,7 @@ BackPart(sc: SplatCloud (C frame, generated only), kind: "mould"|"cloud", source
   - if `|z − D_f| ≤ τ` (on the photographed surface), keep with probability `1 − w_s(θ_cell)`;
   - else keep (hidden).
 - Dithering keeps about one layer. Cross-fading opacities would not: two 0.95 layers at 50 % each give about 0.72.
+- **Mould parts:** generated Gaussians on the surface whose centre cell lies in the protected outline band are kept (not dithered). They are the rim wall and outermost back cells that close the side; F is protected there anyway, and depth-map normals make the band look camera-facing although it is grazing.
 - **Budget.** Decimate the **generated** part first to `750k − |F| − 5k` (`decimate_splats`). Only if `|F| > 600k` is F decimated (logged).
 
 ### 3.8 Closure under-layer (`cloud` sources, i.e. TRELLIS)
@@ -612,6 +614,7 @@ BackPart(sc: SplatCloud (C frame, generated only), kind: "mould"|"cloud", source
   - Edges via `searchsorted` over sorted int64 voxel keys for 13 offsets.
   - Labels by `np.minimum.at` propagation plus pointer jumping (`lab = lab[lab]`).
   - Keep components with ≥ 1 % of the opacity mass or within 5 cm of the largest.
+- **Voxel size:** `max(1.5 cm, 1.5 × the back's Gaussian spacing)` (`BackPart.spacing_m`). A strided "fast" back several metres away is sampled more coarsely than 1.5 cm and would otherwise fall apart into "isolated" Gaussians and small components.
 
 ### 3.11 Brush polish (M5; view-based sources; `capture.train_splat`)
 **Dataset** in `work/brush_ds`, world frame = C:
@@ -654,7 +657,7 @@ brush_args(ds, out, steps=N, max_splats=clamp(1.3·n_init, 300k, 2.5M), export_n
    - `auto`: height, unless `cut_top` or `cut_bottom`, then photo with a warning.
    - Scale means and scales by `k` (new `splat.scale_splats`).
    - Return the box: x, z ∈ [P0.2 − 3 cm, P99.8 + 3 cm], y ∈ [−2 cm, h' + 3 cm].
-4. `crop_splats(sc, radius_pct=None, aabb=box)`.
+4. Box crop of the generated rows only (`front` rows are kept even outside the box, so thin protected parts such as a cane or a pointing hand are never cut).
 5. `decimate_splats(max_n=750k)`.
 6. `write_splats`.
 7. Block with `scale: 1.0` and `height_m = h'`.

@@ -611,20 +611,27 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             "Method",
             "Billboard is instant and needs no add-on: a cut-out with a rounded 3D shape that looks "
             "great from the front and sides. TRELLIS builds a full 3D model including the back "
-            "(add-on, NVIDIA GPU). SHARP, TRELLIS.2 and Hunyuan3D are experimental add-ons "
-            "(shown when experimental features are on in Settings).",
+            "(add-on, NVIDIA GPU). SHARP, SHARP 360°, TRELLIS.2 and Hunyuan3D are experimental "
+            "add-ons (shown when experimental features are on in Settings). SHARP 360° keeps "
+            "SHARP's photo-real front and adds a back, so you can walk all the way round; in this "
+            "version the back is a smooth built-in shape (it uses the SHARP add-on, nothing else "
+            "to download).",
             "combo",
             choices=(
                 ("billboard", "Billboard (instant, no add-on)"),
                 ("trellis", "TRELLIS - full 3D model (add-on)"),
                 ("sharp", "SHARP - fast AI splat (experimental add-on)"),
+                ("sharp360", "SHARP 360° - photo front + AI back (experimental add-on)"),
                 ("trellis2", "TRELLIS.2 (experimental add-on)"),
                 ("hunyuan", "Hunyuan3D (experimental add-on)"),
             ),
-            experimental_choices=frozenset({"sharp", "trellis2", "hunyuan"}),
+            experimental_choices=frozenset({"sharp", "sharp360", "trellis2", "hunyuan"}),
             addon_choices={
                 "trellis": ("trellis",),
                 "sharp": ("sharp",),
+                # the back sources are optional (the job falls back to the built-in back), so
+                # SHARP is the only add-on SHARP 360 needs
+                "sharp360": ("sharp",),
                 "trellis2": ("trellis2",),
                 "hunyuan": ("hunyuan",),
             },
@@ -641,22 +648,25 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         ),
         "thickness": FieldMeta(
             "Thickness",
-            "Billboard only: how deep the rounded shape is, as a fraction of the height.",
+            "Billboard and SHARP 360° built-in back: how deep the rounded shape is, as a fraction "
+            "of the height (0.11 suits an adult seen from the front). SHARP 360° makes a life-size "
+            "back and keeps this within 0.06-0.18 (the presets set it for Billboard).",
             "slider",
             minimum=0.05,
             maximum=0.5,
             step=0.01,
             decimals=2,
-            enabled_if=("method", ("billboard",)),
+            enabled_if=("method", ("billboard", "sharp360")),
         ),
         "back": FieldMeta(
             "Back side",
-            "Billboard only: what the back looks like - soft colours taken from the outline "
-            "(subtle), or a mirror image of the front.",
+            "Billboard and SHARP 360° built-in back: what the back looks like - soft colours "
+            "taken from the outline (subtle), or a mirror image of the front. Careful: the mirror "
+            "copies the front, so a person gets their face on the back of their head.",
             "combo",
             choices=(("diffuse", "Soft colours from the outline"), ("mirror", "Mirror of the front")),
             advanced=True,
-            enabled_if=("method", ("billboard",)),
+            enabled_if=("method", ("billboard", "sharp360")),
         ),
         "export_splat": FieldMeta(
             "Also save splat",
@@ -673,7 +683,7 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         "seed": FieldMeta(
             "Variation",
             "TRELLIS, TRELLIS.2 and Hunyuan3D only: change this number to get a different version "
-            "of the 3D model. (SHARP always gives the same result for the same photo.)",
+            "of the 3D model. (SHARP and SHARP 360° always give the same result for the same photo.)",
             "spin",
             minimum=0,
             maximum=999999,
@@ -693,6 +703,63 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             # form this would be a checkbox that is almost always greyed out
             advanced=True,
             enabled_if=("method", ("hunyuan",)),
+        ),
+        # ---- SHARP 360 (docs/design/SHARP360.md §1.2; this version ships the built-in back only)
+        "back_source": FieldMeta(
+            "Back made by",
+            "SHARP 360° only: what makes the side of the person or object the photo could not "
+            "see. 'Built-in shape' needs no download and takes seconds: a smooth, rounded back in "
+            "the colours around the outline - it looks like the person from behind in soft focus, "
+            "with no clothing or hair detail, and is always closed and life-size. 'Automatic' "
+            "picks the best back that is installed; in this version that is always the built-in "
+            "shape (AI-made backs follow in later versions).",
+            "combo",
+            choices=(("auto", "Automatic"), ("shell", "Built-in shape (no download)")),
+            enabled_if=("method", ("sharp360",)),
+        ),
+        "back_quality": FieldMeta(
+            "Back quality",
+            "SHARP 360° only: how much care goes into the back. 'Fast' builds a coarser back and "
+            "finishes quickest; 'Balanced' is recommended; 'Best' builds the finest back surface "
+            "and takes longer. The photographed front looks the same with all three.",
+            "combo",
+            choices=(("fast", "Fast"), ("balanced", "Balanced"), ("best", "Best (slower)")),
+            enabled_if=("method", ("sharp360",)),
+        ),
+        "seam_deg": FieldMeta(
+            "Keep the photo up to",
+            "SHARP 360° only: where the photo ends and the made-up back begins. SHARP's photo "
+            "front is kept wherever the surface faces the camera within this angle, and the two "
+            "are blended over the next 10-20°. Higher keeps more of the sharp photo on the sides "
+            "but can show stretched edges; lower hides edge smears but uses more of the softer "
+            "back. 60° suits most photos.",
+            "slider",
+            minimum=35,
+            maximum=80,
+            step=5,
+            unit="°",
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+        ),
+        "size_from": FieldMeta(
+            "Size from",
+            "SHARP 360° only: how the life size is set. 'Real-world height' makes the subject "
+            "exactly the height entered above. 'Measured by SHARP' uses SHARP's own estimate from "
+            "the photo (handy for half-body photos). 'Automatic' uses the height you entered, "
+            "unless the subject is cut off by the edge of the photo - then SHARP's measurement.",
+            "combo",
+            choices=(("auto", "Automatic"), ("height", "Real-world height"), ("photo", "Measured by SHARP")),
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+        ),
+        "save_extras": FieldMeta(
+            "Also save parts and debug data",
+            "SHARP 360° only: also save the cleaned photo front and the made-up back as separate "
+            "splats, a .ply copy and a debug file - useful for comparing or for reporting a "
+            "problem. Off keeps the output folder tidy.",
+            "check",
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
         ),
     },
     "capture": {
@@ -966,9 +1033,15 @@ PRESETS: dict[str, dict[str, dict[str, Any]]] = {
         },
     },
     "object": {
-        "Comfortable": {"thickness": 0.08},
-        "Strong 3D": {"thickness": 0.24},
-        "Max quality": {"common.segment_model": "birefnet-portrait", "export_splat": True},
+        # back_quality only matters for SHARP 360 (greyed out for the other methods); the
+        # thickness values are for Billboard - SHARP 360 clamps them to a life-size body
+        "Comfortable": {"thickness": 0.08, "back_quality": "fast"},
+        "Strong 3D": {"thickness": 0.24, "back_quality": "balanced"},
+        "Max quality": {
+            "common.segment_model": "birefnet-portrait",
+            "export_splat": True,
+            "back_quality": "best",
+        },
     },
     "capture": {
         "Comfortable": {"steps": 7000, "max_splats": 500_000},

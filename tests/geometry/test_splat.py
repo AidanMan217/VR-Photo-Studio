@@ -3,6 +3,7 @@ orientation and mesh sampling."""
 
 from __future__ import annotations
 
+import math
 import struct
 import time
 
@@ -704,3 +705,157 @@ def test_write_splats_waits_out_a_briefly_locked_file(tmp_path, monkeypatch, ext
     monkeypatch.undo()
     assert len(calls) == 3 and len(read_splats(p)) == 50
     assert [q.name for q in tmp_path.iterdir()] == [f"a.{ext}"]
+
+
+# --------------------------------------------------------------------------- SHARP 360 helpers
+def test_transform_splats_is_a_similarity_with_rotated_orientation_and_sh():
+    sc = random_cloud(300, sh=15, seed=4)
+    R = _rot([0.3, -0.5, 0.8], 70)
+    t = np.array([0.5, -1.0, 2.0])
+    out = S.transform_splats(sc, R, t, 1.7)
+    assert all(a.dtype == np.float32 for a in (out.means, out.scales, out.quats, out.colors, out.opacity))
+    np.testing.assert_allclose(out.means, 1.7 * sc.means.astype(np.float64) @ R.T + t, atol=2e-6)
+    np.testing.assert_allclose(out.scales, 1.7 * sc.scales, rtol=1e-6)
+    np.testing.assert_allclose(np.linalg.norm(out.quats, axis=1), 1.0, atol=1e-6)
+    # covariances: Sigma' = s^2 R Sigma R^T
+    np.testing.assert_allclose(
+        S.splat_covariances(out), 1.7**2 * R @ S.splat_covariances(sc) @ R.T, atol=1e-9, rtol=1e-5
+    )
+    np.testing.assert_array_equal(out.colors, sc.colors)
+    np.testing.assert_array_equal(out.opacity, sc.opacity)
+    # view-dependent colour follows the rotation: f'(R d) = f(d)
+    d = S._fibonacci_sphere(40)
+    before = np.einsum("mk,kc->mc", S._sh_basis(d, 15), sc.sh_rest[3].astype(np.float64))
+    after = np.einsum("mk,kc->mc", S._sh_basis(d @ R.T, 15), out.sh_rest[3].astype(np.float64))
+    np.testing.assert_allclose(after, before, atol=1e-5)
+    # composition: T2(T1(x)) == T(R2 R1, s2 R2 t1 + t2, s1 s2)
+    R2, t2 = _rot([1, 0, 0], -25), np.array([0.0, 0.3, -0.2])
+    two = S.transform_splats(out, R2, t2, 0.5)
+    one = S.transform_splats(sc, R2 @ R, 0.5 * R2 @ t + t2, 0.85)
+    np.testing.assert_allclose(two.means, one.means, atol=1e-5)
+    assert _quat_close(two.quats.astype(np.float64), one.quats.astype(np.float64)).max() < 1e-5
+
+
+def test_transform_splats_identity_keeps_sh_and_bad_sh_is_dropped(caplog):
+    sc = random_cloud(50, sh=3)
+    same = S.transform_splats(sc, np.eye(3), np.zeros(3))
+    assert same.sh_rest is sc.sh_rest
+    np.testing.assert_allclose(same.means, sc.means)
+    odd = random_cloud(50, sh=5)  # not a complete set of SH bands
+    with caplog.at_level("WARNING"):
+        out = S.transform_splats(odd, _rot([0, 1, 0], 30), np.zeros(3))
+    assert out.sh_rest is None and "SH" in caplog.text
+    plain = S.transform_splats(random_cloud(5), _rot([0, 1, 0], 30), [0, 0, 1], 2.0)
+    assert plain.sh_rest is None
+    empty = S.transform_splats(random_cloud(0), _rot([0, 0, 1], 10), np.ones(3))
+    assert len(empty) == 0
+
+
+@pytest.mark.parametrize(
+    "R, t, s",
+    [
+        (np.diag([1.0, 1.0, -1.0]), np.zeros(3), 1.0),  # reflection
+        (np.eye(3) * 2.0, np.zeros(3), 1.0),  # not orthonormal
+        (np.eye(2), np.zeros(3), 1.0),
+        (np.full((3, 3), np.nan), np.zeros(3), 1.0),
+        (np.eye(3), np.zeros(2), 1.0),
+        (np.eye(3), [0.0, np.inf, 0.0], 1.0),
+        (np.eye(3), np.zeros(3), 0.0),
+        (np.eye(3), np.zeros(3), -1.0),
+        (np.eye(3), np.zeros(3), float("nan")),
+    ],
+)
+def test_transform_splats_rejects_bad_arguments(R, t, s):
+    with pytest.raises(InputError):
+        S.transform_splats(random_cloud(10), R, t, s)
+
+
+def test_scale_splats():
+    sc = random_cloud(100, sh=3)
+    out = S.scale_splats(sc, 0.25)
+    np.testing.assert_allclose(out.means, 0.25 * sc.means, rtol=1e-6)
+    np.testing.assert_allclose(out.scales, 0.25 * sc.scales, rtol=1e-6)
+    np.testing.assert_array_equal(out.quats, sc.quats)
+    assert out.sh_rest is sc.sh_rest and out.means.dtype == np.float32
+    for bad in (0, -2.0, float("inf"), "x"):
+        with pytest.raises(InputError):
+            S.scale_splats(sc, bad)
+
+
+def test_concat_splats_keeps_order_and_sh_only_when_consistent(caplog):
+    a, b, c = random_cloud(10, sh=8, seed=1), random_cloud(5, sh=8, seed=2), random_cloud(7, seed=3)
+    ab = S.concat_splats([a, b])
+    assert len(ab) == 15 and ab.sh_rest.shape == (15, 8, 3)
+    np.testing.assert_array_equal(ab.means[:10], a.means)
+    np.testing.assert_array_equal(ab.opacity[10:], b.opacity)
+    np.testing.assert_array_equal(ab.sh_rest[10:], b.sh_rest)
+    with caplog.at_level("INFO"):
+        abc = S.concat_splats([a, b, c])
+    assert len(abc) == 22 and abc.sh_rest is None and "SH" in caplog.text
+    assert S.concat_splats([a, random_cloud(4, sh=3)]).sh_rest is None  # different K
+    # an empty cloud without SH does not force the SH of the others to be dropped
+    assert S.concat_splats([a, random_cloud(0), b]).sh_rest.shape == (15, 8, 3)
+    one = S.concat_splats(x for x in [c])
+    np.testing.assert_array_equal(one.quats, c.quats)
+    f64 = SplatCloud(*(np.asarray(x, np.float64) for x in (c.means, c.scales, c.quats, c.colors, c.opacity)))
+    out = S.concat_splats([f64, c])
+    assert all(x.dtype == np.float32 for x in (out.means, out.scales, out.quats, out.colors, out.opacity))
+    with pytest.raises(InputError):
+        S.concat_splats([])
+    with pytest.raises(InputError):
+        S.concat_splats([a, SplatCloud(a.means, a.scales[:3], a.quats, a.colors, a.opacity)])
+
+
+def test_subset_splats_by_index_and_mask():
+    sc = random_cloud(20, sh=3)
+    out = S.subset_splats(sc, [5, 1, 1])
+    np.testing.assert_array_equal(out.means, sc.means[[5, 1, 1]])
+    np.testing.assert_array_equal(out.sh_rest, sc.sh_rest[[5, 1, 1]])
+    mask = np.zeros(20, bool)
+    mask[[2, 7]] = True
+    np.testing.assert_array_equal(S.subset_splats(sc, mask).colors, sc.colors[[2, 7]])
+    assert len(S.subset_splats(sc, [])) == 0 and S.subset_splats(sc, np.array([], int)).means.shape == (0, 3)
+    with pytest.raises(InputError):
+        S.subset_splats(sc, np.ones(5, bool))
+    with pytest.raises(InputError):
+        S.subset_splats(sc, [0.5, 1.5])
+
+
+def _noisy_plane(n: int, normal, offset: float, outliers: float, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    nrm = np.asarray(normal, float) / np.linalg.norm(normal)
+    a = np.cross(nrm, [1.0, 0.0, 0.0] if abs(nrm[0]) < 0.9 else [0.0, 1.0, 0.0])
+    a /= np.linalg.norm(a)
+    b = np.cross(nrm, a)
+    uv = rng.uniform(-2, 2, (n, 2))
+    p = offset * nrm + uv[:, :1] * a + uv[:, 1:] * b + rng.normal(0, 0.002, (n, 1)) * nrm
+    k = int(outliers * n)
+    p[:k] = rng.uniform(-2, 2, (k, 3))
+    return p
+
+
+def test_fit_plane_ransac_recovers_a_noisy_plane(monkeypatch):
+    nrm = np.array([0.1, -0.95, 0.2])
+    nrm /= np.linalg.norm(nrm)
+    pts = _noisy_plane(4000, nrm, 1.3, 0.3)
+    normal, offset, frac = S.fit_plane_ransac(pts, 0.01)
+    if normal @ nrm < 0:
+        normal, offset = -normal, -offset
+    assert math.degrees(math.acos(min(1.0, normal @ nrm))) < 0.3
+    assert offset == pytest.approx(1.3, abs=0.003) and frac == pytest.approx(0.7, abs=0.03)
+    again = S.fit_plane_ransac(pts, 0.01)
+    np.testing.assert_array_equal(again[0], S.fit_plane_ransac(pts, 0.01, seed=0)[0])
+    # non-finite rows are ignored, too few points give the documented default
+    bad = np.vstack([pts, [[np.nan, 0, 0]]])
+    assert S.fit_plane_ransac(bad, 0.01, iters=64)[2] > 0.6
+    n0, o0, f0 = S.fit_plane_ransac(pts[:2], 0.01)
+    assert n0.tolist() == [0.0, 1.0, 0.0] and o0 == 0.0 and f0 == 0.0
+    # big inputs are counted in blocks with the same result
+    monkeypatch.setattr(S, "_RANSAC_CHUNK", 1000)
+    chunked = S.fit_plane_ransac(pts, 0.01)
+    np.testing.assert_allclose(chunked[0], normal if normal @ again[0] > 0 else -normal, atol=1e-12)
+    for args in ((pts, 0.0), (pts, -1.0), (pts[:, :2], 0.01)):
+        with pytest.raises(InputError):
+            S.fit_plane_ransac(*args)
+    with pytest.raises(InputError):
+        S.fit_plane_ransac(pts, 0.01, iters=0)

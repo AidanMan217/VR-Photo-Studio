@@ -202,19 +202,63 @@ floor (Quest 3 passthrough) and walk around.
 
 | Option | What it does | Recommended |
 |---|---|---|
-| Method | *Billboard* (instant, no add-on: a cut-out with a rounded 3D shape - looks great from the front and the sides, the back is approximated), *TRELLIS* (add-on: AI builds a full 3D model including the back), *SHARP* (experimental add-on: fast AI splat), *TRELLIS.2* / *Hunyuan3D* (experimental add-ons) | Billboard to start; TRELLIS for full 3D |
+| Method | *Billboard* (instant, no add-on: a cut-out with a rounded 3D shape - looks great from the front and the sides, the back is approximated), *TRELLIS* (add-on: AI builds a full 3D model including the back), *SHARP* (experimental add-on: fast AI splat, front only), *SHARP 360°* (experimental, uses the SHARP add-on: SHARP's photo-real front plus a back, see [below](#sharp-360-experimental)), *TRELLIS.2* / *Hunyuan3D* (experimental add-ons) | Billboard to start; TRELLIS for full 3D |
 | Real-world height | Height so it appears life-size: a person's height, or the object's size. | 1.70 m for adults |
-| Thickness | (Billboard) how deep the shape is, as a fraction of the height. | 0.11 |
+| Thickness | (Billboard and SHARP 360°) how deep the shape is, as a fraction of the height. | 0.11 |
 | Also save splat | Also saves a splat version for the viewer. | On |
 | Placement | *Point at the floor* (you aim at your floor or table and press the trigger), or *In front of me* (appears on the floor 1.5 m ahead). | Point at the floor |
-| Back side *(Advanced)* | (Billboard) *Soft colours from the outline* (subtle), or *Mirror of the front*. | Soft colours |
-| Variation *(Advanced)* | For TRELLIS, TRELLIS.2 and Hunyuan3D: change the number to get a different version. (SHARP always gives the same result for the same photo.) | 0 |
+| Back side *(Advanced)* | (Billboard and SHARP 360°) *Soft colours from the outline* (subtle), or *Mirror of the front* (careful: a person gets their face on the back of their head). | Soft colours |
+| Variation *(Advanced)* | For TRELLIS, TRELLIS.2 and Hunyuan3D: change the number to get a different version. (SHARP and SHARP 360° always give the same result for the same photo.) | 0 |
 | Paint texture *(Advanced)* | (Hunyuan3D) also paints colours onto the model; without it you get a plain grey shape. Slower, needs more graphics memory, and downloads the painting models (about 8 GB) on the first textured run. Needs the add-on's optional texture-painting part (see [section 8](#8-add-ons)). | Off; on for colour |
 
 **Good photos:** the whole person/object visible (feet included), not cut off at the edges,
 clearly separated from the background, even light.
 
 **Output:** an object in the viewer library (+ `.glb` / `.ply` / `.splat` files).
+
+#### SHARP 360° (experimental)
+
+Plain *SHARP* turns your photo into a photo-real splat, but only of what the camera saw: walk
+to the side and the person ends in smears, and from behind there is nothing. *SHARP 360°* keeps
+SHARP's front exactly as it is, cleans off the smears at the edges and the bits of wall SHARP
+puts behind the person, **adds a back**, and makes the result life-size, so in the Quest the
+person stands on your floor and you can walk all the way round.
+
+It needs only the **SHARP** add-on (see [section 8](#8-add-ons)); turn on *Show experimental
+features* in Settings to see the method. In this version the back is always the **built-in
+shape**: the outline "inflated" into a smooth, rounded back, in the colours from around the
+person's outline. AI-made backs (TRELLIS, your own back photo, MV-Adapter) follow in later
+versions.
+
+| Option | What it does | Recommended |
+|---|---|---|
+| Back made by | *Built-in shape* (no download, seconds). *Automatic* picks the best back that is installed - in this version always the built-in shape. | Automatic |
+| Back quality | *Fast* builds a coarser back; *Balanced*; *Best* builds the finest back surface. The photographed front is the same with all three. | Balanced |
+| Thickness, Back side | As for Billboard: how deep the back is, and its colours. SHARP 360° keeps *Thickness* within 0.06-0.18, because its back is life-size (the presets set *Thickness* for Billboard; a note says when it was changed). | 0.11, soft colours |
+| Keep the photo up to *(Advanced)* | Where SHARP's photo ends and the made-up back begins: the photo is kept wherever the body faces the camera within this angle and blended into the back over the next 10-20°. Higher keeps more of the sharp photo on the sides but can show stretched edges. | 60° |
+| Size from *(Advanced)* | *Real-world height*: exactly the height you entered. *Measured by SHARP*: SHARP's own estimate from the photo (handy for half-body photos). *Automatic*: your height, unless the subject is cut off by the edge of the photo - then SHARP's measurement (with a note). | Automatic |
+| Also save parts and debug data *(Advanced)* | Also saves `<name>_sharp360.ply`, the cleaned photo front and the back as separate splats (`_sharp360_front.splat`, `_sharp360_back.splat`, handy for comparing) and `_sharp360_debug.json` (useful when reporting a problem). | Off |
+
+**What to expect:**
+
+* **From the photo's angle** it looks like plain SHARP - the same photo-real front.
+* **From the side** you see where the photo ends and the back begins; the sides of the body are
+  softer than the front, and the join can show as a slight change in sharpness or colour.
+* **From behind** you see a closed, smooth, "mannequin" back in the colours around the outline:
+  no clothing folds, hair detail, hood or backpack, and never the person's real back. It is
+  never see-through and it has the right size.
+* **Time:** about as long as plain SHARP plus a few seconds to half a minute for the back (on a
+  GeForce GTX 1080: typically 1-2 minutes in total, most of it loading SHARP).
+* **Size:** the splat is saved life-size (feet on the floor), so the viewer shows it 1:1. With
+  *Size from: Automatic* and feet or head cut off by the photo edge, SHARP's own estimate is
+  used and a note says so.
+
+**Limits (honest):** one photo cannot tell what the back really looks like, so the built-in back
+is a plausible guess. Loose hair, open arms held away from the body, bags and anything that
+sticks out sideways come out flattened; a seated person or an object with holes (a chair) looks
+worse than a standing person. A camera that looks down or up steeply (more than about 30°) gives
+a less accurate back (you get a note). SHARP's model is **non-commercial**, so every SHARP 360°
+result is for personal use only.
 
 ### 4.7 Capture (many photos → walk-around 3D)
 
@@ -465,7 +509,7 @@ Installing downloads PyTorch, NVIDIA CUDA libraries and the AI model (several GB
 | **Capture to 3D** (COLMAP + Brush) | Photos or a video walking around something → photo-real 3D splat ([Capture mode](#47-capture-many-photos--walk-around-3d)) | Any DirectX 12 / Vulkan GPU, 4 GB+ (an NVIDIA GPU speeds up the photo matching) | ~2 GB | BSD-3 + Apache-2.0 - any use |
 | **TRELLIS** (Microsoft) | One photo → full 3D model with an AI-invented back side (*Person / Object*, method *TRELLIS*) | NVIDIA, 8 GB+ (12 GB recommended) | ~20 GB | MIT, but uses NVIDIA nvdiffrast and Inria diff-gaussian-rasterization: **non-commercial** |
 | **AI outpainting for VR180 / 360** (Stable Diffusion XL) | AI-painted surroundings for VR180/360 (*Fill: AI outpaint*) | NVIDIA, 8 GB+ | ~17 GB | CreativeML Open RAIL++-M (use restrictions) |
-| **SHARP** (Apple, experimental) | One photo → 3D Gaussian splat in seconds (*Person / Object*, method *SHARP*) | NVIDIA, 6 GB+ | ~12 GB | Apple research model license: **non-commercial** |
+| **SHARP** (Apple, experimental) | One photo → 3D Gaussian splat in seconds (*Person / Object*, methods *SHARP* and *SHARP 360°*) | NVIDIA, 6 GB+ | ~12 GB | Apple research model license: **non-commercial** |
 | **TRELLIS.2** (experimental) | Newer, more detailed photo-to-3D | NVIDIA, 12 GB+ (16-24 GB recommended) | ~36 GB | MIT + Meta DINOv3 license (needs a Hugging Face token) + **non-commercial** NVIDIA parts |
 | **Hunyuan3D-2** (experimental) | Alternative photo-to-3D by Tencent; a grey shape, or coloured with *Paint texture* | NVIDIA, 6 GB+ (more for textures) | ~16 GB | Tencent community license - **not licensed in the EU, the UK and South Korea** |
 
@@ -565,6 +609,10 @@ Then choose **Capture**, add all the photos (or the video) as one job, and click
 * **3D looks "inside out" / hurts:** turn on *Swap eyes* or pick the right format in the player.
 * **Flat-looking result:** raise *3D strength* a little, try MoGe-2, or use a photo with more depth.
 * **Holes or smeared edges when moving:** keep *Look behind* on, reduce movement.
+* **SHARP 360°: the back looks flat or too thick:** change *Thickness* (0.08-0.15 suits most
+  people). **The join at the sides shows:** try *Keep the photo up to* 50-55°.
+  **The person has the wrong size:** check *Real-world height*, or set *Size from* to *Real-world
+  height* when the note says SHARP's estimate was used.
 
 ### Files on the Quest
 

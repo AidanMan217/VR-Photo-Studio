@@ -136,6 +136,10 @@ cd tests/viewer; npm install; npx playwright install chromium; npm test   # WebX
   `VRPHOTO_MODEL_<ID>=<path>` environment overrides.
 * Markers: `gui` (Qt offscreen; set `QT_QPA_PLATFORM=offscreen`), `slow`, `models` (real downloads,
   run by `models.yml` with `VRPHOTO_REAL_MODELS=1`), `windows`, `network`.
+* Running a hand-picked list of test files: keep the files of one folder together (or pass the
+  folders). With pytest 9.1, a list that leaves a folder and comes back to it (e.g.
+  `tests/pipeline/a.py tests/test_cli.py tests/pipeline/b.py`) loses that folder's
+  `conftest.py` fixtures for the later files ("fixture 'make_job' not found").
 * Lint: `uv run ruff check .` (configuration in `pyproject.toml`).
 
 ## 8. Packaging

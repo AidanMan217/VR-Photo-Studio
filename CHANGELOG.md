@@ -4,6 +4,44 @@ All notable changes to VR Photo Studio are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+First beta of **SHARP 360°** (planned as 0.2.0-beta1). Design: `docs/design/SHARP360.md`.
+
+### Added
+
+- **SHARP 360° (experimental Person / Object method):** keeps SHARP's photo-real front of a person
+  or object, adds a back so you can walk all the way round, and saves it **life-size** (feet on the
+  floor, shown 1:1 in the viewer). It needs only the SHARP add-on. SHARP's result is cleaned first:
+  the wall and floor blobs SHARP puts behind the person and the streaks at the outline are removed,
+  without touching what the photo shows. In this version the back is the **built-in shape** (a
+  smooth, rounded back in the colours around the outline; no download, seconds); AI-made backs
+  follow in later versions.
+- New options for SHARP 360°: *Back made by*, *Back quality*, *Keep the photo up to* (where the
+  photo ends and the back begins), *Size from* (your height or SHARP's own measurement, automatic
+  when the subject is cut off by the photo edge) and *Also save parts and debug data*.
+  *Thickness* and *Back side* also apply to SHARP 360° (*Thickness* is kept within 0.06-0.18 there,
+  with a note, because the back is life-size and the presets set it for Billboard). The presets set
+  *Back quality*.
+- Command line: `--method sharp360`, `--back-source`, `--back-quality`, `--seam-deg`,
+  `--size-from`, `--save-extras`; `vrphoto-cli addons brush-test` checks that Brush (Capture
+  add-on) works on this PC and remembers the result. The Add-ons window has the same test
+  (*Test Brush on this PC*).
+
+### Changed
+
+- Before an add-on starts (including Capture mode's COLMAP and Brush), the app now closes its own
+  loaded AI models (depth, cut-out) so the add-on gets the whole graphics memory - fewer "CUDA out
+  of memory" errors on 8 GB cards. They are re-loaded automatically when needed.
+- Settings files with a damaged list or dictionary entry now load that entry's default instead
+  of failing.
+
+### Notes
+
+- SHARP 360° is a beta: from behind it shows a believable "mannequin" back, not the person's real
+  back; loose hair, bags and arms held away from the body come out flattened. Like SHARP itself it
+  is for **non-commercial** use only.
+
 ## [0.1.1] - 2026-10-11
 
 Fixes from the first test on a real PC (Windows 11, GeForce GTX 1080 8 GB).

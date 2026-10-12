@@ -22,6 +22,10 @@ only - higher SH bands are dropped when splats are merged), opacity
 ``1 - prod(1 - alpha_i)``.  The voxel size is searched so the number of occupied voxels
 is just below ``max_n``; singleton voxels keep their splat unchanged.  Everything is
 vectorised with ``np.bincount`` (3 M splats take a few seconds and < 1 GB).
+
+Building blocks for combining clouds (SHARP 360): :func:`transform_splats` (similarity
+transform, rotating orientations and SH), :func:`scale_splats`, :func:`concat_splats`,
+:func:`subset_splats` and :func:`fit_plane_ransac`.
 """
 
 from __future__ import annotations
@@ -74,6 +78,7 @@ _PLY_TYPES = {
     "float": "f4", "float32": "f4", "double": "f8", "float64": "f8",
 }  # fmt: skip
 _CHUNK = 500_000
+_RANSAC_CHUNK = 65_536  # points per block of the RANSAC inlier count
 
 
 class SplatError(InputError):
@@ -837,10 +842,18 @@ def _ransac_plane(
         return np.array([0.0, 1.0, 0.0]), 0.0, 0.0
     nrm = nrm[ok] / ln[ok, None]
     off = np.einsum("ij,ij->i", nrm, a[ok])
-    dist = np.abs(pts.astype(np.float32) @ nrm.T.astype(np.float32) - off.astype(np.float32))
-    inl = (dist < tol).sum(axis=0)
-    best = int(np.argmax(inl))
-    mask = dist[:, best] < tol
+    p32, n32, o32 = pts.astype(np.float32), nrm.T.astype(np.float32), off.astype(np.float32)
+    if n <= _RANSAC_CHUNK:
+        dist = np.abs(p32 @ n32 - o32)
+        inl = (dist < tol).sum(axis=0)
+        best = int(np.argmax(inl))
+        mask = dist[:, best] < tol
+    else:  # the N x iters distance matrix of a big cloud would not fit in memory
+        inl = np.zeros(len(o32), np.int64)
+        for s in range(0, n, _RANSAC_CHUNK):
+            inl += (np.abs(p32[s : s + _RANSAC_CHUNK] @ n32 - o32) < tol).sum(axis=0)
+        best = int(np.argmax(inl))
+        mask = np.abs(p32 @ n32[:, best] - o32[best]) < tol
     q = pts[mask]
     centroid = q.mean(axis=0)
     normal = np.linalg.svd(q - centroid, full_matrices=False)[2][-1]
@@ -917,28 +930,174 @@ def normalize_orientation(sc: SplatCloud, up: np.ndarray | None = None) -> Splat
     qr = rotmat_to_quat(R[None])[0]
     quats = quat_mul(qr[None, :], np.asarray(sc.quats, dtype=np.float64))
     quats /= np.linalg.norm(quats, axis=1, keepdims=True)
-    sh = sc.sh_rest
-    if sh is not None and not np.allclose(R, np.eye(3)):
-        M = sh_rotation_matrix(R, int(sh.shape[1]))
-        if M is None:
-            log.warning("Cannot rotate %d SH coefficients; dropping view-dependent colour", sh.shape[1])
-            sh = None
-        else:  # chunked float32 matmul: no float64 copies of a (possibly 540 MB) SH array
-            src = np.asarray(sh)
-            m32 = M.astype(np.float32)
-            sh = np.empty(src.shape, np.float32)
-            for a in range(0, n, _CHUNK):
-                b = min(n, a + _CHUNK)
-                sh[a:b] = np.matmul(m32, src[a:b].astype(np.float32, copy=False))
     return replace(
         sc,
         means=pr.astype(np.float32),
         quats=quats.astype(np.float32),
-        sh_rest=sh,
+        sh_rest=_rotate_sh(sc.sh_rest, R),
         scales=np.asarray(sc.scales, dtype=np.float32),
         colors=np.asarray(sc.colors, dtype=np.float32),
         opacity=np.asarray(sc.opacity, dtype=np.float32),
     )
+
+
+def _rotate_sh(sh: np.ndarray | None, R: np.ndarray) -> np.ndarray | None:
+    """``sh_rest`` (N x K x 3) for a world rotation ``R``; None (with a warning) when ``K``
+    is not a complete set of bands."""
+    if sh is None or np.allclose(R, np.eye(3)):
+        return sh
+    M = sh_rotation_matrix(R, int(sh.shape[1]))
+    if M is None:
+        log.warning("Cannot rotate %d SH coefficients; dropping view-dependent colour", sh.shape[1])
+        return None
+    # chunked float32 matmul: no float64 copies of a (possibly 540 MB) SH array
+    src = np.asarray(sh)
+    m32 = M.astype(np.float32)
+    out = np.empty(src.shape, np.float32)
+    for a in range(0, len(src), _CHUNK):
+        b = min(len(src), a + _CHUNK)
+        out[a:b] = np.matmul(m32, src[a:b].astype(np.float32, copy=False))
+    return out
+
+
+# --------------------------------------------------------------------------- transforms / combining
+def _rotation_arg(R: Any) -> np.ndarray:
+    r = np.asarray(R, dtype=np.float64)
+    if r.shape != (3, 3) or not np.isfinite(r).all():
+        raise InputError("R must be a finite 3x3 rotation matrix.")
+    if not np.allclose(r @ r.T, np.eye(3), atol=1e-4) or np.linalg.det(r) <= 0:
+        # a reflection (det -1) has no quaternion, so splat orientations could not follow it
+        raise InputError("R must be a proper rotation (orthonormal, determinant +1).")
+    return r
+
+
+def _positive(x: Any, what: str) -> float:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        v = float("nan")
+    if not (math.isfinite(v) and v > 0):
+        raise InputError(f"{what} must be a positive number (got {x!r}).")
+    return v
+
+
+def transform_splats(sc: SplatCloud, R: np.ndarray, t: np.ndarray, s: float = 1.0) -> SplatCloud:
+    """Similarity transform ``P' = s * R @ P + t`` of a whole cloud.
+
+    Orientations follow the rotation (quaternions left-multiplied by ``R``'s quaternion and
+    normalised), sizes scale by ``s`` and the higher SH bands are rotated like
+    :func:`normalize_orientation` does (dropped with a warning when their count is not a
+    complete set of bands).  Colours and opacities are unchanged.  ``R`` must be a proper
+    rotation (a reflection cannot be expressed with quaternions) and ``s > 0``; raises
+    :class:`InputError` otherwise.  Returns a new float32 cloud (unchanged arrays may be
+    shared with ``sc``)."""
+    _validate(sc)
+    r = _rotation_arg(R)
+    tv = np.asarray(t, dtype=np.float64).reshape(-1)
+    if tv.shape != (3,) or not np.isfinite(tv).all():
+        raise InputError("t must be a finite 3-vector.")
+    k = _positive(s, "The scale s")
+    p = np.asarray(sc.means, dtype=np.float64)
+    means = (k * (p @ r.T) + tv).astype(np.float32)
+    qr = rotmat_to_quat(r[None])[0]
+    quats = quat_mul(qr[None, :], np.asarray(sc.quats, dtype=np.float64))
+    quats /= np.maximum(np.linalg.norm(quats, axis=1, keepdims=True), 1e-12)
+    return SplatCloud(
+        means=means,
+        scales=(np.asarray(sc.scales, dtype=np.float64) * k).astype(np.float32),
+        quats=quats.astype(np.float32),
+        colors=np.asarray(sc.colors, dtype=np.float32),
+        opacity=np.asarray(sc.opacity, dtype=np.float32),
+        sh_rest=_rotate_sh(sc.sh_rest, r),
+    )
+
+
+def scale_splats(sc: SplatCloud, k: float) -> SplatCloud:
+    """Uniform scale about the origin: positions and sizes times ``k`` (> 0); orientations,
+    colours and SH are unchanged.  Raises :class:`InputError` for a bad ``k``."""
+    _validate(sc)
+    f = _positive(k, "The scale factor")
+    return replace(
+        sc,
+        means=(np.asarray(sc.means, dtype=np.float64) * f).astype(np.float32),
+        scales=(np.asarray(sc.scales, dtype=np.float64) * f).astype(np.float32),
+        quats=np.asarray(sc.quats, dtype=np.float32),
+        colors=np.asarray(sc.colors, dtype=np.float32),
+        opacity=np.asarray(sc.opacity, dtype=np.float32),
+    )
+
+
+def concat_splats(clouds: Any) -> SplatCloud:
+    """Concatenate clouds in order (float32).
+
+    ``sh_rest`` is kept only when every non-empty cloud has it with the same number of
+    coefficients; otherwise the higher SH bands are dropped (DC colour stays) and that is
+    logged.  An empty sequence raises :class:`InputError`."""
+    parts = list(clouds)
+    if not parts:
+        raise InputError("There are no splat clouds to combine.")
+    for c in parts:
+        _validate(c)
+    # empty clouds carry no SH information, so they must not force the SH to be dropped
+    decide = [c for c in parts if len(c)] or parts
+    ks = {None if c.sh_rest is None else int(c.sh_rest.shape[1]) for c in decide}
+    k = next(iter(ks)) if len(ks) == 1 else None
+    if k is None and any(c.sh_rest is not None for c in parts):
+        log.info(
+            "concat_splats: SH coefficient counts differ (%s); keeping DC colour only", sorted(map(str, ks))
+        )
+
+    def cat(get: Any, width: tuple[int, ...]) -> np.ndarray:
+        arrs = [np.asarray(get(c), dtype=np.float32).reshape((len(c), *width)) for c in parts]
+        return np.ascontiguousarray(np.concatenate(arrs, axis=0), dtype=np.float32)
+
+    sh = None
+    if k is not None:
+        sh = cat(lambda c: c.sh_rest if c.sh_rest is not None else np.zeros((0, k, 3), np.float32), (k, 3))
+    return SplatCloud(
+        means=cat(lambda c: c.means, (3,)),
+        scales=cat(lambda c: c.scales, (3,)),
+        quats=cat(lambda c: c.quats, (4,)),
+        colors=cat(lambda c: c.colors, (3,)),
+        opacity=cat(lambda c: c.opacity, ()),
+        sh_rest=sh,
+    )
+
+
+def subset_splats(sc: SplatCloud, idx: Any) -> SplatCloud:
+    """The splats ``idx`` (integer indices, in that order, or a boolean mask of length
+    ``len(sc)``) as a new contiguous float32 cloud (``sh_rest`` kept)."""
+    sel = np.asarray(idx)
+    if sel.dtype == bool:
+        if sel.shape != (len(sc),):
+            raise InputError(f"The selection mask must have {len(sc)} entries (got shape {sel.shape}).")
+        sel = np.flatnonzero(sel)
+    elif sel.size == 0:
+        sel = np.zeros(0, np.int64)
+    elif sel.dtype.kind not in "iu":
+        raise InputError("Splat indices must be integers or a boolean mask.")
+    return _subset(sc, sel)
+
+
+def fit_plane_ransac(
+    pts: np.ndarray, tol: float, *, seed: int = 0, iters: int = 256
+) -> tuple[np.ndarray, float, float]:
+    """RANSAC plane through ``pts`` (N x 3): ``iters`` random triangles, the one with most
+    points within ``tol`` wins, then a least-squares refit on its inliers.
+
+    Returns ``(normal, offset, inlier_frac)`` with ``normal . p == offset`` on the plane;
+    the sign of ``normal`` is arbitrary (orient it yourself).  Rows with non-finite values
+    are ignored; fewer than 3 points give ``((0, 1, 0), 0.0, 0.0)``.  Deterministic for a
+    given ``seed``.  Memory is chunked, but runtime grows with ``N * iters``, so subsample
+    very large inputs."""
+    p = np.asarray(pts, dtype=np.float64)
+    if p.ndim != 2 or p.shape[1] != 3:
+        raise InputError(f"Plane fitting needs N x 3 points (got shape {p.shape}).")
+    tol_v = _positive(tol, "The plane tolerance")
+    if not (isinstance(iters, (int, np.integer)) and int(iters) >= 1):
+        raise InputError(f"iters must be a positive integer (got {iters!r}).")
+    p = p[np.isfinite(p).all(axis=1)]
+    return _ransac_plane(p, tol_v, np.random.default_rng(seed), int(iters))
 
 
 # --------------------------------------------------------------------------- mesh -> splats
@@ -1052,6 +1211,11 @@ __all__ = [
     "decimate_splats",
     "crop_splats",
     "normalize_orientation",
+    "transform_splats",
+    "scale_splats",
+    "concat_splats",
+    "subset_splats",
+    "fit_plane_ransac",
     "splats_from_mesh",
     "importance",
     "splat_covariances",

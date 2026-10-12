@@ -29,11 +29,18 @@ size; it is NOT the subject's height.
 The tools come from the ``capture`` add-on (``manifests/capture.toml``); ``VRPHOTO_COLMAP`` /
 ``VRPHOTO_BRUSH`` override their paths (a ``.py`` path runs with the current Python -
 used by the tests with fake tools).
+
+Stage 3 is reusable for datasets with known cameras (SHARP 360, docs/design/SHARP360.md
+§3.11 and §4.5): :func:`write_colmap_text` writes the COLMAP text model Brush reads,
+:func:`train_splat` runs Brush on any prepared folder, and :func:`brush_selftest`
+(``vrphoto-cli addons brush-test``) checks once on the user's PC that Brush trains there,
+whether SH degree 0 works and whether masked and transparent pictures can be mixed.
 """
 
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import math
 import os
@@ -650,13 +657,16 @@ class _Runner:
         self.cancel = cancel
         self.deadline = (time.monotonic() + timeout) if timeout else None
 
+    def remaining(self) -> float | None:
+        """Seconds left before the deadline (at least 1), or None without a timeout."""
+        if self.deadline is None:
+            return None
+        return max(1.0, self.deadline - time.monotonic())
+
     def __call__(self, cmd: list[str], title: str, on_line: Callable[[str], None] | None = None,
                  cwd: Path | None = None) -> ProcResult:
-        remaining = None
-        if self.deadline is not None:
-            remaining = max(1.0, self.deadline - time.monotonic())
         return run_process(cmd, env=_tool_env(cmd), cwd=cwd, log_sink=self.sink, on_line=on_line,
-                           cancel=self.cancel, timeout=remaining, title=title)
+                           cancel=self.cancel, timeout=self.remaining(), title=title)
 
 
 def colmap_feature_args(db: Path, images: Path, *, use_gpu: bool, info: ColmapInfo) -> list[str]:
@@ -701,8 +711,10 @@ def colmap_undistort_args(images: Path, model: Path, out: Path, *, info: ColmapI
 
 
 def brush_args(dataset: Path, export_dir: Path, *, steps: int, max_splats: int, export_name: str = "splat.ply",
-               seed: int = 42) -> list[str]:
-    """Arguments for a headless Brush training run with a single export at the end."""
+               seed: int = 42, extra: Sequence[str] = ()) -> list[str]:
+    """Arguments for a headless Brush training run with a single export at the end.
+
+    ``extra`` (e.g. ``["--sh-degree", "0"]``) is appended as given."""
     return [
         str(dataset),
         "--total-steps", str(int(steps)),
@@ -712,6 +724,7 @@ def brush_args(dataset: Path, export_dir: Path, *, steps: int, max_splats: int, 
         "--export-name", export_name,
         "--max-splats", str(int(max_splats)),
         "--seed", str(int(seed)),
+        *(str(a) for a in extra),
     ]
 
 
@@ -722,6 +735,217 @@ def _fail_colmap(stage: str, res: ProcResult) -> AddonError:
     else:
         hint = "See the capture log for details. Make sure the photos overlap well and are sharp."
     return AddonError(f"COLMAP {stage} failed (exit code {res.returncode}).", hint=hint)
+
+
+# --------------------------------------------------------------------------- known-camera datasets
+def _rot_to_quat(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix -> unit quaternion ``(w, x, y, z)`` with ``w >= 0`` (Shepperd's method,
+    stable for every rotation; the inverse of :func:`_quat_to_R`)."""
+    R = np.asarray(R, dtype=np.float64)
+    tr = float(np.trace(R))
+    if tr > 0:
+        s = 2.0 * math.sqrt(1.0 + tr)
+        q = np.array([0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s])
+    else:
+        i = int(np.argmax(np.diag(R)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        s = 2.0 * math.sqrt(max(1.0 + R[i, i] - R[j, j] - R[k, k], 1e-300))
+        v = np.zeros(3)
+        v[i] = 0.25 * s
+        v[j] = (R[j, i] + R[i, j]) / s
+        v[k] = (R[k, i] + R[i, k]) / s
+        q = np.array([(R[k, j] - R[j, k]) / s, *v])
+    q /= np.linalg.norm(q)
+    return -q if q[0] < 0 else q
+
+
+def _check_camera(name: str, K: Any, R: Any, t: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    K = np.asarray(K, dtype=np.float64)
+    R = np.asarray(R, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64).reshape(-1)
+    if not name or name != name.strip() or any(c.isspace() for c in name) or "/" in name or "\\" in name:
+        # COLMAP's text format splits on spaces and Brush looks the name up in images/
+        raise InputError(f"Invalid image name for the training data: {name!r}.",
+                         hint="Use a plain file name without spaces or folders.")
+    if K.shape != (3, 3) or R.shape != (3, 3) or t.shape != (3,):
+        raise InputError(f"Camera of {name}: K and R must be 3x3 and t a 3-vector.")
+    if not (np.isfinite(K).all() and np.isfinite(R).all() and np.isfinite(t).all()):
+        raise InputError(f"Camera of {name} contains NaN or infinite values.")
+    pinhole = K[0, 0] > 0 and K[1, 1] > 0 and abs(K[0, 1]) <= 1e-9 * K[0, 0]
+    if not pinhole or np.abs(K[2] - [0, 0, 1]).max() > 1e-12:
+        raise InputError(f"Camera of {name} is not a plain pinhole camera (positive focal lengths, no skew).")
+    if np.abs(R @ R.T - np.eye(3)).max() > 1e-4 or np.linalg.det(R) <= 0:
+        raise InputError(f"Camera of {name}: R is not a rotation matrix.")
+    return K, R, t
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return int(im.size[0]), int(im.size[1])
+    except (OSError, ValueError) as e:
+        raise InputError(
+            f"Cannot read the size of the training image {path.name}.",
+            hint="Write the images first or give each camera its (width, height).",
+        ) from e
+
+
+def write_colmap_text(
+    dataset_dir: str | os.PathLike[str],
+    cams: Sequence[Sequence[Any]],
+    points: np.ndarray | None = None,
+    colors: np.ndarray | None = None,
+) -> Path:
+    """Write a COLMAP text model ``<dataset_dir>/sparse/0/{cameras,images,points3D}.txt``.
+
+    This is the known-camera layout Brush reads (with ``images/``, optional ``masks/`` and an
+    ``init.ply`` next to ``sparse/``).
+
+    ``cams``: one ``(name, K, R, t)`` per image, optionally ``(name, K, R, t, (width, height))``.
+    ``K`` is the 3x3 pinhole matrix; ``R``, ``t`` map world to camera in the OpenCV convention
+    (``x_cam = R @ x_world + t``; x right, y down, z forward), exactly COLMAP's
+    ``cam_from_world``.  ``name`` is the file name inside ``<dataset_dir>/images``; without an
+    explicit size it is read from that file.  Every image gets its own ``PINHOLE`` camera
+    (``W H fx fy cx cy``); the second line of each image (its 2D points) is left empty.
+    ``points`` (N x 3, world) and ``colors`` (N x 3, uint8 or floats in [0, 1]) become
+    ``points3D.txt`` with empty tracks.  Cameras are written with 17 significant digits, so a
+    point projects through the written camera as through the given one (to rounding error).
+
+    Returns the model folder (``sparse/0``).
+    """
+    ds = Path(dataset_dir)
+    if not cams:
+        raise InputError("No cameras were given for the training data.")
+    cam_lines: list[str] = []
+    img_lines: list[str] = []
+    seen: set[str] = set()
+    for i, cam in enumerate(cams, start=1):
+        if len(cam) not in (4, 5):
+            raise InputError("Each camera must be (name, K, R, t) or (name, K, R, t, (width, height)).")
+        name = str(cam[0])
+        K, R, t = _check_camera(name, cam[1], cam[2], cam[3])
+        if name in seen:
+            raise InputError(f"The image name {name} is used twice; every view needs its own file.")
+        seen.add(name)
+        w, h = (int(cam[4][0]), int(cam[4][1])) if len(cam) == 5 else _image_size(ds / "images" / name)
+        if w <= 0 or h <= 0:
+            raise InputError(f"Invalid image size {w}x{h} for {name}.")
+        g = "{:.17g}".format
+        cam_lines.append(f"{i} PINHOLE {w} {h} {g(K[0, 0])} {g(K[1, 1])} {g(K[0, 2])} {g(K[1, 2])}")
+        q = _rot_to_quat(R)
+        img_lines.append(" ".join([str(i), *map(g, q), *map(g, t), str(i), name]))
+        img_lines.append("")
+    pts = np.zeros((0, 3)) if points is None else np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if colors is None:
+        rgb = np.full((len(pts), 3), 128, dtype=np.int64)
+    else:
+        c = np.asarray(colors)
+        if c.shape != pts.shape:
+            raise InputError(f"points ({pts.shape}) and colors ({c.shape}) must have the same shape.")
+        rgb = np.clip(c if c.dtype.kind in "iu" else np.rint(c * 255.0), 0, 255).astype(np.int64)
+    ok = np.isfinite(pts).all(axis=1)
+    pts, rgb = pts[ok], rgb[ok]
+
+    model = ds / "sparse" / "0"
+    model.mkdir(parents=True, exist_ok=True)
+    head = "# Camera list with one line of data per camera:\n#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
+    text = head + f"# Number of cameras: {len(cam_lines)}\n" + "\n".join(cam_lines) + "\n"
+    atomic_write_bytes(model / "cameras.txt", text.encode())
+    head = ("# Image list with two lines of data per image:\n"
+            "#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n"
+            "#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+    text = head + f"# Number of images: {len(cams)}\n" + "\n".join(img_lines) + "\n"
+    atomic_write_bytes(model / "images.txt", text.encode())
+    table = np.column_stack([np.arange(1, len(pts) + 1), pts, rgb, np.zeros(len(pts))])
+    buf = io.StringIO()
+    np.savetxt(buf, table, fmt=["%d", "%.9g", "%.9g", "%.9g", "%d", "%d", "%d", "%.1f"])
+    head = ("# 3D point list with one line of data per point:\n"
+            "#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n"
+            f"# Number of points: {len(pts)}\n")
+    atomic_write_bytes(model / "points3D.txt", (head + buf.getvalue()).encode())
+    return model
+
+
+# --------------------------------------------------------------------------- Brush training
+def train_splat(
+    dataset: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    *,
+    steps: int,
+    max_splats: int,
+    extra_args: Sequence[str] = (),
+    export_name: str = "splat.ply",
+    seed: int = 0,
+    progress: ProgressReporter | None = None,
+    cancel: CancelToken | None = None,
+    timeout: float | None = None,
+    log_name: str = "brush.log",
+    log_sink: LogSink | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    label: str = "Training the splat",
+) -> Path:
+    """Train a Gaussian splat with Brush on a prepared dataset; returns the exported ``.ply``.
+
+    ``dataset`` is a folder Brush reads (COLMAP ``sparse/`` + ``images/``, optionally
+    ``masks/`` and ``init.ply``, see :func:`write_colmap_text`); ``out_dir`` receives the
+    single export ``export_name`` and should lie outside the dataset folder, so an export
+    is never read back as an input.  ``extra_args`` are appended to the command line
+    (:func:`brush_args`).  Progress messages read ``"<label> (step i/steps)"``.
+
+    The log goes to ``out_dir/log_name`` unless ``log_sink`` is given (the capture pipeline
+    passes its own); Brush runs in ``cwd`` (default ``out_dir``).  Honours ``cancel``
+    (kills Brush) and ``timeout`` (seconds).  Raises :class:`AddonNotInstalled` without
+    Brush and :class:`AddonError` (with an out-of-memory hint when that is the cause) when
+    training fails or nothing is exported.
+    """
+    progress = progress or ProgressReporter.null()
+    dataset, out_dir = Path(dataset), Path(out_dir)
+    steps, max_splats = int(steps), int(max_splats)
+    if not dataset.is_dir():
+        raise InputError(f"The training data folder does not exist: {dataset}")
+    if steps < 1 or max_splats < 1:
+        raise InputError(f"Training steps and max splats must be positive (got {steps}, {max_splats}).")
+    brush = find_brush()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ply = out_dir / export_name
+    with contextlib.suppress(OSError):
+        ply.unlink()  # a stale export must never pass for this run's result
+    sink = log_sink if log_sink is not None else LogSink(out_dir / log_name)
+    try:
+        if log_sink is None:
+            sink.header(f"Brush training: {steps} steps, {dataset}")
+        runner = _Runner(sink, cancel, timeout)
+
+        def brush_line(line: str) -> None:
+            m = _BRUSH_ITER_RE.search(line)
+            if m:
+                progress(int(m.group(1)) / steps, f"{label} (step {m.group(1)}/{steps})")
+
+        t0 = time.time()
+        args = brush_args(dataset, out_dir, steps=steps, max_splats=max_splats, export_name=export_name,
+                          seed=seed, extra=extra_args)
+        res = runner([*brush, *args], "Brush training", brush_line, cwd=Path(cwd) if cwd else out_dir)
+        if not ply.is_file():
+            # some Brush builds name the export themselves: take the newest .ply of this run
+            cands = sorted((p for p in out_dir.glob("*.ply") if p.stat().st_mtime >= t0 - 2.0),
+                           key=lambda p: p.stat().st_mtime)
+            ply = cands[-1] if cands else ply
+        if not res.ok or not ply.is_file():
+            tail = res.tail_text(5)
+            # "the capture log" for the capture pipeline's capture.log, "the brush log" otherwise
+            what = sink.path.stem.replace("_", " ") if sink.path is not None else "Brush"
+            if re.search(r"memory|OutOfMemory|allocation", tail, re.I):
+                hint = ("Your GPU may have run out of memory: lower the training steps / max splats or "
+                        "close other apps.")
+            else:
+                hint = f"See the {what} log for details; updating the GPU driver often helps."
+            raise AddonError(f"Brush training failed (exit code {res.returncode}).", hint=hint)
+        return ply
+    finally:
+        if log_sink is None:
+            sink.close()
 
 
 def capture_to_splat(
@@ -767,7 +991,7 @@ def capture_to_splat(
     stem = re.sub(r"[^\w.-]+", "_", name or (videos[0].stem if videos else photos[0].parent.name or "capture"))
     stem = stem.strip("._") or "capture"
     colmap = find_colmap()
-    brush = find_brush()
+    find_brush()  # fail before the long COLMAP stage when Brush is missing
     work = _work_dir(out_dir, stem)
     if work.exists():
         shutil.rmtree(work, ignore_errors=True)
@@ -933,27 +1157,10 @@ def capture_to_splat(
             cancel.check()
 
         # ---------------------------------------------------------------- 3. Brush
-        export_dir = work / "brush"
-        p_brush = progress.sub(0.60, 0.95)
         train_cap = int(min(10_000_000, max(1_000_000, 2 * int(max_splats))))
-
-        def brush_line(line: str) -> None:
-            m = _BRUSH_ITER_RE.search(line)
-            if m:
-                p_brush(int(m.group(1)) / max(int(steps), 1), f"Training the splat (step {m.group(1)}/{steps})")
-
-        res = runner([*brush, *brush_args(undist, export_dir, steps=steps, max_splats=train_cap)],
-                     "Brush training", brush_line, cwd=work)
-        ply = export_dir / "splat.ply"
-        if not ply.is_file():
-            cands = sorted(export_dir.glob("*.ply"), key=lambda p: p.stat().st_mtime) if export_dir.is_dir() else []
-            ply = cands[-1] if cands else ply
-        if not res.ok or not ply.is_file():
-            tail = res.tail_text(5)
-            hint = ("Your GPU may have run out of memory: lower the training steps / max splats or close other apps."
-                    if re.search(r"memory|OutOfMemory|allocation", tail, re.I)
-                    else "See the capture log for details; updating the GPU driver often helps.")
-            raise AddonError(f"Brush training failed (exit code {res.returncode}).", hint=hint)
+        ply = train_splat(undist, work / "brush", steps=steps, max_splats=train_cap, seed=42,
+                          progress=progress.sub(0.60, 0.95), cancel=cancel, timeout=runner.remaining(),
+                          log_sink=sink, cwd=work)
 
         # ---------------------------------------------------------------- 4. post-process
         progress(0.95, "Cleaning up the splat")
@@ -1047,9 +1254,340 @@ def run_task(
     return {"splat": str(out), "ply": str(out.with_suffix(".ply"))}
 
 
+# --------------------------------------------------------------------------- Brush self-test
+# A short Brush run on an analytic known-camera dataset, done once on the user's PC: Brush
+# 0.3.0 on Pascal GPUs, its SH-degree-0 bug and mixing masked with transparent pictures are
+# unverified, and SHARP 360's optional Brush polish relies on all three
+# (docs/design/SHARP360.md §4.5).  Like the polish recipe (§3.11) the views are orthographic
+# pictures expressed as distant telephoto pinholes: centre 40 m back, f = 40 m / (metres per pixel).
+SELFTEST_STEPS = 300
+_SELFTEST_PX = 128
+_SELFTEST_VIEWS = 8
+_SELFTEST_MASKED = (1, 5)  # RGB + mask (black = ignore); the other views are RGBA
+_SELFTEST_RADIUS_M = 0.5
+_SELFTEST_FILL = 0.7  # sphere diameter as a fraction of the picture
+_SELFTEST_ELEV_DEG = 12.0  # cameras alternate this far above / below the equator
+_TELEPHOTO_DIST_M = 40.0
+_SELFTEST_INIT_POINTS = 2000
+_SELFTEST_MAX_SPLATS = 100_000
+_SELFTEST_TIMEOUT_S = 600.0  # per run; the first run also compiles Brush's GPU shaders
+_SELFTEST_BG = 0.5  # grey behind the masked views (ignored when the masks work)
+_SELFTEST_PALETTE = np.array(
+    [[0.9, 0.2, 0.2], [0.95, 0.8, 0.2], [0.2, 0.75, 0.3], [0.2, 0.7, 0.9], [0.25, 0.3, 0.9], [0.8, 0.3, 0.8]]
+)
+_STEP_RE = re.compile(r"\(step (\d+)/")
+
+
+def _selftest_colour(n: np.ndarray) -> np.ndarray:
+    """Colour of the test sphere at unit normals ``n`` (..., 3): one colour per 60° of
+    longitude, darker on every other 30° latitude band, so every view sees a different,
+    unambiguous pattern."""
+    lon = np.arctan2(n[..., 0], n[..., 2])
+    lat = np.arcsin(np.clip(-n[..., 1], -1.0, 1.0))
+    sector = np.floor((lon + np.pi) / (np.pi / 3)).astype(np.int64) % 6
+    band = np.floor((lat + np.pi / 2) / (np.pi / 6)).astype(np.int64) % 2
+    return _SELFTEST_PALETTE[sector] * np.where(band == 0, 1.0, 0.65)[..., None]
+
+
+def _selftest_cameras() -> list[tuple[str, np.ndarray, np.ndarray, np.ndarray]]:
+    """``(name, K, R, t)`` (world to camera, OpenCV axes, world y down) of the test views:
+    a circle of telephoto cameras around the sphere at the origin."""
+    m = 2 * _SELFTEST_RADIUS_M / (_SELFTEST_FILL * _SELFTEST_PX)  # metres per pixel
+    f = _TELEPHOTO_DIST_M / m
+    K = np.array([[f, 0.0, _SELFTEST_PX / 2], [0.0, f, _SELFTEST_PX / 2], [0.0, 0.0, 1.0]])
+    cams = []
+    for k in range(_SELFTEST_VIEWS):
+        az = 2 * np.pi * k / _SELFTEST_VIEWS
+        el = np.radians(_SELFTEST_ELEV_DEG * (1 if k % 2 else -1))
+        fwd = -np.array([np.cos(el) * np.sin(az), -np.sin(el), -np.cos(el) * np.cos(az)])
+        right = np.cross([0.0, 1.0, 0.0], fwd)
+        right /= np.linalg.norm(right)
+        R = np.stack([right, np.cross(fwd, right), fwd])  # rows: camera x, y (down), z
+        C = -_TELEPHOTO_DIST_M * fwd
+        cams.append((f"view_{k:02d}.png", K, R, -R @ C))
+    return cams
+
+
+def _render_selftest_view(K: np.ndarray, R: np.ndarray, t: np.ndarray,
+                          ss: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """Exact ray-sphere render of one view: straight (not premultiplied) RGB in [0, 1] and
+    coverage alpha, box-filtered from ``ss`` x ``ss`` samples per pixel."""
+    n_px = _SELFTEST_PX
+    s = (np.arange(n_px * ss) + 0.5) / ss  # pixel centres at i + 0.5 (COLMAP / OpenCV)
+    u, v = np.meshgrid(s, s)
+    d = np.stack([(u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], np.ones_like(u)], axis=-1) @ R
+    C = -R.T @ t
+    a = (d * d).sum(-1)
+    b = 2.0 * (d @ C)
+    c = float(C @ C) - _SELFTEST_RADIUS_M**2
+    disc = b * b - 4 * a * c
+    hit = disc > 0
+    depth = (-b - np.sqrt(np.maximum(disc, 0.0))) / (2 * a)
+    nrm = (C + depth[..., None] * d) / _SELFTEST_RADIUS_M
+    col = _selftest_colour(nrm) * hit[..., None]
+    cov = hit.reshape(n_px, ss, n_px, ss).mean(axis=(1, 3))
+    rgb = col.reshape(n_px, ss, n_px, ss, 3).mean(axis=(1, 3)) / np.maximum(cov, 1e-9)[..., None]
+    return np.clip(rgb, 0.0, 1.0), cov
+
+
+def _write_png(path: Path, img: np.ndarray) -> None:
+    import cv2
+
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGRA if img.shape[2] == 4 else cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise AddonError(f"Could not encode {path.name}.")
+    atomic_write_bytes(path, buf.tobytes())  # unicode-safe (cv2.imwrite is not on Windows)
+
+
+def write_selftest_dataset(folder: str | os.PathLike[str]) -> dict[str, Any]:
+    """Write the Brush self-test dataset into ``folder``: ``images/`` (RGBA views, plus the
+    :data:`_SELFTEST_MASKED` views as RGB on grey with ``masks/``), the COLMAP text model and
+    ``init.ply`` (points on the sphere, read back to validate).  Returns a summary."""
+    ds = Path(folder)
+    (ds / "images").mkdir(parents=True, exist_ok=True)
+    (ds / "masks").mkdir(exist_ok=True)
+    cams = _selftest_cameras()
+    for k, (name, K, R, t) in enumerate(cams):
+        rgb, cov = _render_selftest_view(K, R, t)
+        if k in _SELFTEST_MASKED:
+            comp = rgb * cov[..., None] + _SELFTEST_BG * (1.0 - cov[..., None])
+            _write_png(ds / "images" / name, np.rint(comp * 255).astype(np.uint8))
+            _write_png(ds / "masks" / name, np.where(cov > 0, 255, 0).astype(np.uint8))
+        else:
+            rgba = np.concatenate([rgb, cov[..., None]], axis=-1)
+            _write_png(ds / "images" / name, np.rint(rgba * 255).astype(np.uint8))
+    # Fibonacci sphere: evenly spread initial splats on the true surface
+    n = _SELFTEST_INIT_POINTS
+    i = np.arange(n) + 0.5
+    polar = np.arccos(1.0 - 2.0 * i / n)
+    az = np.pi * (1.0 + 5.0**0.5) * i
+    nrm = np.stack([np.cos(az) * np.sin(polar), np.cos(polar), np.sin(az) * np.sin(polar)], axis=1)
+    pts = _SELFTEST_RADIUS_M * nrm
+    colors = _selftest_colour(nrm)
+    write_colmap_text(ds, [(*c, (_SELFTEST_PX, _SELFTEST_PX)) for c in cams], pts, colors)
+    from ..core.types import SplatCloud
+
+    spacing = _SELFTEST_RADIUS_M * math.sqrt(4 * math.pi / n)
+    init = SplatCloud(
+        means=pts.astype(np.float32),
+        scales=np.full((n, 3), 0.6 * spacing, np.float32),
+        quats=np.tile(np.array([1, 0, 0, 0], np.float32), (n, 1)),
+        colors=colors.astype(np.float32),
+        opacity=np.full(n, 0.5, np.float32),
+    )
+    api = _splat_api()
+    api.write_splats(init, ds / "init.ply")
+    if len(api.read_splats(ds / "init.ply")) != n:
+        raise AddonError("The self-test's initial splats could not be written correctly.")
+    return {"views": len(cams), "masked": len(_SELFTEST_MASKED), "points": n, "size": _SELFTEST_PX}
+
+
+def _brush_version(brush: Sequence[str], cancel: CancelToken | None = None) -> str:
+    """Brush's version from ``--version`` (empty when it does not say)."""
+    lines: list[str] = []
+    try:
+        res = run_process([*brush, "--version"], env=_tool_env(brush), timeout=30, title="Brush version",
+                          on_line=lines.append, cancel=cancel)
+    except AddonError as e:  # a version probe must never fail the test
+        log.debug("brush --version failed: %s", e)
+        return ""
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?(?:[-+][\w.]+)?)", "\n".join(lines)) if res.ok else None
+    return m.group(1) if m else ""
+
+
+def _check_export(ply: Path) -> int:
+    """Number of splats of a trained export; raises AddonError if it is empty or broken."""
+    try:
+        sc = _splat_api().read_splats(ply)
+    except Exception as e:  # noqa: BLE001 - any read failure means a broken export
+        raise AddonError(f"Brush exported an unreadable splat ({e}).") from e
+    if len(sc) == 0 or not np.isfinite(np.asarray(sc.means)).all():
+        raise AddonError("Brush exported an empty splat or one with invalid positions.")
+    return len(sc)
+
+
+def brush_selftest(
+    progress: ProgressReporter | None = None,
+    cancel: CancelToken | None = None,
+    *,
+    work_dir: str | os.PathLike[str] | None = None,
+) -> dict[str, Any]:
+    """Check that Brush (Capture add-on) trains on this PC; takes a minute or two.
+
+    Writes the analytic dataset (:func:`write_selftest_dataset`) to a temporary folder (or
+    ``work_dir``, which is then kept), then trains :data:`SELFTEST_STEPS` steps until a run
+    works: with masks at ``--sh-degree`` 0, then 1; without masks at 0, then 1; and last
+    with Brush's own defaults (no ``--sh-degree``, no masks).  An SH degree is only judged
+    against a run with the same mask setting, so the result tells which part does not work.
+
+    Returns ``{"ok", "sh0", "masks", "sh_option", "steps_per_s", "seconds", "splats",
+    "steps", "brush_version", "attempts", "date", "log"}`` plus ``"error"`` when no run
+    worked.  ``ok``: a run exported a valid splat; ``sh0``: True when an SH-degree-0 run
+    worked, False when it failed and SH degree 1 worked with the same masks setting, None
+    when only the defaults run worked (unknown); ``masks``: a run with masked views worked;
+    ``sh_option``: Brush accepted ``--sh-degree``; ``steps_per_s`` is timed from Brush's
+    first progress line to the end (start-up and shader compilation excluded when possible);
+    ``seconds`` is the wall time of the successful run.  Training failures are reported in the
+    result, not raised; a missing Brush raises :class:`AddonNotInstalled` and ``cancel``
+    raises :class:`Cancelled`.
+    The caller stores the result (``Settings.brush_test``); see :func:`brush_test_verdict`.
+    """
+    import tempfile
+
+    from ..core.config import data_root
+    from ..core.errors import Cancelled
+
+    progress = progress or ProgressReporter.null()
+    t_start = time.monotonic()
+    brush = find_brush()
+    root = Path(work_dir) if work_dir is not None else Path(tempfile.mkdtemp(prefix="vrphoto_brush_test_"))
+    log_path = data_root() / "logs" / "brush_test.log"
+    sink = LogSink(log_path)
+    sink.header("Brush self-test")
+    result: dict[str, Any] = {
+        "ok": False,
+        "sh0": False,
+        "masks": False,
+        "sh_option": False,
+        "steps_per_s": None,
+        "seconds": 0.0,
+        "splats": 0,
+        "steps": SELFTEST_STEPS,
+        "brush_version": "",
+        "attempts": [],
+        "date": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "log": str(log_path),
+    }
+    try:
+        progress(0.0, "Writing the test pictures")
+        ds = root / "dataset"
+        if ds.exists():
+            shutil.rmtree(ds)
+        info = write_selftest_dataset(ds)
+        sink.write(f"dataset: {info} in {ds}")
+        result["brush_version"] = _brush_version(brush, cancel)
+        if cancel is not None:
+            cancel.check()
+        # (SH degree or None = Brush's default, masks, progress range).  Each SH degree is
+        # tried with and without masks before the next mask setting: a failure is only blamed
+        # on SH degree 0 when degree 1 then works with the same masks setting
+        plan: list[tuple[int | None, bool, float, float]] = [
+            (0, True, 0.05, 0.6),
+            (1, True, 0.6, 0.72),
+            (0, False, 0.72, 0.82),
+            (1, False, 0.82, 0.91),
+            (None, False, 0.91, 0.98),
+        ]
+        error = ""
+        for i, (sh, with_masks, lo, hi) in enumerate(plan):
+            if not with_masks and (ds / "masks").is_dir():
+                shutil.rmtree(root / "masks_off", ignore_errors=True)
+                os.replace(ds / "masks", root / "masks_off")  # Brush picks masks up by folder name
+            samples: list[tuple[float, int]] = []
+            outer = progress.sub(lo, hi)
+
+            def on_progress(frac: float, msg: str, samples=samples, outer=outer) -> None:
+                m = _STEP_RE.search(msg)
+                if m:
+                    samples.append((time.monotonic(), int(m.group(1))))
+                outer(frac, msg)
+
+            what = ("Brush's default settings" if sh is None else f"SH degree {sh}") + (
+                "" if with_masks else ", no masks"
+            )
+            if i:
+                sink.write(f"retrying with {what}")
+                progress(lo, f"Testing Brush again ({what})")
+            t0 = time.monotonic()
+            attempt: dict[str, Any] = {"sh_degree": sh, "masks": with_masks, "ok": False}
+            try:
+                ply = train_splat(
+                    ds, root / f"out_{i}", steps=SELFTEST_STEPS, max_splats=_SELFTEST_MAX_SPLATS,
+                    extra_args=[] if sh is None else ["--sh-degree", str(sh)],
+                    export_name="selftest.ply", seed=0,
+                    progress=ProgressReporter(on_progress), cancel=cancel, timeout=_SELFTEST_TIMEOUT_S,
+                    log_sink=sink, cwd=root, label="Testing Brush",
+                )
+                result["splats"] = _check_export(ply)
+            except Cancelled:
+                raise
+            except AddonError as e:
+                error = str(e)
+                attempt.update(seconds=round(time.monotonic() - t0, 2), error=error)
+                result["attempts"].append(attempt)
+                sink.write(f"{what}: failed - {error}")
+                if time.monotonic() - t0 >= _SELFTEST_TIMEOUT_S - 1:
+                    break  # a hang is no SH or mask problem: retrying would only wait again
+                continue
+            t_end = time.monotonic()
+            secs = t_end - t0
+            attempt.update(ok=True, seconds=round(secs, 2))
+            result["attempts"].append(attempt)
+            rate = SELFTEST_STEPS / secs if secs > 0 else None
+            # Brush logs only every few hundred steps: time the steps after its first progress
+            # line, which leaves out start-up and shader compilation
+            if samples and samples[0][1] < SELFTEST_STEPS and t_end - samples[0][0] >= 0.5:
+                rate = (SELFTEST_STEPS - samples[0][1]) / (t_end - samples[0][0])
+            result.update(ok=True, sh0=None if sh is None else sh == 0, masks=with_masks,
+                          sh_option=sh is not None, seconds=round(secs, 2),
+                          steps_per_s=None if rate is None else round(rate, 2))
+            break
+        if not result["ok"]:
+            result["error"] = error or "Brush did not run."
+            result["seconds"] = round(time.monotonic() - t_start, 2)
+        sink.write(f"result: {json.dumps({k: v for k, v in result.items() if k != 'attempts'})}")
+        log.info("Brush self-test: ok=%s sh0=%s masks=%s %.1f steps/s", result["ok"], result["sh0"],
+                 result["masks"], result["steps_per_s"] or 0.0)
+        progress(1.0, "Brush works" if result["ok"] else "Brush test failed")
+        return result
+    finally:
+        sink.close()
+        if work_dir is None:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+def brush_test_verdict(result: dict[str, Any]) -> str:
+    """Plain-language summary of a :func:`brush_selftest` result."""
+    if not result:
+        return "Brush has not been tested on this PC yet."
+    if not result.get("ok"):
+        err = str(result.get("error") or "unknown error").strip()
+        return (
+            f"Brush could not train on this PC ({err}). SHARP 360's optional Brush polishing will "
+            "not be offered; everything else works without it. The details are in "
+            f"{result.get('log') or 'brush_test.log'}."
+        )
+    steps = int(result.get("steps") or SELFTEST_STEPS)
+    rate = result.get("steps_per_s")
+    speed = f" ({float(rate):.1f} steps per second)" if rate else ""
+    secs = float(result.get("seconds") or 0)
+    text = f"Brush works on this PC: {steps} training steps took {secs:.0f} s{speed}."
+    sh0 = result.get("sh0")
+    if result.get("sh_option") is False and sh0 is None:
+        text += (" It only trained with its default settings: it did not accept the SH degree option"
+                 " (--sh-degree), so polishing will leave that option out.")
+    elif sh0:
+        text += " Plain-colour training (SH degree 0) works."
+    elif sh0 is None:
+        text += " Whether plain-colour training (SH degree 0) works is not known."
+    else:
+        text += (" Plain-colour training (SH degree 0) failed, so Brush will train with SH degree 1"
+                 " (a little slower).")
+    if result.get("masks"):
+        text += " Masked and transparent pictures can be mixed."
+    else:
+        text += " Masked pictures could not be mixed with transparent ones, so polishing will not use masks."
+    return text
+
+
 __all__ = [
     "ColmapInfo",
+    "SELFTEST_STEPS",
     "brush_args",
+    "brush_selftest",
+    "brush_test_verdict",
     "camera_centers",
     "camera_up_vector",
     "capture_to_splat",
@@ -1068,4 +1606,7 @@ __all__ = [
     "run_task",
     "select_sharp",
     "sharpness",
+    "train_splat",
+    "write_colmap_text",
+    "write_selftest_dataset",
 ]

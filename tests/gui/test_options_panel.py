@@ -182,6 +182,7 @@ def test_seed_and_texture_follow_the_method(panel_factory):
     for method, seed_on, texture_on in (
         ("billboard", False, False),
         ("sharp", False, False),
+        ("sharp360", False, False),  # the built-in back is deterministic (no seed this release)
         ("trellis", True, False),
         ("trellis2", True, False),
         ("hunyuan", True, True),
@@ -191,6 +192,69 @@ def test_seed_and_texture_follow_the_method(panel_factory):
         assert p.form.editors["hunyuan_texture"].isEnabled() is texture_on, method
     p.form.set_values({"method": "hunyuan", "hunyuan_texture": True})
     assert p.build_spec(["x.jpg"]).hunyuan_texture is True
+
+
+SHARP360_FIELDS = ("back_source", "back_quality", "seam_deg", "size_from", "save_extras")
+
+
+@pytest.mark.parametrize("method", ["billboard", "trellis", "sharp", "trellis2", "hunyuan", "sharp360"])
+def test_sharp360_fields_follow_the_method(panel_factory, method):
+    """The SHARP 360 options are greyed out for every other method; thickness and back side
+    serve both the billboard and the SHARP 360 built-in back."""
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values({"method": method})
+    on = method == "sharp360"
+    for name in SHARP360_FIELDS:
+        assert p.form.editors[name].isEnabled() is on, (method, name)
+        assert p.form.labels[name].isEnabled() is on, (method, name)
+    for name in ("thickness", "back"):
+        assert p.form.editors[name].isEnabled() is (method in ("billboard", "sharp360")), (method, name)
+
+
+def test_sharp360_hidden_unless_experimental(panel_factory):
+    assert "sharp360" not in panel_factory("object").form.editors["method"].values()
+    assert "sharp360" in panel_factory("object", show_experimental=True).form.editors["method"].values()
+
+
+def test_sharp360_options_round_trip(panel_factory):
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values(
+        {
+            "method": "sharp360",
+            "back_source": "shell",
+            "back_quality": "best",
+            "seam_deg": 55.0,
+            "size_from": "photo",
+            "save_extras": True,
+            "thickness": 0.14,
+            "back": "mirror",
+        }
+    )
+    spec = p.build_spec(["x.jpg"])
+    assert (spec.method, spec.back_source, spec.back_quality, spec.size_from) == (
+        "sharp360",
+        "shell",
+        "best",
+        "photo",
+    )
+    assert spec.seam_deg == pytest.approx(55.0) and spec.save_extras is True
+    assert spec.thickness == pytest.approx(0.14) and spec.back == "mirror"
+    assert job_from_dict(json.loads(json.dumps(job_to_dict(spec)))) == spec
+    # the slider snaps to 5° steps; the spin box keeps an exact typed value
+    ed = p.form.editors["seam_deg"]
+    ed.slider.setValue(ed.slider.maximum())
+    assert ed.value() == pytest.approx(80.0)
+    q = panel_factory("object", show_experimental=True)
+    q.load_options(p.options_dict())
+    assert q.build_spec(["x.jpg"]) == p.build_spec(["x.jpg"])
+
+
+def test_sharp360_presets_set_the_back_quality(panel_factory):
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values({"method": "sharp360"})
+    for name, quality in (("Comfortable", "fast"), ("Strong 3D", "balanced"), ("Max quality", "best")):
+        p.apply_preset(name)
+        assert p.build_spec(["x.jpg"]).back_quality == quality, name
 
 
 def test_capture_subject_height_shows_automatic(panel_factory):

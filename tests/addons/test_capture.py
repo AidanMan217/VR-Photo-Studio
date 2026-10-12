@@ -691,3 +691,312 @@ def test_fit_affine():
     line = np.column_stack([np.arange(10.0), np.zeros(10), np.zeros(10)])
     assert capture._fit_affine(line, line * [1, -1, -1] + [0, 1, 0]) is None  # ambiguous
     assert capture._fit_affine(src[:3], dst[:3]) is None
+
+
+# ------------------------------------------------------------------ SHARP 360: Brush (design §3.11, §4.5)
+def _random_rotation(rng: np.random.Generator) -> np.ndarray:
+    q = rng.normal(size=4)
+    return capture._quat_to_R(q / np.linalg.norm(q))
+
+
+def _read_colmap_text(model: Path) -> tuple[dict, list]:
+    """Minimal COLMAP text reader (cameras.txt + images.txt) for the round-trip tests."""
+    cams = {}
+    for ln in (model / "cameras.txt").read_text(encoding="utf-8").splitlines():
+        if ln and not ln.startswith("#"):
+            p = ln.split()
+            assert p[1] == "PINHOLE"
+            cams[int(p[0])] = (int(p[2]), int(p[3]), *map(float, p[4:8]))
+    lines = (model / "images.txt").read_text(encoding="utf-8").splitlines()
+    while lines and lines[0].startswith("#"):
+        lines.pop(0)
+    images = []
+    for img_line, pts_line in zip(lines[0::2], lines[1::2]):
+        p = img_line.split()
+        assert pts_line == ""  # no 2D points: the second line of each image is empty
+        images.append((p[9], np.array(p[1:5], float), np.array(p[5:8], float), int(p[8])))
+    return cams, images
+
+
+def test_brush_args_extra(tmp_path):
+    base = capture.brush_args(tmp_path / "ds", tmp_path / "out", steps=300, max_splats=1000)
+    a = capture.brush_args(tmp_path / "ds", tmp_path / "out", steps=300, max_splats=1000,
+                           extra=["--sh-degree", 0, "--max-resolution", "1024"])
+    assert a == [*base, "--sh-degree", "0", "--max-resolution", "1024"]  # appended, as strings
+
+
+def test_rot_to_quat_inverts_quat_to_R():
+    rng = np.random.default_rng(5)
+    rots = [_random_rotation(rng) for _ in range(200)]
+    rots += [np.diag([1.0, -1.0, -1.0]), np.diag([-1.0, 1.0, -1.0]), np.diag([-1.0, -1.0, 1.0]), np.eye(3)]
+    for R in rots:  # includes 180-degree turns (negative trace branch)
+        q = capture._rot_to_quat(R)
+        assert q[0] >= 0 and abs(np.linalg.norm(q) - 1) < 1e-12
+        np.testing.assert_allclose(capture._quat_to_R(q), R, atol=1e-12)
+
+
+def test_write_colmap_text_round_trip(tmp_path):
+    """A point projects through the written camera exactly as through the given one."""
+    rng = np.random.default_rng(11)
+    cams, truth = [], []
+    for k in range(5):
+        R = _random_rotation(rng)
+        C = rng.normal(size=3) * 3
+        t = -R @ C
+        K = np.array([[700.0 + 37 * k, 0, 321.3], [0, 705.5 + k, 239.7], [0, 0, 1]])
+        cams.append((f"img_{k}.png", K, R, t, (640, 480)))
+        truth.append((K, R, t))
+    pts = rng.normal(size=(50, 3))
+    model = capture.write_colmap_text(tmp_path / "ds", cams, pts, rng.uniform(0, 1, size=(50, 3)))
+    assert model == tmp_path / "ds" / "sparse" / "0"
+    read_cams, images = _read_colmap_text(model)
+    assert [n for n, *_ in images] == [c[0] for c in cams]
+    X = np.array([0.3, -0.2, 0.25])
+    for (name, q, t, cam_id), (K, R, t_true) in zip(images, truth):
+        w, h, fx, fy, cx, cy = read_cams[cam_id]
+        assert (w, h) == (640, 480)
+        K_read = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+        x_true = K @ (R @ X + t_true)
+        x_read = K_read @ (capture._quat_to_R(q) @ X + t)
+        err = np.abs(x_true[:2] / x_true[2] - x_read[:2] / x_read[2]).max()
+        assert err < 1e-6, (name, err)
+    rows = [ln.split() for ln in (model / "points3D.txt").read_text().splitlines() if not ln.startswith("#")]
+    assert len(rows) == 50 and len(rows[0]) == 8  # id x y z r g b error, empty track
+    np.testing.assert_allclose(np.array([r[1:4] for r in rows], float), pts, atol=1e-6)
+    assert all(0 <= int(v) <= 255 for r in rows for v in r[4:7])
+
+
+def test_write_colmap_text_reads_sizes_and_validates(tmp_path):
+    ds = tmp_path / "ds"
+    (ds / "images").mkdir(parents=True)
+    _write_jpg(ds / "images" / "a.jpg", _texture(48, 80, 0))
+    K = np.array([[100.0, 0, 40], [0, 100, 24], [0, 0, 1]])
+    model = capture.write_colmap_text(ds, [("a.jpg", K, np.eye(3), np.zeros(3))])  # no points: empty file
+    cams, images = _read_colmap_text(model)
+    assert cams[1][:2] == (80, 48) and images[0][0] == "a.jpg"
+    assert "Number of points: 0" in (model / "points3D.txt").read_text()
+    with pytest.raises(InputError, match="size"):
+        capture.write_colmap_text(ds, [("missing.jpg", K, np.eye(3), np.zeros(3))])
+    with pytest.raises(InputError, match="twice"):
+        capture.write_colmap_text(ds, [("a.jpg", K, np.eye(3), np.zeros(3))] * 2)
+    with pytest.raises(InputError, match="rotation"):
+        capture.write_colmap_text(ds, [("a.jpg", K, np.diag([1.0, 1, -1]), np.zeros(3))])  # a mirror
+    with pytest.raises(InputError, match="name"):
+        capture.write_colmap_text(ds, [("my photo.jpg", K, np.eye(3), np.zeros(3), (8, 8))])
+    skew = K.copy()
+    skew[0, 1] = 3.0
+    with pytest.raises(InputError, match="pinhole"):
+        capture.write_colmap_text(ds, [("a.jpg", skew, np.eye(3), np.zeros(3))])
+    with pytest.raises(InputError, match="No cameras"):
+        capture.write_colmap_text(ds, [])
+
+
+@pytest.fixture
+def fake_brush(monkeypatch, tmp_path):
+    """Only the fake Brush (the real splat module reads and writes the PLY files)."""
+    log = tmp_path / "tools.jsonl"
+    monkeypatch.setenv("VRPHOTO_BRUSH", str(FAKES / "fake_brush.py"))
+    monkeypatch.setenv("FAKE_TOOL_LOG", str(log))
+    for k in ("FAKE_BRUSH_SLEEP", "FAKE_BRUSH_FAIL", "FAKE_BRUSH_PLY", "FAKE_BRUSH_ECHO_INIT",
+              "FAKE_BRUSH_FAIL_SH0"):
+        monkeypatch.delenv(k, raising=False)
+
+    def calls():
+        lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        return [c for c in map(json.loads, lines) if c[0] == "brush" and "--total-steps" in c]
+
+    return SimpleNamespace(log=log, calls=calls)
+
+
+@pytest.fixture
+def selftest_ds(tmp_path) -> Path:
+    pytest.importorskip("vrphoto.geometry.splat")
+    ds = tmp_path / "ds"
+    capture.write_selftest_dataset(ds)
+    return ds
+
+
+def test_selftest_dataset_is_consistent(selftest_ds):
+    """The rendered sphere lands where the written cameras project it, and the masked views
+    carry a mask exactly over the sphere."""
+    cams, images = _read_colmap_text(selftest_ds / "sparse" / "0")
+    assert len(images) == 8
+    for name, q, t, cam_id in images:
+        w, h, fx, fy, cx, cy = cams[cam_id]
+        R = capture._quat_to_R(q)
+        c = np.array([fx, fy]) * (t[:2] / t[2]) + [cx, cy]  # the sphere centre (world origin)
+        img = cv2.imdecode(np.fromfile(str(selftest_ds / "images" / name), np.uint8), cv2.IMREAD_UNCHANGED)
+        mask_path = selftest_ds / "masks" / name
+        cover = (cv2.imdecode(np.fromfile(str(mask_path), np.uint8), cv2.IMREAD_GRAYSCALE) > 0
+                 if mask_path.is_file() else img[..., 3] > 0)
+        ys, xs = np.nonzero(cover)
+        assert abs(xs.mean() + 0.5 - c[0]) < 0.5 and abs(ys.mean() + 0.5 - c[1]) < 0.5, name
+        radius_px = fx * capture._SELFTEST_RADIUS_M / np.linalg.norm(-R.T @ t)
+        assert cover.sum() == pytest.approx(np.pi * radius_px**2, rel=0.05)
+        assert img.shape[2] == (3 if mask_path.is_file() else 4)
+    assert len(list((selftest_ds / "masks").iterdir())) == 2
+    init = pytest.importorskip("vrphoto.geometry.splat").read_splats(selftest_ds / "init.ply")
+    np.testing.assert_allclose(np.linalg.norm(init.means, axis=1), capture._SELFTEST_RADIUS_M, rtol=1e-5)
+
+
+def test_train_splat_progress_and_export(fake_brush, selftest_ds, tmp_path):
+    rec: list[tuple[float, str]] = []
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "polished.ply").write_bytes(b"stale")  # an old export must not be returned
+    ply = capture.train_splat(selftest_ds, out, steps=600, max_splats=5000, export_name="polished.ply",
+                              extra_args=["--sh-degree", "0"], seed=7, label="Polishing with Brush",
+                              progress=ProgressReporter(lambda f, m: rec.append((f, m))))
+    assert ply == out / "polished.ply" and ply.read_bytes() != b"stale"
+    call = fake_brush.calls()[-1]
+    assert call[1] == str(selftest_ds) and call[-2:] == ["--sh-degree", "0"]
+    assert call[call.index("--seed") + 1] == "7" and call[call.index("--export-path") + 1] == str(out)
+    assert [m for _, m in rec] == [f"Polishing with Brush (step {i}/600)" for i in (200, 400, 600)]
+    assert [f for f, _ in rec] == pytest.approx([1 / 3, 2 / 3, 1.0])
+    assert "Refine iter 600" in (out / "brush.log").read_text(encoding="utf-8")
+
+
+def test_train_splat_failures(fake_brush, selftest_ds, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_BRUSH_FAIL", "1")
+    with pytest.raises(AddonError, match="Brush training failed") as ei:
+        capture.train_splat(selftest_ds, tmp_path / "o1", steps=200, max_splats=100)
+    assert "memory" in ei.value.hint  # the OOM hint
+    monkeypatch.delenv("FAKE_BRUSH_FAIL")
+    monkeypatch.setenv("FAKE_BRUSH_FAIL_SH0", "1")
+    with pytest.raises(AddonError) as ei:
+        capture.train_splat(selftest_ds, tmp_path / "o2", steps=200, max_splats=100,
+                            extra_args=["--sh-degree", "0"])
+    assert "memory" not in ei.value.hint and "brush log" in ei.value.hint
+    # the same dataset trains with SH degree 1: only the SH-0 run fails
+    capture.train_splat(selftest_ds, tmp_path / "o3", steps=200, max_splats=100,
+                        extra_args=["--sh-degree", "1"])
+    with pytest.raises(InputError, match="does not exist"):
+        capture.train_splat(tmp_path / "nope", tmp_path / "o4", steps=200, max_splats=100)
+    with pytest.raises(InputError, match="positive"):
+        capture.train_splat(selftest_ds, tmp_path / "o4", steps=0, max_splats=100)
+
+
+def test_fake_brush_checks_known_camera_datasets(fake_brush, selftest_ds, tmp_path):
+    """The fake rejects a dataset whose images.txt names a missing picture or whose masks
+    have no picture, so the self-test really exercises the dataset layout."""
+    (selftest_ds / "images" / "view_03.png").unlink()
+    with pytest.raises(AddonError):
+        capture.train_splat(selftest_ds, tmp_path / "o", steps=200, max_splats=100)
+    assert "missing" in (tmp_path / "o" / "brush.log").read_text(encoding="utf-8")
+
+
+def test_brush_selftest_passes(fake_brush, monkeypatch, isolated_home):
+    monkeypatch.setenv("FAKE_BRUSH_ECHO_INIT", "1")
+    rec: list[float] = []
+    r = capture.brush_selftest(progress=ProgressReporter(lambda f, m: rec.append(f)))
+    assert r["ok"] and r["sh0"] and r["masks"] and "error" not in r
+    assert r["splats"] == capture._SELFTEST_INIT_POINTS  # the echoed init.ply
+    assert r["brush_version"] == "0.3.0" and r["steps"] == capture.SELFTEST_STEPS == 300
+    assert r["steps_per_s"] > 0 and r["seconds"] >= 0
+    assert [a["ok"] for a in r["attempts"]] == [True]
+    call = fake_brush.calls()[-1]
+    assert call[call.index("--total-steps") + 1] == "300" and call[-2:] == ["--sh-degree", "0"]
+    assert Path(r["log"]).is_file() and Path(r["log"]).is_relative_to(isolated_home)
+    assert rec[-1] == pytest.approx(1.0)
+    json.dumps(r)  # stored in settings.json
+    assert not Path(call[1]).exists()  # the temporary dataset is removed afterwards
+    text = capture.brush_test_verdict(r)
+    assert "Brush works" in text and "SH degree 0) works" in text and "can be mixed" in text
+
+
+def test_brush_selftest_retries_with_sh1(fake_brush, monkeypatch, tmp_path):
+    monkeypatch.setenv("FAKE_BRUSH_FAIL_SH0", "1")
+    r = capture.brush_selftest(work_dir=tmp_path / "bt")
+    assert r["ok"] and r["sh0"] is False and r["masks"] and r["sh_option"]
+    runs = [(a["sh_degree"], a["masks"], a["ok"]) for a in r["attempts"]]
+    assert runs == [(0, True, False), (1, True, True)]
+    assert [c[c.index("--sh-degree") + 1] for c in fake_brush.calls()] == ["0", "1"]
+    assert (tmp_path / "bt" / "dataset" / "init.ply").is_file()  # work_dir is kept
+    assert "SH degree 1" in capture.brush_test_verdict(r)
+
+
+def test_brush_selftest_failure_is_reported(fake_brush, monkeypatch):
+    monkeypatch.setenv("FAKE_BRUSH_FAIL", "1")
+    r = capture.brush_selftest()
+    assert not r["ok"] and not r["sh0"] and not r["masks"] and "Brush training failed" in r["error"]
+    assert not r["sh_option"]
+    assert [(a["sh_degree"], a["masks"]) for a in r["attempts"]] == [
+        (0, True),
+        (1, True),
+        (0, False),
+        (1, False),
+        (None, False),  # Brush's own defaults: tells "cannot train" from "option not accepted"
+    ]
+    assert "--sh-degree" not in fake_brush.calls()[-1]
+    assert r["steps_per_s"] is None and r["splats"] == 0
+    assert "could not train" in capture.brush_test_verdict(r)
+    assert "not been tested" in capture.brush_test_verdict({})
+
+
+def _picky_brush(monkeypatch, *, masks_fail=False, sh0_fail=False, sh_option_fail=False):
+    """Brush that fails when the dataset has masks / with ``--sh-degree 0`` / with any
+    ``--sh-degree``; records ``(sh degree or None, masks)`` per run."""
+    real = capture.train_splat
+    runs: list[tuple] = []
+
+    def picky(dataset, *a, extra_args=(), **kw):
+        args = list(extra_args)
+        sh = int(args[args.index("--sh-degree") + 1]) if "--sh-degree" in args else None
+        runs.append((sh, (Path(dataset) / "masks").is_dir()))
+        if (masks_fail and runs[-1][1]) or (sh0_fail and sh == 0) or (sh_option_fail and sh is not None):
+            raise AddonError("Brush training failed (exit code 101).")
+        return real(dataset, *a, extra_args=extra_args, **kw)
+
+    monkeypatch.setattr(capture, "train_splat", picky)
+    return runs
+
+
+def test_brush_selftest_without_masks(fake_brush, monkeypatch, tmp_path):
+    """Masked views are the only problem: SH degree 0 is then tried without masks and works,
+    so it is not blamed (it failed only next to the masks)."""
+    runs = _picky_brush(monkeypatch, masks_fail=True)
+    r = capture.brush_selftest(work_dir=tmp_path / "bt")
+    assert r["ok"] and not r["masks"] and r["sh0"] is True and r["sh_option"]
+    assert runs == [(0, True), (1, True), (0, False)]
+    text = capture.brush_test_verdict(r)
+    assert "will not use masks" in text and "SH degree 0) works" in text
+
+
+def test_brush_selftest_without_masks_and_sh0(fake_brush, monkeypatch, tmp_path):
+    runs = _picky_brush(monkeypatch, masks_fail=True, sh0_fail=True)
+    r = capture.brush_selftest(work_dir=tmp_path / "bt")
+    assert r["ok"] and not r["masks"] and r["sh0"] is False
+    assert runs == [(0, True), (1, True), (0, False), (1, False)]
+    assert "SH degree 1" in capture.brush_test_verdict(r)
+
+
+def test_brush_selftest_brush_without_the_sh_option(fake_brush, monkeypatch, tmp_path):
+    """A Brush that rejects ``--sh-degree`` still trains with its defaults: reported as such,
+    not as "Brush could not train", and SH degree 0 is unknown (None), not failed."""
+    runs = _picky_brush(monkeypatch, sh_option_fail=True)
+    r = capture.brush_selftest(work_dir=tmp_path / "bt")
+    assert r["ok"] and r["sh0"] is None and r["sh_option"] is False and not r["masks"]
+    assert runs[-1] == (None, False) and len(runs) == 5
+    text = capture.brush_test_verdict(r)
+    assert "Brush works" in text and "did not accept" in text and "could not train" not in text
+    json.dumps(r)
+
+
+def test_brush_selftest_cancel_and_missing_brush(fake_brush, monkeypatch, tmp_path):
+    token = CancelToken()
+    token.cancel()
+    with pytest.raises(Cancelled):
+        capture.brush_selftest(cancel=token, work_dir=tmp_path / "bt")
+    monkeypatch.delenv("VRPHOTO_BRUSH")
+    monkeypatch.setattr(manager.shutil, "which", lambda name: None)
+    with pytest.raises(AddonNotInstalled):
+        capture.brush_selftest()
+
+
+def test_brush_selftest_times_the_training_steps(fake_brush, monkeypatch):
+    """steps/s counts from Brush's first progress line (step 200 of 300 in the fake, which
+    then sleeps 0.6 s), not from the process start."""
+    monkeypatch.setenv("FAKE_BRUSH_SLEEP", "0.6")
+    r = capture.brush_selftest()
+    assert r["ok"]
+    assert 0 < r["steps_per_s"] <= 100 / 0.6 + 1e-6

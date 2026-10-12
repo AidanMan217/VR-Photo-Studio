@@ -2,7 +2,9 @@
 
 One card per add-on with its description, GPU memory / disk requirements compared with
 this PC, license notes (non-commercial, region restrictions), Install with live progress
-+ log tail + cancel, Uninstall and "Open folder".
++ log tail + cancel, Uninstall and "Open folder".  The installed Capture add-on also gets
+"Test Brush on this PC" (:func:`vrphoto.addons.capture.brush_selftest`); the result is
+kept in ``Settings.brush_test``.
 """
 
 from __future__ import annotations
@@ -33,6 +35,21 @@ from ..workers import DIALOG_CLOSE_WAIT_MS, TaskRunner, Worker
 from . import common as dc
 
 log = get_logger(__name__)
+
+#: The add-on whose card offers the Brush self-test (Brush ships with Capture).
+BRUSH_ADDON = "capture"
+
+
+def brush_test_summary(result: dict[str, Any] | None) -> str:
+    """One line about the last Brush test (tooltip of the test button)."""
+    if not result:
+        return "Not tested yet."
+    when = str(result.get("date", "")).replace("T", " ")[:16]
+    if result.get("ok"):
+        rate = result.get("steps_per_s")
+        speed = f", {float(rate):.1f} steps/s" if rate else ""
+        return f"Last test {when}: Brush works{speed}."
+    return f"Last test {when}: Brush could not train."
 
 
 def detect_gpu() -> dict[str, Any]:
@@ -128,6 +145,7 @@ class AddonCard(QFrame):
     uninstallRequested = Signal(str)
     cancelRequested = Signal(str)
     folderRequested = Signal(str)
+    testRequested = Signal(str)
 
     def __init__(self, manifest: Any, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -177,14 +195,25 @@ class AddonCard(QFrame):
         self.folder_button = QPushButton("Open folder")
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setVisible(False)
+        # only shown on the installed Capture card (see set_status)
+        self.test_button = QPushButton("Test Brush on this PC")
+        self.test_button.setVisible(False)
+        self._test_tip = (
+            "Trains Brush for a minute or two on a small test scene to check that it works with "
+            "your graphics card, and how fast. SHARP 360 uses the result to decide whether its "
+            "optional Brush polishing can be offered."
+        )
+        self.set_test_result(None)
         self.install_button.clicked.connect(lambda: self.installRequested.emit(self.m.id))
         self.uninstall_button.clicked.connect(lambda: self.uninstallRequested.emit(self.m.id))
         self.cancel_button.clicked.connect(lambda: self.cancelRequested.emit(self.m.id))
         self.folder_button.clicked.connect(lambda: self.folderRequested.emit(self.m.id))
+        self.test_button.clicked.connect(lambda: self.testRequested.emit(self.m.id))
         btns = QHBoxLayout()
         btns.addWidget(self.install_button)
         btns.addWidget(self.uninstall_button)
         btns.addWidget(self.folder_button)
+        btns.addWidget(self.test_button)
         btns.addStretch(1)
         btns.addWidget(self.cancel_button)
 
@@ -258,9 +287,14 @@ class AddonCard(QFrame):
         self.uninstall_button.setVisible(installed or bool(status.get("partial")))
         self.uninstall_button.setEnabled(not any_busy)
         self.folder_button.setEnabled(Path(str(status.get("path", ""))).is_dir())
+        self.test_button.setVisible(self.m.id == BRUSH_ADDON and installed)
+        self.test_button.setEnabled(not any_busy)
         self.cancel_button.setVisible(busy)
         if not supported:
             self.install_button.setToolTip("Not available on this operating system.")
+
+    def set_test_result(self, result: dict[str, Any] | None) -> None:
+        self.test_button.setToolTip(f"{self._test_tip}\n\n{brush_test_summary(result)}")
 
     def begin(self, title: str) -> None:
         self.progress.setValue(0)
@@ -314,6 +348,7 @@ class AddonsDialog(QDialog):
         self._empty_label: QLabel | None = None
         self.worker: Worker | None = None
         self.active_id: str | None = None
+        self.testing = False  # the running task is the Brush test (not an install)
         self.gpu: dict[str, Any] | None = None
         self.statuses: dict[str, dict[str, Any]] = {}
         self._status_gen = 0
@@ -401,6 +436,8 @@ class AddonsDialog(QDialog):
             card.uninstallRequested.connect(self.uninstall)
             card.cancelRequested.connect(self.cancel)
             card.folderRequested.connect(self.open_folder)
+            card.testRequested.connect(self.test_brush)
+            card.set_test_result(getattr(self.settings, "brush_test", None))
             card.set_requirements(self.gpu, free)
             self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
             self.cards[m.id] = card
@@ -611,18 +648,75 @@ class AddonsDialog(QDialog):
         if p and Path(p).is_dir():
             util.open_path(p)
 
+    def test_brush(self, addon_id: str = BRUSH_ADDON) -> bool:
+        """Run the Brush self-test in the background; the verdict is shown in a message box
+        and stored in ``Settings.brush_test``."""
+        if self.active_id is not None:
+            return False
+        try:
+            from ...addons import capture
+        except Exception as e:
+            util.show_error(self, "Brush test", e)
+            return False
+        card = self.cards.get(addon_id)
+        self.active_id = addon_id
+        self.testing = True
+        if card:
+            card.begin("Testing Brush on this PC… this takes a minute or two.")
+            card.log_view.setVisible(False)  # the install log is not this task's log
+        self.worker = self.tasks.start(
+            capture.brush_selftest,
+            on_progress=lambda f, msg: card.set_progress(f, msg) if card else None,
+            on_result=lambda r: self._test_finished(addon_id, r, None),
+            on_error=lambda e: self._test_finished(addon_id, None, e),
+            on_cancelled=lambda: self._test_finished(addon_id, None, "cancel"),
+            name="brush-test",
+        )
+        self._apply_status()
+        return True
+
+    def _test_finished(self, addon_id: str, result: dict[str, Any] | None, error: Any) -> None:
+        self.active_id = None
+        self.worker = None
+        self.testing = False
+        card = self.cards.get(addon_id)
+        if error == "cancel":
+            msg = "Brush test cancelled."
+        elif error is not None:
+            text, _hint = util.error_text(error)
+            msg = f"Brush test failed: {text}"
+            util.show_error(self, "Brush test failed", error)
+        else:
+            from ...addons import capture
+
+            result = dict(result or {})
+            self.settings.brush_test = result
+            dc.save_settings(self.settings)
+            verdict = capture.brush_test_verdict(result)
+            if card:
+                card.set_test_result(result)
+            if result.get("ok"):
+                msg = "Brush works on this PC."
+                util.show_info(self, "Brush test", verdict)
+            else:
+                msg = "Brush could not train on this PC."
+                util.show_error(self, "Brush test", verdict)
+        if card:
+            card.end(msg)
+        self._apply_status()
+
     # ---------------------------------------------------------------- closing
     def busy(self) -> bool:
         return self.active_id is not None
 
     def done(self, result: int) -> None:  # noqa: D401 - QDialog API
         if self.worker is not None and self.active_id is not None:
-            if not util.ask_yes_no(
-                self,
-                "Installation in progress",
-                "Cancel the installation and close?",
-                informative="You can resume it later; finished steps are kept.",
-            ):
+            if self.testing:
+                title, question, info = "Brush test running", "Stop the Brush test and close?", None
+            else:
+                title, question = "Installation in progress", "Cancel the installation and close?"
+                info = "You can resume it later; finished steps are kept."
+            if not util.ask_yes_no(self, title, question, informative=info):
                 return
             self.worker.cancel()
         self.log_timer.stop()

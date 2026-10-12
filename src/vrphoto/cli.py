@@ -9,7 +9,7 @@ matches what the GUI can do)::
     vrphoto-cli run --spec job.json
     vrphoto-cli serve                      # start the Quest viewer, prints URL + QR code
     vrphoto-cli models list | download da2-small | delete da2-small | path da2-small
-    vrphoto-cli addons list | status trellis | install trellis | check trellis
+    vrphoto-cli addons list | status trellis | install trellis | check trellis | brush-test
     vrphoto-cli selftest --json            # same as: vrphoto-cli --selftest --json
     vrphoto-cli devices | version
 
@@ -326,6 +326,9 @@ def _choices_table() -> dict[tuple[str, str], tuple[str, ...]]:
         ("object", "method"): R.OBJECT_METHODS,
         ("object", "back"): R.BACKS,
         ("object", "placement"): R.PLACEMENTS,
+        ("object", "back_source"): R.BACK_SOURCES,
+        ("object", "back_quality"): R.BACK_QUALITIES,
+        ("object", "size_from"): R.SIZE_FROM,
         ("video", "output"): R.VIDEO_OUTPUTS,
         ("video", "encoder_preset"): presets,
         ("common", "quest_model"): R.QUEST_MODELS,
@@ -649,6 +652,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="also test CUDA (default: only when an NVIDIA GPU is present)",
     )
+    asub.add_parser(
+        "brush-test",
+        parents=[parent],
+        help="check that Brush (Capture add-on) can train on this PC (takes 1-2 minutes)",
+        description="Trains Brush for a few hundred steps on a small built-in test scene and reports "
+        "the speed and which training options work. The result is remembered for SHARP 360.",
+    )
 
     st = sub.add_parser("selftest", parents=[parent], help="check that the installation works")
     st.add_argument("--out", type=Path, default=None, help="also write the JSON report to this file")
@@ -941,6 +951,8 @@ def _cmd_addons(console: Console, ns: argparse.Namespace) -> int:
                 flags += " [non-commercial]" if r["noncommercial"] else ""
                 console.info(f"{r['id']:10s} {status:10s} {r['title']}{flags}")
         return EXIT_OK
+    if ns.action == "brush-test":
+        return _cmd_brush_test(console)
     m = manager.get_manifest(ns.addon_id)
     if ns.action == "status":
         st = {"id": m.id, "title": m.title, **manager.status(m.id)}
@@ -991,6 +1003,37 @@ def _cmd_addons(console: Console, ns: argparse.Namespace) -> int:
         for k, v in (info or {}).items():
             console.info(f"  {k}: {v}")
     return EXIT_OK
+
+
+def _cmd_brush_test(console: Console) -> int:
+    """``addons brush-test``: exit 0 when Brush trains on this PC, 1 when it does not."""
+    from .addons import capture
+    from .core.config import get_settings
+
+    result = _run_cancellable(
+        console, lambda progress, cancel: capture.brush_selftest(progress=progress, cancel=cancel)
+    )
+    settings = get_settings()
+    settings.brush_test = dict(result)
+    try:
+        settings.save()
+    except Exception as e:  # noqa: BLE001 - the verdict is still printed
+        log.warning("Could not save the Brush test result: %s", e)
+    if console.json_mode:
+        console.emit({"type": "result", **result})
+    else:
+        console.info(capture.brush_test_verdict(result))
+        version = result.get("brush_version") or "unknown"
+        console.info(f"  Brush version: {version}")
+        for a in result.get("attempts", []):
+            sh = "Brush's defaults" if a.get("sh_degree") is None else f"SH degree {a['sh_degree']}"
+            how = f"{sh}, {'with' if a['masks'] else 'without'} masks"
+            outcome = "OK" if a["ok"] else f"failed: {a.get('error', '')}"
+            console.info(f"  {how}: {outcome} ({a.get('seconds', 0):.1f} s)")
+        if result.get("ok"):
+            console.info(f"  Exported splats: {result.get('splats', 0):,}")
+        console.info(f"  Log: {result.get('log', '')}")
+    return EXIT_OK if result.get("ok") else EXIT_ERROR
 
 
 def _cmd_selftest(console: Console, ns: argparse.Namespace) -> int:

@@ -124,6 +124,11 @@ def test_required_addons():
     assert om.required_addon_candidates("object", {"method": "trellis"}) == ("trellis",)
     assert om.required_addon_candidates("vr180", {"fill": "outpaint"}) == ("sdxl360",)
     assert om.required_addon_candidates("unknown", {}) == ()
+    # SHARP 360 needs only SHARP: the built-in back needs nothing
+    req = om.required_addon_candidates
+    assert req("object", {"method": "sharp360"}) == ("sharp",)
+    assert req("object", {"method": "sharp360", "back_source": "shell"}) == ("sharp",)
+    assert req("object", {"method": "billboard", "back_source": "auto"}) == ()
 
 
 def test_addon_choice_ids_match_manifests():
@@ -145,6 +150,77 @@ def test_seed_is_not_offered_for_sharp():
     assert other == "method"
     assert "sharp" not in allowed
     assert set(allowed) == {"trellis", "trellis2", "hunyuan"}
+
+
+def test_seed_is_not_offered_for_sharp360_in_this_release():
+    """SHARP 360's built-in back is deterministic too (the seed arrives with the AI backs)."""
+    _other, allowed = om.JOB_META["object"]["seed"].enabled_if
+    assert "sharp360" not in allowed
+
+
+# --------------------------------------------------------------------------- SHARP 360
+SHARP360_FIELDS = ("back_source", "back_quality", "seam_deg", "size_from", "save_extras")
+
+
+def test_sharp360_is_an_experimental_method_that_needs_sharp():
+    meta = om.JOB_META["object"]["method"]
+    assert "sharp360" in meta.choice_values()
+    assert "sharp360" in meta.experimental_choices
+    assert meta.addon_choices["sharp360"] == ("sharp",)
+    label = dict(meta.choices)["sharp360"]
+    assert label.startswith("SHARP 360") and "experimental" in label
+    assert "SHARP 360" in meta.tooltip and "walk all the way round" in meta.tooltip
+
+
+def test_sharp360_choices_match_the_runner():
+    """The GUI offers exactly what the job accepts (pipeline/run.py constants)."""
+    from vrphoto.pipeline import run as R
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    obj = om.JOB_META["object"]
+    assert tuple(obj["back_source"].choice_values()) == R.BACK_SOURCES
+    assert tuple(obj["back_quality"].choice_values()) == R.BACK_QUALITIES
+    assert tuple(obj["size_from"].choice_values()) == R.SIZE_FROM
+    assert "sharp360" in R.OBJECT_METHODS
+    job = ObjectJob()
+    assert (job.back_source, job.back_quality, job.size_from) == ("auto", "balanced", "auto")
+    assert job.seam_deg == 60.0 and job.save_extras is False
+
+
+def test_sharp360_fields_metadata():
+    obj = om.JOB_META["object"]
+    for name in SHARP360_FIELDS:
+        assert obj[name].enabled_if == ("method", ("sharp360",)), name
+        assert "SHARP 360" in obj[name].tooltip, name
+    assert obj["back_source"].label == "Back made by"
+    assert dict(obj["back_source"].choices) == {"auto": "Automatic", "shell": "Built-in shape (no download)"}
+    assert not obj["back_source"].advanced and not obj["back_quality"].advanced
+    assert dict(obj["back_quality"].choices)["best"].startswith("Best")
+    seam = obj["seam_deg"]
+    assert (seam.kind, seam.minimum, seam.maximum, seam.step, seam.unit) == ("slider", 35, 80, 5, "°")
+    assert seam.advanced and seam.label == "Keep the photo up to"
+    assert obj["size_from"].advanced
+    assert dict(obj["size_from"].choices) == {
+        "auto": "Automatic",
+        "height": "Real-world height",
+        "photo": "Measured by SHARP",
+    }
+    assert obj["save_extras"].kind == "check" and obj["save_extras"].advanced
+    # no add-on is attached to a back source yet: the built-in back needs no download
+    assert not obj["back_source"].addon_choices
+
+
+def test_thickness_and_back_apply_to_the_sharp360_built_in_back():
+    obj = om.JOB_META["object"]
+    for name in ("thickness", "back"):
+        assert set(obj[name].enabled_if[1]) == {"billboard", "sharp360"}, name
+        assert "SHARP 360" in obj[name].tooltip
+    assert "back of their head" in obj["back"].tooltip  # mirror puts a face on the back
+
+
+def test_object_presets_set_the_back_quality():
+    presets = om.PRESETS["object"]
+    assert [presets[n]["back_quality"] for n in om.PRESET_NAMES] == ["fast", "balanced", "best"]
 
 
 def test_hunyuan_texture_checkbox_only_for_hunyuan():

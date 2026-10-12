@@ -914,11 +914,23 @@ def _require_addon(addon_id: str) -> Any:
     return m
 
 
+def _free_app_gpu() -> None:
+    """Close the app's own ONNX Runtime sessions (depth, cut-out, fill models) so an add-on
+    process gets the graphics memory; they are re-opened on next use.  Never fails the job."""
+    try:
+        from ..models import ort
+
+        ort.unload_model(wait=True)
+    except Exception:
+        log.warning("Could not release the app's AI models before running an add-on", exc_info=True)
+
+
 def _run_addon(
     run: _Run, item: _Item, addon_id: str, task: str, inputs: dict, params: dict, rep: ProgressReporter
 ) -> dict[str, Any]:
     from ..addons import manager
 
+    _free_app_gpu()  # 8 GB cards: a loaded depth / cut-out model can push the add-on out of memory
     work = run.work_dir(item) / addon_id
     work.mkdir(parents=True, exist_ok=True)
     try:
@@ -1614,6 +1626,33 @@ def _cutout_rgba(rgb: RGB, alpha: FloatMap, margin: float = 0.08) -> np.ndarray:
     return np.dstack([rgb[y0:y1, x0:x1], a])
 
 
+#: Viewer environment of object scenes: shown in passthrough AR on the Quest.
+OBJECT_ENV: dict[str, str] = {"prefer": "ar", "background": "passthrough"}
+
+
+def _save_cutout(run: _Run, item: _Item, photo: _Photo, alpha: FloatMap) -> Path:
+    """Save the subject cut-out (``<base>_cutout.png``) as an output; returns its path."""
+    from ..core.imaging import save_image
+
+    cut = run.out_path(item, "cutout", "png")
+    save_image(cut, _cutout_rgba(photo.rgb, alpha))
+    run.add_output(item, "Cut-out (PNG with transparency)", cut)
+    return cut
+
+
+def _sharp_inputs(run: _Run, item: _Item, photo: _Photo) -> tuple[Path, dict[str, Any]]:
+    """SHARP's input image and parameters: the whole photo (SHARP models the scene, the
+    subject is picked out afterwards) and its horizontal field of view."""
+    from ..core.imaging import save_image
+    from ..geometry.camera import estimate_intrinsics
+
+    K = estimate_intrinsics(photo.rgb.shape, hfov_deg=run.common.hfov_deg, exif_hfov=photo.exif_hfov)
+    params: dict[str, Any] = {"hfov_deg": round(K.hfov_deg, 3), "name": "model"}
+    image_in = run.work_dir(item) / "sharp_input.png"
+    save_image(image_in, photo.rgb)
+    return image_in, params
+
+
 def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     """Walk-around person / object.
 
@@ -1621,35 +1660,46 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
     PNG / HEIC), else from the segmenter.  ``billboard`` inflates it locally (GLB + optional
     splat); the add-on methods get the RGBA cut-out (SHARP: the whole photo, its Gaussians are
     then reduced to the subject) and their GLB is rescaled to ``height_m`` losslessly.
+    ``sharp360`` continues in :func:`vrphoto.pipeline.sharp360.mode_sharp360` once the
+    subject is found.
     """
-    from ..core.imaging import save_image
-
     spec: ObjectJob = run.spec  # type: ignore[assignment]
     method = _choice(spec.method, OBJECT_METHODS, "3D method")
     placement = _choice(spec.placement, PLACEMENTS, "placement")
     height = _positive(spec.height_m, "Height")
     back = _choice(spec.back, BACKS, "back texture")
     thickness = _positive(spec.thickness, "Thickness", allow_zero=True)
+    s360_opts = None
+    if method == "sharp360":
+        from . import sharp360
+
+        s360_opts = sharp360.resolve_options(spec, installed=_addon_installed)  # bad options: before work
     manifest = None
     if method in ADDON_METHODS:
         manifest = _require_addon(ADDON_METHODS[method][0])  # fail fast, before any work
     photo = _load_photo(run, item, rep.sub(0.0, 0.04), with_alpha=True)
+    found = 0.10 if method == "sharp360" else 0.25  # SHARP 360 needs the time for the back
     if photo.alpha is not None:
         from ..segment.matte import clean_matte
 
         # an already cut-out photo (PNG/HEIC with transparency): use its own outline
         log.info("%s has transparency; using it as the cut-out", item.path.name)
         alpha = clean_matte(photo.alpha)
-        rep(0.25, "Using the photo's transparent background as the cut-out")
+        rep(found, "Using the photo's transparent background as the cut-out")
     else:
-        alpha = _segment(run, item, photo.rgb, rep.sub(0.04, 0.25))
+        alpha = _segment(run, item, photo.rgb, rep.sub(0.04, found))
     if float((alpha > 0.5).mean()) < 0.002:
         raise InputError(
             f"No person or object could be found in {item.path.name}.",
             hint="Use a photo where the subject stands out clearly from the background, or try another cut-out model.",
         )
+    if s360_opts is not None:
+        sharp360.mode_sharp360(
+            run, item, photo, alpha, spec, placement=placement, height=height, rep=rep, opts=s360_opts
+        )
+        return
     assets: dict[str, Path | bytes] = {}
-    env = {"prefer": "ar", "background": "passthrough"}
+    env = dict(OBJECT_ENV)
     if method == "billboard":
         from ..geometry.billboard import billboard
         from ..geometry.gltf import write_glb
@@ -1709,22 +1759,15 @@ def _mode_object(run: _Run, item: _Item, rep: ProgressReporter) -> None:
 
     addon_id, task = ADDON_METHODS[method]
     run.addon_notice(item, manifest)
-    cut = run.out_path(item, "cutout", "png")
-    save_image(cut, _cutout_rgba(photo.rgb, alpha))
-    run.add_output(item, "Cut-out (PNG with transparency)", cut)
+    cut = _save_cutout(run, item, photo, alpha)
     params: dict[str, Any] = {"seed": int(spec.seed), "name": "model"}
     if method == "hunyuan":
         params["texture"] = bool(getattr(spec, "hunyuan_texture", False))  # paint a texture (slower)
     image_in = cut
     if method == "sharp":
-        from ..geometry.camera import estimate_intrinsics
-
         if int(spec.seed):
             run.warn(f"{manifest.title} always gives the same result; the 'Variation' number is not used.")
-        K = estimate_intrinsics(photo.rgb.shape, hfov_deg=run.common.hfov_deg, exif_hfov=photo.exif_hfov)
-        params = {"hfov_deg": round(K.hfov_deg, 3), "name": "model"}
-        image_in = run.work_dir(item) / "sharp_input.png"
-        save_image(image_in, photo.rgb)
+        image_in, params = _sharp_inputs(run, item, photo)
     rep(0.3, f"Running {manifest.title}")
     outs = _run_addon(run, item, addon_id, task, {"image": str(image_in)}, params, rep.sub(0.3, 0.9))
     title = manifest.title
@@ -1984,6 +2027,7 @@ def _mode_capture(run: _Run, items: list[_Item], rep: ProgressReporter) -> None:
     paths = [it.path for it in items]
     work = run.work_dir(item) / "capture"
     work.mkdir(parents=True, exist_ok=True)
+    _free_app_gpu()  # COLMAP's GPU SIFT and Brush do not go through _run_addon
     try:
         splat = _call_opt(
             capture_to_splat, paths, work,

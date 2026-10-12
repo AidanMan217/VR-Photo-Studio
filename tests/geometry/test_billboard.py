@@ -8,7 +8,7 @@ import pytest
 
 from vrphoto.core.errors import Cancelled, InputError
 from vrphoto.core.types import CancelToken, DepthResult, Intrinsics, Mesh
-from vrphoto.geometry.billboard import billboard, local_thickness
+from vrphoto.geometry.billboard import _dist, billboard, inflation_profile, local_thickness
 
 
 def _person_photo(alpha: np.ndarray) -> np.ndarray:
@@ -288,3 +288,23 @@ def test_float_and_grayscale_inputs(person):
     assert gray[0].texture.shape[2] == 4
     fl = billboard(img.astype(np.float32) / 255.0, alpha.astype(bool), depth, K)
     np.testing.assert_allclose(fl[0].vertices, ref[0].vertices, atol=1e-6)
+
+
+def test_inflation_profile_is_a_circular_cross_section():
+    """SHARP 360's shell back reuses the billboard profile: full-grid float32 maps, 0 outside."""
+    m = np.zeros((81, 121), bool)
+    cv2.circle(m.view(np.uint8), (40, 40), 25, 1, -1)
+    m[36:45, 66:118] = True  # thin bar: its own small radius
+    prof, dt_eff = inflation_profile(m)
+    assert prof.shape == dt_eff.shape == m.shape and prof.dtype == dt_eff.dtype == np.float32
+    assert (prof[~m] == 0).all() and (dt_eff[~m] == 0).all()
+    np.testing.assert_allclose(dt_eff, np.maximum(_dist(m) - 1.0, 0.0), atol=1e-5)  # cv2 threads: 1 ulp
+    rloc = local_thickness(dt_eff, m)
+    np.testing.assert_allclose(
+        prof[m], np.sqrt(np.maximum(dt_eff * (2 * rloc - dt_eff), 0))[m], rtol=1e-5, atol=1e-4
+    )
+    assert prof[40, 40] == pytest.approx(dt_eff[40, 40], abs=1.0)  # disc centre: the full radius
+    assert prof[40, 100] < 6 and prof[40, 100] < 0.3 * prof[40, 40]  # the bar stays thin
+    assert prof[m & (dt_eff == 0)].max() == 0  # boundary pixels are the silhouette itself
+    empty, dt0 = inflation_profile(np.zeros((5, 7), np.uint8))
+    assert not empty.any() and not dt0.any()

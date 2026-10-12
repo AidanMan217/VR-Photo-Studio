@@ -208,7 +208,7 @@ floor (Quest 3 passthrough) and walk around.
 | Also save splat | Also saves a splat version for the viewer. | On |
 | Placement | *Point at the floor* (you aim at your floor or table and press the trigger), or *In front of me* (appears on the floor 1.5 m ahead). | Point at the floor |
 | Back side *(Advanced)* | (Billboard and SHARP 360°) *Soft colours from the outline* (subtle), or *Mirror of the front* (careful: a person gets their face on the back of their head). | Soft colours |
-| Variation *(Advanced)* | For TRELLIS, TRELLIS.2 and Hunyuan3D: change the number to get a different version. (SHARP and SHARP 360° always give the same result for the same photo.) | 0 |
+| Variation *(Advanced)* | For TRELLIS, TRELLIS.2 and Hunyuan3D: change the number to get a different version. (SHARP always gives the same result for the same photo, and so does SHARP 360°.) | 0 |
 | Paint texture *(Advanced)* | (Hunyuan3D) also paints colours onto the model; without it you get a plain grey shape. Slower, needs more graphics memory, and downloads the painting models (about 8 GB) on the first textured run. Needs the add-on's optional texture-painting part (see [section 8](#8-add-ons)). | Off; on for colour |
 
 **Good photos:** the whole person/object visible (feet included), not cut off at the edges,

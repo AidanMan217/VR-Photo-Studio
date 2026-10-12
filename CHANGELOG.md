@@ -4,9 +4,9 @@ All notable changes to VR Photo Studio are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.0b1] - 2026-10-12
 
-First beta of **SHARP 360°** (planned as 0.2.0-beta1). Design: `docs/design/SHARP360.md`.
+First beta of **SHARP 360°**. Design: `docs/design/SHARP360.md`.
 
 ### Added
 
@@ -35,6 +35,12 @@ First beta of **SHARP 360°** (planned as 0.2.0-beta1). Design: `docs/design/SHA
   of memory" errors on 8 GB cards. They are re-loaded automatically when needed.
 - Settings files with a damaged list or dictionary entry now load that entry's default instead
   of failing.
+
+### Fixed
+
+- **MoGe-2 depth model** always failed ("Ranks of input data are different, cannot concatenate
+  them"), so jobs that asked for it (e.g. the 3D scene *Max quality* preset) used the simple
+  built-in depth estimate instead, with a warning; it works again.
 
 ### Notes
 

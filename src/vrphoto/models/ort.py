@@ -470,7 +470,9 @@ class OrtModel:
             want = _ORT_TYPES.get(t)
             if want is not None and arr.dtype != want:
                 arr = arr.astype(want)
-            out[name] = np.ascontiguousarray(arr)
+            # np.ascontiguousarray turns a 0-d array into shape (1,): scalar inputs (MoGe-2's
+            # num_tokens) must stay rank 0 or the graph's Unsqueeze/Concat fails
+            out[name] = np.ascontiguousarray(arr) if arr.ndim else arr
         return out
 
     def _run_raw(

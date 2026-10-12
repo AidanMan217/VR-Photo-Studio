@@ -119,12 +119,19 @@ def make_moge(path: Path, h: int = 256, w: int = 256) -> Path:
         numpy_helper.from_array(msk, "c_mask"),
         numpy_helper.from_array(scale, "c_scale"),
         numpy_helper.from_array(np.zeros((1, 3, h, w), np.float32), "zero_img"),
+        numpy_helper.from_array(np.array([0], np.int64), "axis0"),
+        numpy_helper.from_array(np.array([0], np.int64), "tok_pad"),
     ]
-    # consume the inputs so they are not pruned: points = c_points + 0*sum(image)
+    # consume the inputs so they are not pruned: points = c_points + 0*sum(image).
+    # Like the real export, num_tokens is unsqueezed and concatenated with a 1-D tensor, so a
+    # feed of rank 1 instead of a scalar fails exactly like MoGe-2 does ("expected rank 1 got 2")
     nodes = [
         helper.make_node("Mul", ["image", "zero_img"], ["z0"]),
         helper.make_node("ReduceSum", ["z0"], ["zs"], keepdims=0),
-        helper.make_node("Cast", ["num_tokens"], ["tokf"], to=TensorProto.FLOAT),
+        helper.make_node("Unsqueeze", ["num_tokens", "axis0"], ["tok1"]),
+        helper.make_node("Concat", ["tok1", "tok_pad"], ["tokcat"], axis=0),
+        helper.make_node("ReduceSum", ["tokcat"], ["toksum"], keepdims=0),
+        helper.make_node("Cast", ["toksum"], ["tokf"], to=TensorProto.FLOAT),
         helper.make_node("Mul", ["tokf", "zs"], ["zz"]),
         helper.make_node("Add", ["c_points", "zz"], ["points"]),
         helper.make_node("Identity", ["c_normal"], ["normal"]),

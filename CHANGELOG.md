@@ -4,7 +4,7 @@ All notable changes to VR Photo Studio are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0b1] - 2026-10-13
 
 **SHARP 360°: MV-Adapter AI views and the Brush polish.** Design: `docs/design/SHARP360.md`
 (milestones M4 and M5). Not yet tested on a GeForce GTX 1080 with the real models; the times below

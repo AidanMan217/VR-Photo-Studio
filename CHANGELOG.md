@@ -4,7 +4,7 @@ All notable changes to VR Photo Studio are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.4.0b1] - 2026-10-13
 
 **SHARP 360°: SHARP relief, face check (M6) and the AI photo-editor backs (M7, experimental).**
 Design: `docs/design/SHARP360.md` (sections 3.5.6 and 4.4). Nothing here has run with the real models

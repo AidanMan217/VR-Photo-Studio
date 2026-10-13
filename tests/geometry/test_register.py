@@ -28,7 +28,10 @@ def _rot(axis, deg: float) -> np.ndarray:
 
 
 def _angle(R: np.ndarray) -> float:
-    return math.degrees(math.acos(max(-1.0, min(1.0, 0.5 * (np.trace(R) - 1.0)))))
+    """Rotation angle of ``R`` in degrees.  atan2 of the skew part and the trace stays exact near
+    0 deg, where acos((trace - 1) / 2) has a ~1e-6 deg noise floor (it failed on CI once)."""
+    w = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    return math.degrees(math.atan2(0.5 * float(np.linalg.norm(w)), 0.5 * (float(np.trace(R)) - 1.0)))
 
 
 def body_surface(body: sp.Body, n: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

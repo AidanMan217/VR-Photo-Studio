@@ -2,6 +2,7 @@
 # environment (PyTorch/CUDA wheels etc.) and verifies its packages import.  The runners
 # have no NVIDIA GPU, so nothing is executed on CUDA ("--no-check-gpu", import-only check).
 # Experimental add-ons may fail without failing the workflow.
+# Run it from the Actions tab ("Add-ons" > Run workflow) after changing an add-on manifest.
 name: Add-ons
 
 on:

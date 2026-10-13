@@ -28,13 +28,14 @@ photos are never uploaded anywhere.
 | **Depth Map** | Grey-scale depth images (for other 3D tools) | Any image viewer | 16-bit PNG + colour preview |
 
 Optional **add-ons** (big downloads, most need an NVIDIA GPU) add AI photo-to-3D (TRELLIS, plus the
-experimental SHARP, TRELLIS.2 and Hunyuan3D), photo-capture-to-3D (COLMAP + Brush) and AI fill for the
-rest of a 360°/180° sphere (SDXL).
+experimental SHARP, TRELLIS.2 and Hunyuan3D), AI back and side views (experimental MV-Adapter),
+photo-capture-to-3D (COLMAP + Brush) and AI fill for the rest of a 360°/180° sphere (SDXL).
 
 **New (experimental): SHARP 360°** keeps SHARP's photo-real front of a person, adds a back and makes
 them life-size, so you can walk all the way round them in passthrough AR. The back is a smooth built-in
-shape, made by TRELLIS (if you have that add-on), or taken from your own photo of the person from behind;
-a turntable preview picture shows the result from all sides.
+shape, painted from six matching AI views by MV-Adapter, made by TRELLIS (if you have those add-ons), or
+taken from your own photo of the person from behind; an optional Brush polish blends a back made from
+views into the photo front, and a turntable preview picture shows the result from all sides.
 
 ---
 

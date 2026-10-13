@@ -21,7 +21,7 @@ from vrphoto.addons.manifest import (
 from vrphoto.core.errors import AddonError
 
 BUNDLED = sorted(manifests_dir().glob("*.toml"))
-EXPECTED_IDS = {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360", "capture"}
+EXPECTED_IDS = {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360", "capture", "mvadapter"}
 REQUIRED = ("id", "title", "description", "license", "kind", "tasks", "steps")
 
 
@@ -276,4 +276,4 @@ def test_torch_manifests_pin_setuptools(path: Path):
 def test_all_torch_addons_are_covered_by_the_setuptools_rule():
     torch_ids = {m.id for m in map(load_manifest, BUNDLED)
                  if any(p.startswith("torch==") for s in m.steps if s["type"] == "pip" for p in s["packages"])}
-    assert torch_ids == {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360"}
+    assert torch_ids == {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360", "mvadapter"}

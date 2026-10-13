@@ -557,7 +557,12 @@ def test_typed_number_is_used_by_ctrl_enter(make_window, media, monkeypatch):
 class _FakeAddons:
     """``addons.manager`` stand-in: SHARP / TRELLIS manifests, a configurable installed set."""
 
-    TITLES = {"sharp": "SHARP (photo to splat)", "trellis": "TRELLIS (photo to 3D object)"}
+    TITLES = {
+        "sharp": "SHARP (photo to splat)",
+        "trellis": "TRELLIS (photo to 3D object)",
+        "mvadapter": "MV-Adapter (AI back and side views, experimental)",
+        "capture": "Capture to 3D (COLMAP + Brush)",
+    }
 
     def __init__(self) -> None:
         self.installed: set[str] = set()
@@ -634,6 +639,33 @@ def test_missing_optional_back_source_can_continue(make_window, media, monkeypat
     assert buttons == ("Open Add-ons", "Continue (the built-in back is used)", "Cancel")
     assert "TRELLIS" in text and "not installed" in text
     assert kw.get("escape") == 2  # Esc / closing the box cancels
+
+
+def test_missing_mvadapter_and_capture_for_the_polish_ask_separately(
+    make_window, media, monkeypatch, prompts, addons, choices
+):
+    """MV-Adapter as the back and 'Brush polish' On without Capture: one optional question each,
+    the polish one saying the polish (not the back) is what is skipped."""
+    from vrphoto.gui.main_window import OPTIONAL_ADDON_BUTTONS
+
+    addons.installed = {"sharp"}
+    w, q, opened = _object_window(
+        make_window, media, monkeypatch, method="sharp360", back_source="mvadapter", polish="on"
+    )
+    choices.answer = 1
+    assert len(w.create_jobs()) == 1
+    assert [c[2] for c in choices.calls] == [
+        OPTIONAL_ADDON_BUTTONS,
+        ("Open Add-ons", "Continue without the polish", "Cancel"),
+    ]
+    assert "MV-Adapter" in choices.calls[0][1] and "back" in choices.calls[0][1]
+    assert "Brush polish" in choices.calls[1][1] and "Capture to 3D" in choices.calls[1][1]
+    assert (q.submitted[-1].back_source, q.submitted[-1].polish) == ("mvadapter", "on")
+    # 'Automatic' polish never asks for Capture
+    choices.calls.clear()
+    addons.installed = {"sharp", "mvadapter"}
+    w.modes.current_panel().form.set_values({"polish": "auto"})
+    assert len(w.create_jobs()) == 1 and choices.calls == [] and not prompts.questions
 
 
 def test_missing_optional_back_source_open_addons(make_window, media, monkeypatch, prompts, addons, choices):

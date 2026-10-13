@@ -208,7 +208,7 @@ floor (Quest 3 passthrough) and walk around.
 | Also save splat | Also saves a splat version for the viewer. | On |
 | Placement | *Point at the floor* (you aim at your floor or table and press the trigger), or *In front of me* (appears on the floor 1.5 m ahead). | Point at the floor |
 | Back side *(Advanced)* | (Billboard and SHARP 360°) *Soft colours from the outline* (subtle), or *Mirror of the front* (careful: a person gets their face on the back of their head). | Soft colours |
-| Variation *(Advanced)* | For TRELLIS, TRELLIS.2, Hunyuan3D and SHARP 360°: change the number to get a different version. With SHARP 360° it changes the AI-made back (TRELLIS) and the pattern where the photo blends into the back; the photographed front stays the same. (Plain SHARP always gives the same result for the same photo.) | 0 |
+| Variation *(Advanced)* | For TRELLIS, TRELLIS.2, Hunyuan3D and SHARP 360°: change the number to get a different version. With SHARP 360° it changes the AI-made back (MV-Adapter or TRELLIS) and the pattern where the photo blends into the back; the photographed front stays the same. (Plain SHARP always gives the same result for the same photo.) | 0 |
 | Paint texture *(Advanced)* | (Hunyuan3D) also paints colours onto the model; without it you get a plain grey shape. Slower, needs more graphics memory, and downloads the painting models (about 8 GB) on the first textured run. Needs the add-on's optional texture-painting part (see [section 8](#8-add-ons)). | Off; on for colour |
 
 **Good photos:** the whole person/object visible (feet included), not cut off at the edges,
@@ -225,10 +225,15 @@ puts behind the person, **adds a back**, and makes the result life-size, so in t
 person stands on your floor and you can walk all the way round.
 
 It needs only the **SHARP** add-on (see [section 8](#8-add-ons)); turn on *Show experimental
-features* in Settings to see the method. The back can come from three places (*Back made by*):
+features* in Settings to see the method. The back can come from four places (*Back made by*):
 
 * **Built-in shape** (no download): the outline "inflated" into a smooth, rounded back in the
   colours from around the person's outline - like the person from behind in soft focus.
+* **MV-Adapter AI views** (the experimental MV-Adapter add-on, about 14 GB): an AI paints the
+  person from six directions - the front, both sides, straight from behind and two in-between -
+  and the app builds the back and sides from those pictures. Because the six pictures are made
+  with exact, matching cameras, the app can check them against your photo and line them up
+  precisely (see *The MV-Adapter back* below).
 * **TRELLIS** (the TRELLIS add-on, which you may already have for the *TRELLIS* method): an AI
   builds the whole person in 3D from the photo; the app lines that shape up exactly behind
   SHARP's front and uses only its back half. Real volume (hair, shoulders, a hood, a bag), but
@@ -240,16 +245,19 @@ features* in Settings to see the method. The back can come from three places (*B
 
 | Option | What it does | Recommended |
 |---|---|---|
-| Back made by | *Automatic* uses TRELLIS when its add-on is installed, else the built-in shape (with *Fast* back quality always the built-in shape; it never picks your own back photo). *Built-in shape*, *TRELLIS* or *Your own back photo* choose one. If the chosen back cannot be made, the built-in shape is used and a note says why. | Automatic |
+| Back made by | *Automatic* uses MV-Adapter when its add-on is installed, else TRELLIS when that is installed, else the built-in shape (with *Fast* back quality always the built-in shape; it never picks your own back photo). *Built-in shape*, *MV-Adapter AI views*, *TRELLIS* or *Your own back photo* choose one. If the chosen back cannot be made, the next one is used and a note says why. | Automatic |
 | Back photo | (Your own back photo) the picture of the back; side photos in the same folder are found by their names (see *Taking the back and side photos* below). | - |
-| Back quality | *Fast* builds a coarser back, never runs TRELLIS by itself and makes small previews; *Balanced*; *Best* builds the finest back surface and gives TRELLIS more steps and two attempts (slower). The photographed front is the same with all three. | Balanced |
+| Back quality | *Fast* builds a coarser back, never runs an AI back by itself and makes small previews; *Balanced*; *Best* builds the finest back surface, gives MV-Adapter and TRELLIS more steps and two attempts, and (with *Brush polish* on *Automatic*) polishes a back made from views (slower). The photographed front is the same with all three. | Balanced |
 | Thickness / Back side | As for Billboard: how deep the built-in back is (and a back photo's, unless side photos show it), and its colours. SHARP 360° keeps *Thickness* within 0.06-0.18, because its back is life-size (the presets set *Thickness* for Billboard; a note says when it was changed). | 0.11, soft colours |
 | Back detail *(Advanced)* | (Your own back photo) *From the picture* lets the depth model add folds, hair and clothing relief seen in the back photo; *Smooth* keeps the rounded shape and only takes the colours. *Automatic* uses the picture (smooth with *Fast*, or when only the built-in *Heuristic* depth model is available). | Automatic |
-| Match colours to the photo *(Advanced)* | Adjusts the brightness and colours of the TRELLIS back or your back photo to the front photo, so the join does not show as a change of light. Turn it off if your back photo already has the right colours. | On |
-| AI attempts / AI steps *(Advanced)* | (TRELLIS) how many backs the AI makes - the best-fitting one is kept - and how many refining steps each takes. *Automatic*: 1 attempt with 12 steps, 2 attempts with 25 steps for *Best*. Each attempt takes a few minutes. | Automatic |
+| Match colours to the photo *(Advanced)* | Adjusts the brightness and colours of the AI back (MV-Adapter, TRELLIS) or your back photo to the front photo, so the join does not show as a change of light. Turn it off if your back photo already has the right colours. | On |
+| AI attempts / AI steps *(Advanced)* | (MV-Adapter, TRELLIS) how many backs the AI makes - the best-fitting one is kept - and how many refining steps each takes. *Automatic*: 1 attempt (2 for *Best*); TRELLIS 12 steps (25 for *Best*), MV-Adapter 20 / 30 / 50 steps for *Fast* / *Balanced* / *Best*. Each attempt takes a few minutes. | Automatic |
+| Describe the hidden side *(Advanced)* | (MV-Adapter) a few words about what the photo cannot show, for example *long brown ponytail, black backpack*. Empty: a neutral description. See *The MV-Adapter back* below. | Empty |
+| Brush polish *(Advanced)* | (A back made from views: MV-Adapter or your own back photo) Brush - the trainer of the Capture add-on - trains the finished splat against all the pictures at once, so the views agree with each other and the join softens; SHARP's photographed front is put back exactly afterwards. *Automatic*: only with *Best* back quality and after a passed Brush test (see below); *On*: whenever possible (a note says when it is not); *Off*. If the polish fails, the unpolished result is kept. | Automatic |
+| Brush steps *(Advanced)* | How long Brush trains (1000-30000). | 5000 |
 | Keep the photo up to *(Advanced)* | Where SHARP's photo ends and the made-up back begins: the photo is kept wherever the body faces the camera within this angle and blended into the back over the next 10-20°. Higher keeps more of the sharp photo on the sides but can show stretched edges. | 60° |
 | Size from *(Advanced)* | *Real-world height*: exactly the height you entered. *Measured by SHARP*: SHARP's own estimate from the photo (handy for half-body photos). *Automatic*: your height, unless the subject is cut off by the edge of the photo - then SHARP's measurement (with a note). | Automatic |
-| Also save parts and debug data *(Advanced)* | Also saves `<name>_sharp360.ply`, the cleaned photo front and the back as separate splats (`_sharp360_front.splat`, `_sharp360_back.splat`, handy for comparing) and `_sharp360_debug.json` (useful when reporting a problem). | Off |
+| Also save parts and debug data *(Advanced)* | Also saves `<name>_sharp360.ply`, the cleaned photo front and the back as separate splats (`_sharp360_front.splat`, `_sharp360_back.splat`, handy for comparing), `_sharp360_debug.json` (useful when reporting a problem) and, after MV-Adapter, the AI views as an editable folder `_sharp360_views` (see below). | Off |
 
 **Taking the back and side photos** (for *Your own back photo*):
 
@@ -268,14 +276,60 @@ features* in Settings to see the method. The back can come from three places (*B
 * An AI-made back view works too (for example a photo editor that can turn the person round),
   as long as the pose and the outline match the front photo.
 
+**The MV-Adapter back** (the experimental MV-Adapter add-on, see [section 8](#8-add-ons)):
+
+* **What happens:** the app turns your photo into a straight-on, level picture of the person
+  (it takes out the camera's tilt and perspective) and gives it to MV-Adapter, which paints the
+  person from 0°, 45°, 90°, 180°, 270° and 315°. The app checks that the AI's front view matches
+  your photo's outline, that every view shows the person at the same height, and that the back
+  view's outline is the mirror of the front's; a view that does not fit is left out, and a set
+  that does not fit at all is not used (you get a note and the next back - TRELLIS or the
+  built-in shape). With two attempts (*Best*), the set that fits best is kept.
+* **What to expect:** views that agree all the way round (including straight from behind), with
+  plausible clothing and hair outlines - better than the built-in shape or TRELLIS for that. But
+  the AI paints softer than your photo (about 3-4 mm per pixel for a 1.7 m person), and it was
+  trained on objects, not people: a face or hands seen from the side may not quite match the
+  person ("identity drift"), and details it cannot see are invented.
+* **Describe the hidden side:** without a description, MV-Adapter is told only *a person, full
+  body, high quality, realistic photo*. If you know what the back looks like, say so in a few
+  words - *long brown ponytail*, *black backpack*, *hood up*, *grey hoodie, short hair* - about the
+  person as a whole, not the camera or the background. Short is better (at most 300 characters).
+  Changing it (or *Variation*, *AI steps* or *Back quality*'s steps) makes new views.
+* **Time on a GeForce GTX 1080** (estimates, not yet measured): *Balanced* about 6-10 minutes in
+  all; *Best* with two attempts and the Brush polish about 15-30 minutes. The first run after
+  installing also loads the models from disk.
+* **Made once, re-used:** the AI views are kept (up to 2 GB, the oldest are removed first), so
+  running the same photo again with another *Keep the photo up to*, *Back detail*, *Match
+  colours* or *Brush polish* reuses them and takes only a minute or two. Another *Back quality*
+  reuses them too when *AI steps* is set; on *Automatic* each quality paints with its own number
+  of steps, which makes new views (a second attempt for *Best* adds one more set). MV-Adapter
+  saves each attempt as soon as it is finished: if the second attempt runs out of memory, the
+  first one is used; after a cancel, the finished attempts are not painted again next time.
+
+**Brush polish and the Brush test:** the polish needs the **Capture to 3D** add-on (it brings
+Brush). Brush's behaviour on older graphics cards (GeForce 10-series) is not known in advance, so
+test it once: open **Add-ons**, select *Capture to 3D* and click **Test Brush on this PC** (or run
+`vrphoto-cli addons brush-test`). The test takes a few minutes and is remembered. *Automatic*
+polishes only after a passed test; *On* tries anyway and keeps the unpolished result if Brush
+fails (Brush's log is then saved as `<name>_sharp360_polish.log`).
+
+**Fixing an AI view and running again** (the saved views folder): with *Also save parts and debug
+data* on, an MV-Adapter run also saves the AI views as a folder `<name>_sharp360_views` with
+`back.png`, `right.png`, `left.png`, `front_right.png`, `front_left.png`, `front.png` and a
+`views.json` that remembers their exact cameras. Edit a picture in any photo editor (keep its size
+and the grey background; paint out a wrong detail, fix a colour), then run the same front photo
+again with *Back made by: Your own back photo* and pick that folder's `back.png` as the *Back
+photo*: the app uses your edited views with their exact cameras.
+
 **Preview pictures** (saved next to the splat, so you can check the result before putting the
 headset on):
 
 * `<name>_sharp360_preview.jpg` - the finished splat from 8 directions around the person (0° is
   the photo's side, 90° from the person's left, 180° from behind).
-* `<name>_sharp360_views.png` - only with *Your own back photo*: the levelled front photo and your
-  back and side photos as the app lined them up. Green is the outline the app expected, blue the
-  person found in your photo; a photo outlined in red was not used (the note says why).
+* `<name>_sharp360_views.png` - only with *MV-Adapter AI views* or *Your own back photo*: the
+  levelled front photo and the AI views (or your back and side photos) as the app lined them up.
+  Green is the outline the app expected, blue the person found in the picture; a picture outlined
+  in red was not used (the note says why).
 
 **What to expect:**
 
@@ -286,6 +340,9 @@ headset on):
 * **From behind:**
   * *Built-in shape*: a closed, smooth, "mannequin" back in the colours around the outline: no
     clothing folds, hair detail, hood or backpack. Never see-through, always the right size.
+  * *MV-Adapter*: clothing and hair that follow the person's outline from every side, softer than
+    the photo and invented by the AI - faces seen from the side may drift. Colours are matched to
+    your photo; *Brush polish* blends the views further.
   * *TRELLIS*: the real volume of hair, shoulders and a bag, but soft and evenly lit, and invented
     by the AI - it can get details wrong. Its colours are matched to your photo.
   * *Your own back photo*: the most real back - your photo's colours and detail on a shape that
@@ -293,13 +350,14 @@ headset on):
     example between the legs) take neighbouring colours.
 * **Time on a GeForce GTX 1080** (estimates): built-in shape 1-2 minutes in all, most of it
   loading SHARP; your own back photo 1-3 minutes; TRELLIS 4-8 minutes (*Best*: two longer
-  attempts, about 10-20 minutes). The turntable preview adds a few seconds to about half a minute.
+  attempts, about 10-20 minutes); MV-Adapter 6-10 minutes (*Best* with two attempts and the Brush
+  polish: 15-30 minutes). The turntable preview adds a few seconds to about half a minute.
 * **Size:** the splat is saved life-size (feet on the floor), so the viewer shows it 1:1. With
   *Size from: Automatic* and feet or head cut off by the photo edge, SHARP's own estimate is
   used and a note says so.
 
-**Limits (honest):** one photo cannot tell what the back really looks like: the built-in back and
-TRELLIS are plausible guesses, and only your own back photo shows the real back. Loose hair, open
+**Limits (honest):** one photo cannot tell what the back really looks like: the built-in back,
+MV-Adapter and TRELLIS are plausible guesses, and only your own back photo shows the real back. Loose hair, open
 arms held away from the body, bags and anything that sticks out sideways come out flattened with
 the built-in back; a seated person or an object with holes (a chair) looks worse than a standing
 person. A camera that looks down or up steeply (more than about 30°) gives a less accurate back
@@ -552,12 +610,13 @@ Installing downloads PyTorch, NVIDIA CUDA libraries and the AI model (several GB
 
 | Add-on | What it gives you | GPU (minimum) | Disk (approx.) | License |
 |---|---|---|---|---|
-| **Capture to 3D** (COLMAP + Brush) | Photos or a video walking around something → photo-real 3D splat ([Capture mode](#47-capture-many-photos--walk-around-3d)) | Any DirectX 12 / Vulkan GPU, 4 GB+ (an NVIDIA GPU speeds up the photo matching) | ~2 GB | BSD-3 + Apache-2.0 - any use |
-| **TRELLIS** (Microsoft) | One photo → full 3D model with an AI-invented back side (*Person / Object*, method *TRELLIS*; also the AI back of *SHARP 360°*) | NVIDIA, 8 GB+ (12 GB recommended) | ~20 GB | MIT, but uses NVIDIA nvdiffrast and Inria diff-gaussian-rasterization: **non-commercial** |
+| **Capture to 3D** (COLMAP + Brush) | Photos or a video walking around something → photo-real 3D splat ([Capture mode](#47-capture-many-photos--walk-around-3d)); also the *Brush polish* of *SHARP 360°* | Any DirectX 12 / Vulkan GPU, 4 GB+ (an NVIDIA GPU speeds up the photo matching) | ~2 GB | BSD-3 + Apache-2.0 - any use |
+| **TRELLIS** (Microsoft) | One photo → full 3D model with an AI-invented back side (*Person / Object*, method *TRELLIS*; also an AI back of *SHARP 360°*) | NVIDIA, 8 GB+ (12 GB recommended) | ~20 GB | MIT, but uses NVIDIA nvdiffrast and Inria diff-gaussian-rasterization: **non-commercial** |
 | **AI outpainting for VR180 / 360** (Stable Diffusion XL) | AI-painted surroundings for VR180/360 (*Fill: AI outpaint*) | NVIDIA, 8 GB+ | ~17 GB | CreativeML Open RAIL++-M (use restrictions) |
 | **SHARP** (Apple, experimental) | One photo → 3D Gaussian splat in seconds (*Person / Object*, methods *SHARP* and *SHARP 360°*) | NVIDIA, 6 GB+ | ~12 GB | Apple research model license: **non-commercial** |
 | **TRELLIS.2** (experimental) | Newer, more detailed photo-to-3D | NVIDIA, 12 GB+ (16-24 GB recommended) | ~36 GB | MIT + Meta DINOv3 license (needs a Hugging Face token) + **non-commercial** NVIDIA parts |
 | **Hunyuan3D-2** (experimental) | Alternative photo-to-3D by Tencent; a grey shape, or coloured with *Paint texture* | NVIDIA, 6 GB+ (more for textures) | ~16 GB | Tencent community license - **not licensed in the EU, the UK and South Korea** |
+| **MV-Adapter** (experimental) | AI back and side views for *SHARP 360°* (*Back made by: MV-Adapter AI views*): six matching views of the person, including straight from behind | NVIDIA, 6 GB+ (runs on a GTX 1080's 8 GB with part of the model in system memory) | ~14 GB | Apache-2.0 (MV-Adapter) + CreativeML Open RAIL++-M (Stable Diffusion 2.1: use restrictions) |
 
 The numbers are guides; the Add-ons window shows each add-on's exact requirements and checks your
 GPU. Experimental add-ons appear when *Show experimental add-ons* (in the Add-ons window) or *Show
@@ -722,11 +781,16 @@ Then choose **Capture**, add all the photos (or the video) as one job, and click
   (not from the installer's last page), then retry the install.
 * **"This GPU is not supported by the installed PyTorch build":** the add-on's PyTorch version has no code
   for your graphics card generation. Update to the latest VR Photo Studio and reinstall the add-on.
-* **GeForce GTX 10-series (e.g. GTX 1080, 8 GB):** TRELLIS and Hunyuan3D shape generation are supported but
+* **GeForce GTX 10-series (e.g. GTX 1080, 8 GB):** TRELLIS, MV-Adapter and Hunyuan3D shape generation are supported but
   slow (several minutes per object, also as the back of *SHARP 360°*) and close to the memory limit - close games, browsers with many tabs
   and other GPU programs first. Texture painting (Hunyuan3D) and TRELLIS.2 need more memory than 8 GB.
 * **"CUDA out of memory":** close other GPU programs; use lower quality settings; some add-ons need more VRAM
   than your GPU has.
+* **SHARP 360° with MV-Adapter:** on an 8 GB card MV-Adapter keeps part of its model in system memory (slower,
+  but it fits); if it still runs out of memory the job notes it and uses TRELLIS or the built-in back. A
+  note like "the generated views do not match the photo's outline" means the AI drew the person in another
+  shape or place - try another *Variation*, a short *Describe the hidden side*, or *Best* (two attempts).
+  If *Brush polish* never runs, run **Test Brush on this PC** (Add-ons window, *Capture to 3D*) first.
 
 ### Starting fresh
 

@@ -628,9 +628,9 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             "great from the front and sides. TRELLIS builds a full 3D model including the back "
             "(add-on, NVIDIA GPU). SHARP, SHARP 360°, TRELLIS.2 and Hunyuan3D are experimental "
             "add-ons (shown when experimental features are on in Settings). SHARP 360° keeps "
-            "SHARP's photo-real front and adds a back made by the built-in shape, TRELLIS or your "
-            "own back photo (see 'Back made by'), so you can walk all the way round. It needs only "
-            "the SHARP add-on; TRELLIS is used when you have it.",
+            "SHARP's photo-real front and adds a back made by the built-in shape, MV-Adapter, TRELLIS "
+            "or your own back photo (see 'Back made by'), so you can walk all the way round. It needs "
+            "only the SHARP add-on; MV-Adapter or TRELLIS is used when you have it.",
             "combo",
             choices=(
                 ("billboard", "Billboard (instant, no add-on)"),
@@ -698,9 +698,10 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         "seed": FieldMeta(
             "Variation",
             "TRELLIS, TRELLIS.2, Hunyuan3D and SHARP 360°: change this number to get a different "
-            "version of the 3D model. With SHARP 360° it changes the AI-made back (TRELLIS) and "
-            "the pattern where the photo front blends into the back; the photographed front stays "
-            "exactly the same. (Plain SHARP always gives the same result for the same photo.)",
+            "version of the 3D model. With SHARP 360° it changes the AI-made back (MV-Adapter or "
+            "TRELLIS) and the pattern where the photo front blends into the back; the photographed "
+            "front stays exactly the same. (Plain SHARP always gives the same result for the same "
+            "photo.)",
             "spin",
             minimum=0,
             maximum=999999,
@@ -726,36 +727,42 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         "back_source": FieldMeta(
             "Back made by",
             "SHARP 360° only: what makes the side of the person or object the photo could not "
-            "see. 'Automatic' uses the best back that is installed: TRELLIS if you have its add-on, "
-            "else the built-in shape (with 'Fast' back quality always the built-in shape). "
-            "'Built-in shape' needs no download (about 1-2 minutes in all): a smooth, rounded back "
-            "in the colours around the outline - like the person from behind in soft focus, with "
-            "no clothing or hair detail, but always closed and life-size. 'TRELLIS' (add-on, "
-            "about 20 GB; about 4-8 minutes in all on a GTX 1080) lets an AI build the whole "
-            "person in 3D and uses only its back half: real volume (hair, shoulders, a bag) but a "
-            "soft, flat-lit texture. 'Your own back photo' (no download, about 1-3 minutes) fits a "
-            "photo of the person from behind - or a back view made with any AI tool - to the "
-            "outline; this can look the most real (choose the picture under 'Back photo'). If the "
-            "chosen back cannot be made, the built-in shape is used and the job says why.",
+            "see. 'Automatic' uses the best back that is installed: MV-Adapter if you have its "
+            "add-on, else TRELLIS, else the built-in shape (with 'Fast' back quality always the "
+            "built-in shape). 'Built-in shape' needs no download (about 1-2 minutes in all): a "
+            "smooth, rounded back in the colours around the outline - like the person from behind "
+            "in soft focus, with no clothing or hair detail, but always closed and life-size. "
+            "'MV-Adapter AI views' (add-on, about 14 GB; about 6-10 minutes in all on a GTX 1080) "
+            "lets an AI paint the person from six sides, including straight from behind, and builds "
+            "the back and sides from those pictures: plausible clothing and hair, softer than the "
+            "photo, and a face seen from the side may not quite match. 'TRELLIS' (add-on, about "
+            "20 GB; about 4-8 minutes in all) lets an AI build the whole person in 3D and uses only "
+            "its back half: real volume (hair, shoulders, a bag) but a soft, flat-lit texture. "
+            "'Your own back photo' (no download, about 1-3 minutes) fits a photo of the person from "
+            "behind - or a back view made with any AI tool - to the outline; this can look the most "
+            "real (choose the picture under 'Back photo'). If the chosen back cannot be made, the "
+            "next one is used and the job says why.",
             "combo",
             choices=(
                 ("auto", "Automatic (best installed)"),
                 ("shell", "Built-in shape (no download)"),
                 ("trellis", "TRELLIS (add-on)"),
                 ("images", "Your own back photo"),
+                ("mvadapter", "MV-Adapter AI views (add-on)"),
             ),
             enabled_if=("method", ("sharp360",)),
-            # optional: a missing TRELLIS is a warning and the built-in back, never a failure
-            addon_choices={"trellis": ("trellis",)},
+            # optional: a missing AI add-on is a warning and the next back, never a failure
+            addon_choices={"trellis": ("trellis",), "mvadapter": ("mvadapter",)},
             addon_optional=True,
         ),
         "back_quality": FieldMeta(
             "Back quality",
             "SHARP 360° only: how much care goes into the back. 'Fast' builds a coarser back and "
             "finishes quickest ('Automatic' then always uses the built-in shape); 'Balanced' is "
-            "recommended; 'Best' builds the finest back surface and gives TRELLIS more steps and "
-            "two attempts (the best fitting is kept), so it takes longer. The photographed front "
-            "looks the same with all three.",
+            "recommended; 'Best' builds the finest back surface and gives the AI (MV-Adapter, "
+            "TRELLIS) more steps and two attempts (the best fitting is kept), so it takes longer; "
+            "with 'Best', 'Brush polish' on Automatic also polishes a back made from views. The "
+            "photographed front looks the same with all three.",
             "combo",
             choices=(("fast", "Fast"), ("balanced", "Balanced"), ("best", "Best (slower)")),
             enabled_if=("method", ("sharp360",)),
@@ -803,10 +810,10 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         ),
         "back_tries": FieldMeta(
             "AI attempts",
-            "SHARP 360° with an AI-made back (TRELLIS, also under 'Automatic'): how many backs "
-            "the AI makes; the one that fits your photo best is kept. 'Automatic' makes 1 attempt "
-            "(2 with 'Best' back quality). Each attempt takes roughly 2-5 minutes on a GTX 1080. "
-            "Change 'Variation' to get different attempts.",
+            "SHARP 360° with an AI-made back (MV-Adapter or TRELLIS, also under 'Automatic'): how "
+            "many backs the AI makes; the one that fits your photo best is kept. 'Automatic' makes "
+            "1 attempt (2 with 'Best' back quality). Each attempt takes roughly 2-5 minutes on a "
+            "GTX 1080 (MV-Adapter: 3-7 minutes). Change 'Variation' to get different attempts.",
             "spin",
             minimum=0,
             maximum=4,
@@ -814,14 +821,15 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             zero_label="Automatic",
             advanced=True,
             enabled_if=("method", ("sharp360",)),
-            enabled_if_all=(("back_source", ("auto", "trellis")),),
+            enabled_if_all=(("back_source", ("auto", "trellis", "mvadapter")),),
         ),
         "back_steps": FieldMeta(
             "AI steps",
-            "SHARP 360° with an AI-made back (TRELLIS, also under 'Automatic'): how many "
-            "refining steps the AI takes per attempt. More steps can give a cleaner, more detailed "
-            "shape but take longer. 'Automatic' uses 12 (25 with 'Best' back quality); on a GTX "
-            "1080 the AI part of an attempt takes roughly twice as long with 25 steps as with 12.",
+            "SHARP 360° with an AI-made back (MV-Adapter or TRELLIS, also under 'Automatic'): how "
+            "many refining steps the AI takes per attempt. More steps can give a cleaner, more "
+            "detailed result but take longer. 'Automatic' uses TRELLIS 12 (25 with 'Best' back "
+            "quality) and MV-Adapter 20 / 30 / 50 (Fast / Balanced / Best); on a GTX 1080 the AI "
+            "part of an attempt takes roughly twice as long with twice the steps.",
             "spin",
             minimum=0,
             maximum=100,
@@ -829,7 +837,51 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             zero_label="Automatic",
             advanced=True,
             enabled_if=("method", ("sharp360",)),
-            enabled_if_all=(("back_source", ("auto", "trellis")),),
+            enabled_if_all=(("back_source", ("auto", "trellis", "mvadapter")),),
+        ),
+        "back_prompt": FieldMeta(
+            "Describe the hidden side",
+            "SHARP 360° with MV-Adapter AI views (also under 'Automatic'): a few words about what "
+            "the photo cannot show, so the AI paints the right back and sides - for example 'long "
+            "brown ponytail, black backpack' or 'grey hoodie, short hair'. Describe the person or "
+            "object as a whole, not the camera or the background. Leave it empty for a neutral "
+            "description ('a person, full body, high quality, realistic photo'). At most 300 "
+            "characters; changing it makes new AI views.",
+            "text",
+            placeholder="e.g. long brown ponytail, black backpack",
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+            enabled_if_all=(("back_source", ("auto", "mvadapter")),),
+        ),
+        "polish": FieldMeta(
+            "Brush polish",
+            "SHARP 360° with a back made from views (MV-Adapter or your own back photo): Brush, "
+            "the trainer of the Capture add-on, trains the finished splat against the photo and "
+            "the views so they agree with each other and the join softens; the photographed front "
+            "is put back exactly afterwards. It needs the Capture add-on and a passed 'Test Brush "
+            "on this PC' (in the Add-ons window, or vrphoto-cli addons brush-test). 'Automatic' "
+            "polishes only with 'Best' back quality and after a passed test; 'On' tries it with "
+            "any quality (if it fails, the unpolished result is kept); 'Off' never. Adds about "
+            "5-15 minutes on a GTX 1080.",
+            "combo",
+            choices=(("auto", "Automatic (Best quality only)"), ("off", "Off"), ("on", "On")),
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+            # optional: without Capture the polish is skipped with a warning (Automatic never asks)
+            addon_choices={"on": ("capture",)},
+            addon_optional=True,
+        ),
+        "polish_steps": FieldMeta(
+            "Brush steps",
+            "SHARP 360° Brush polish: how long Brush trains. 5000 is a good balance (about 5-8 "
+            "minutes on a GTX 1080); more steps blend the views further but take longer.",
+            "slider",
+            minimum=1000,
+            maximum=30000,
+            step=500,
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+            enabled_if_all=(("polish", ("auto", "on")),),
         ),
         "seam_deg": FieldMeta(
             "Keep the photo up to",
@@ -1248,6 +1300,27 @@ def required_addon_groups(kind: str, values: Mapping[str, Any]) -> tuple[tuple[t
     return tuple(groups.items())
 
 
+def addon_fields(kind: str, values: Mapping[str, Any], ids: tuple[str, ...]) -> tuple[str, ...]:
+    """The options of :func:`required_addon_groups` whose chosen value needs the add-on group
+    ``ids`` (``"method"`` stands for the mode's own add-on too), e.g. ``("polish",)`` - so
+    the GUI can say what a missing optional add-on is for."""
+    want = tuple(dict.fromkeys(ids))
+    out: list[str] = []
+    mode = MODE_BY_KIND.get(kind)
+    if mode is not None and mode.needs_addon and tuple(dict.fromkeys(mode.needs_addon)) == want:
+        out.append("method")
+    for name, m in JOB_META.get(kind, {}).items():
+        if not m.addon_choices or name not in values:
+            continue
+        try:
+            got = m.addon_choices.get(values[name])
+        except TypeError:
+            continue
+        if got and tuple(dict.fromkeys(got)) == want and field_applies(kind, name, values):
+            out.append(name)
+    return tuple(dict.fromkeys(out))
+
+
 def required_addon_candidates(kind: str, values: Mapping[str, Any]) -> tuple[str, ...]:
     """Every add-on id of :func:`required_addon_groups` (required and optional), flattened."""
     return tuple(dict.fromkeys(aid for ids, _optional in required_addon_groups(kind, values) for aid in ids))
@@ -1268,4 +1341,5 @@ __all__ = [
     "field_applies",
     "required_addon_groups",
     "required_addon_candidates",
+    "addon_fields",
 ]

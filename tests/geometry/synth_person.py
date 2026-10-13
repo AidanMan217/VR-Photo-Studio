@@ -1073,3 +1073,134 @@ def ortho_view_parts(body: Body, canon: Canon, phi_deg: float, m: float = 0.01, 
 
 
 __all__ += ["make_body_pose", "ortho_view_parts"]
+
+
+# --------------------------------------------------------------------------- MV-Adapter-like view sets (M4)
+#: Azimuths of MV-Adapter's six orthographic views (design 2 / 4.3), in the app's convention.
+MVADAPTER_AZIMUTHS = (0.0, 45.0, 90.0, 180.0, 270.0, 315.0)
+
+
+@dataclass
+class MVSet:
+    """Output of :func:`mvadapter_like_set`: what the MV-Adapter worker would write.
+
+    ``images`` / ``alphas`` / ``phis`` are keyed by file name (``view_0.png`` ...): the RGB
+    picture composited over the background, the true coverage, and the TRUE azimuth of the
+    render (the camera file may label it differently, see ``flip_sign``).  ``cameras`` is the
+    ``cameras.json`` dict (design 4.3)."""
+
+    images: dict[str, np.ndarray]
+    alphas: dict[str, np.ndarray]
+    phis: dict[str, float]
+    cameras: dict
+
+    def write(self, folder) -> object:
+        """Write the pictures (PNG) and ``cameras.json`` into ``folder``; returns the JSON path."""
+        import json
+        from pathlib import Path
+
+        out = Path(folder)
+        out.mkdir(parents=True, exist_ok=True)
+        for name, rgb in self.images.items():
+            cv2.imwrite(str(out / name), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        path = out / "cameras.json"
+        path.write_text(json.dumps(self.cameras, indent=1), encoding="utf-8")
+        return path
+
+
+def _c2w_opencv(phi_deg: float, distance: float) -> list[list[float]]:
+    """4 x 4 camera-to-world matrix (OpenCV axes: x right, y down, z forward) of the view at
+    ``phi`` in a generator-style world that is NOT frame S: y up, and turned by 90 deg about
+    it (MV-Adapter's ``az - 90``), so a reader must not assume the world axes."""
+    p = math.radians(phi_deg)
+    right = np.array([math.cos(p), 0.0, math.sin(p)])  # in S
+    down = np.array([0.0, 1.0, 0.0])
+    fwd = np.array([-math.sin(p), 0.0, math.cos(p)])
+    W = np.array([[0.0, 0.0, 1.0], [0.0, -1.0, 0.0], [1.0, 0.0, 0.0]])  # S -> world, det +1
+    M = np.eye(4)
+    M[:3, :3] = W @ np.column_stack([right, down, fwd])
+    M[:3, 3] = W @ (-distance * fwd)
+    return M.tolist()
+
+
+def mvadapter_like_set(
+    body: Body,
+    canon: Canon,
+    ortho_input,
+    *,
+    scale: float = 1.0,
+    offset_px: tuple[float, float] = (0.0, 0.0),
+    flip_sign: bool = False,
+    grey_bg: bool = True,
+    size: int = 512,
+    view_scale: dict[float, float] | None = None,
+    axis_dz: float = 0.0,
+    azimuths: tuple[float, ...] = MVADAPTER_AZIMUTHS,
+    ss: int = 2,
+    paint: dict[str, np.ndarray] | None = None,
+) -> MVSet:
+    """Six :func:`ortho_view` renders of ``body`` at MV-Adapter's azimuths with the app's
+    framing - what an ideal generator returns for the levelled input ``ortho_input``
+    (``views_lift.OrthoInput``): ``size`` px, the input's pixel scale (``m = m_in * S /
+    size``), the orbit axis at the picture centre, i.e. at ``x = center_S[0]`` and ``z =
+    axis_dz`` in ``canon``'s frame S (``canon`` = the TRUE frame), rows centred on
+    ``center_S[1]``.
+
+    Perturbations (all optional): ``scale`` / ``offset_px`` - every picture scaled about its
+    centre and shifted by ``(dx, dy)`` px (a generator that re-framed its output); with
+    ``view_scale`` ``{phi: s}`` one view is scaled on its own as well; ``flip_sign`` - the
+    camera file labels the view at ``phi`` as ``360 - phi`` (the azimuth sign convention
+    reversed, consistently in ``phi_deg``, ``azimuth_deg`` and ``c2w``); ``grey_bg=False``
+    composites over white instead of 0.5 grey; ``paint`` recolours body parts (name ->
+    colour) in every view to track them.  Returns an :class:`MVSet`."""
+    import dataclasses as _dc
+
+    S_in = int(ortho_input.size)
+    m = float(ortho_input.m_in) * S_in / int(size)
+    cx, cy = (float(t) for t in np.asarray(ortho_input.center_S, np.float64)[:2])
+    bg = VIEW_BG_RGB if grey_bg else np.array([255, 255, 255], np.uint8)
+    dx, dy = (float(t) for t in offset_px)
+    axis = canon.c + canon.R @ np.array([cx, cy, float(axis_dz)])
+    images: dict[str, np.ndarray] = {}
+    alphas: dict[str, np.ndarray] = {}
+    phis: dict[str, float] = {}
+    entries = []
+    distance = 1.8
+    for i, phi in enumerate(azimuths):
+        k = float(scale) * float((view_scale or {}).get(float(phi), 1.0))
+        mv = m / k  # metres per pixel of this picture
+        right, down, _ = ortho_axes(canon, phi)
+        c_view = axis - dx * mv * right - dy * mv * down  # the axis lands at (N/2 + dx, N/2 + dy)
+        view_canon = _dc.replace(canon, c=c_view)
+        rgb, alpha, _ = ortho_view(body, view_canon, phi, m=mv, N=int(size), ss=ss, bg=bg)
+        if paint:
+            parts = ortho_view_parts(body, view_canon, phi, m=mv, N=int(size))
+            for part, colour in paint.items():
+                rgb[parts == body.part(part)] = colour
+        name = f"view_{i}.png"
+        label = (360.0 - phi) % 360.0 if flip_sign else float(phi)
+        images[name], alphas[name], phis[name] = rgb, alpha, float(phi)
+        entries.append(
+            {
+                "file": name,
+                "phi_deg": label,
+                "azimuth_deg": label,
+                "elevation_deg": 0.0,
+                "c2w": _c2w_opencv(label, distance),
+            }
+        )
+    cameras = {
+        "projection": "orthographic",
+        "ortho_half_extent": 0.55,
+        "distance": distance,
+        "width": int(size),
+        "height": int(size),
+        "input_fill": 0.9,
+        "pixel_center": 0.5,
+        "convention": "c2w_opencv",
+        "views": entries,
+    }
+    return MVSet(images=images, alphas=alphas, phis=phis, cameras=cameras)
+
+
+__all__ += ["MVADAPTER_AZIMUTHS", "MVSet", "mvadapter_like_set"]

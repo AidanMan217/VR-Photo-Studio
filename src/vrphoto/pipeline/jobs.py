@@ -137,13 +137,16 @@ class ObjectJob(JobBase):
     seed: int = 0
     hunyuan_texture: bool = False  # Hunyuan3D add-on: also paint a texture (slower, more VRAM)
     # SHARP 360 (method "sharp360"): SHARP's photo front + a predicted back (docs/design/SHARP360.md)
-    back_source: str = "auto"  # auto | shell (built-in) | trellis | images (your own back photo)
+    back_source: str = "auto"  # auto | shell (built-in) | trellis | images (your own back photo) | mvadapter
     back_quality: str = "balanced"  # fast | balanced | best
     back_images: str | None = None  # images source: the back photo (side photos next to it by name)
     back_relief: str = "auto"  # auto | depth | flat: surface detail of a back made from a picture
     color_match: bool = True  # match the back's colours / exposure to the photo
     back_tries: int = 0  # AI back sources: attempts, the best fitting is kept (0 = automatic)
     back_steps: int = 0  # AI back sources: generation steps (0 = automatic)
+    back_prompt: str = ""  # AI back sources: describe the hidden side ("long ponytail, black backpack")
+    polish: str = "auto"  # auto | off | on: Brush polish of view-based backs (Capture add-on)
+    polish_steps: int = 5000  # Brush training steps for the polish
     seam_deg: float = 60.0  # the photo is used where the surface faces the camera within this angle
     size_from: str = "auto"  # auto | height | photo (SHARP's own metric size)
     save_extras: bool = False  # also save front/back parts, PLY and a debug JSON

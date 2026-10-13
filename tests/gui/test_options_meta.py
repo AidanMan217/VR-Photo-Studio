@@ -199,7 +199,13 @@ def test_field_applies_follows_enabled_if_and_enabled_if_all():
     assert fa("object", "back_images", on)
     assert not fa("object", "back_images", {**on, "back_source": "trellis"})  # enabled_if_all
     assert not fa("object", "back_images", {**on, "method": "sharp"})  # enabled_if
-    for source, tries_on in (("auto", True), ("trellis", True), ("shell", False), ("images", False)):
+    for source, tries_on in (
+        ("auto", True),
+        ("trellis", True),
+        ("mvadapter", True),
+        ("shell", False),
+        ("images", False),
+    ):
         vals = {"method": "sharp360", "back_source": source}
         for name in ("back_tries", "back_steps"):
             assert fa("object", name, vals) is tries_on, (name, source)
@@ -266,8 +272,14 @@ SHARP360_M2_FIELDS = (
     ("back_images", ("images",)),
     ("back_relief", None),
     ("color_match", None),
-    ("back_tries", ("auto", "trellis")),
-    ("back_steps", ("auto", "trellis")),
+    ("back_tries", ("auto", "trellis", "mvadapter")),
+    ("back_steps", ("auto", "trellis", "mvadapter")),
+)
+#: M4 / M5 fields: (name, extra all-of condition or None)
+SHARP360_M4_FIELDS = (
+    ("back_prompt", ("back_source", ("auto", "mvadapter"))),
+    ("polish", None),
+    ("polish_steps", ("polish", ("auto", "on"))),
 )
 
 
@@ -307,6 +319,7 @@ def test_sharp360_fields_metadata():
         "shell": "Built-in shape (no download)",
         "trellis": "TRELLIS (add-on)",
         "images": "Your own back photo",
+        "mvadapter": "MV-Adapter AI views (add-on)",
     }
     assert not obj["back_source"].advanced and not obj["back_quality"].advanced
     assert dict(obj["back_quality"].choices)["best"].startswith("Best")
@@ -320,8 +333,8 @@ def test_sharp360_fields_metadata():
         "photo": "Measured by SHARP",
     }
     assert obj["save_extras"].kind == "check" and obj["save_extras"].advanced
-    # TRELLIS is optional: the job warns and falls back to the built-in back without it
-    assert obj["back_source"].addon_choices == {"trellis": ("trellis",)}
+    # TRELLIS / MV-Adapter are optional: the job warns and falls back without them
+    assert obj["back_source"].addon_choices == {"trellis": ("trellis",), "mvadapter": ("mvadapter",)}
     assert obj["back_source"].addon_optional
     assert not obj["method"].addon_optional  # SHARP itself is required
 
@@ -363,8 +376,70 @@ def test_sharp360_m2_fields_metadata():
         assert "GTX 1080" in m.tooltip, name
     # the plain-language source tooltip names every choice and the expected time
     tip = obj["back_source"].tooltip
-    for word in ("Automatic", "Built-in shape", "TRELLIS", "Your own back photo", "GTX 1080", "minutes"):
+    for word in ("Automatic", "Built-in shape", "TRELLIS", "MV-Adapter", "Your own back photo", "GTX 1080"):
         assert word in tip, word
+    assert "minutes" in tip and "14 GB" in tip
+
+
+def test_sharp360_m4_fields_metadata():
+    """'Describe the hidden side', 'Brush polish' and 'Brush steps' (design 1.2)."""
+    from vrphoto.pipeline import run as R
+    from vrphoto.pipeline import sharp360 as S
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    obj = om.JOB_META["object"]
+    for name, cond in SHARP360_M4_FIELDS:
+        m = obj[name]
+        assert m.enabled_if == ("method", ("sharp360",)), name
+        assert m.enabled_if_all == ((cond,) if cond else ()), name
+        assert m.advanced and "SHARP 360" in m.tooltip and len(m.tooltip) > 100, name
+    prompt = obj["back_prompt"]
+    assert (prompt.kind, prompt.label) == ("text", "Describe the hidden side")
+    assert prompt.enabled_if_all == (("back_source", S.PROMPT_SOURCES),)  # what the job reads
+    assert "ponytail" in prompt.placeholder and "300" in prompt.tooltip
+    assert ObjectJob().back_prompt == ""
+    polish = obj["polish"]
+    assert (polish.kind, polish.label) == ("combo", "Brush polish")
+    assert tuple(polish.choice_values()) == R.POLISH_MODES and ObjectJob().polish == "auto"
+    for word in ("Capture add-on", "Test Brush on this PC", "Best"):
+        assert word in polish.tooltip, word
+    # only 'On' needs Capture, and only optionally: 'Automatic' never asks for an add-on
+    assert polish.addon_choices == {"on": ("capture",)} and polish.addon_optional
+    steps = obj["polish_steps"]
+    assert (steps.kind, steps.label, steps.minimum, steps.maximum, steps.step) == (
+        "slider",
+        "Brush steps",
+        1000,
+        30000,
+        500,
+    )
+    assert (steps.minimum, steps.maximum) == S.POLISH_STEPS_RANGE and ObjectJob().polish_steps == 5000
+    fa = om.field_applies
+    on = {"method": "sharp360", "back_source": "auto", "polish": "auto"}
+    assert fa("object", "polish_steps", on) and fa("object", "polish_steps", {**on, "polish": "on"})
+    assert not fa("object", "polish_steps", {**on, "polish": "off"})
+    assert not fa("object", "polish_steps", {**on, "method": "billboard"})  # via 'polish'
+    for source, prompt_on in (("auto", True), ("mvadapter", True), ("trellis", False), ("images", False)):
+        assert fa("object", "back_prompt", {**on, "back_source": source}) is prompt_on, source
+
+
+def test_addon_groups_of_mvadapter_and_the_polish():
+    """design §5.5: MV-Adapter is an optional back source; 'Brush polish' On wants Capture
+    (optional), Automatic asks for nothing."""
+    groups = om.required_addon_groups
+    mv = {"method": "sharp360", "back_source": "mvadapter"}
+    assert groups("object", mv) == ((("sharp",), False), (("mvadapter",), True))
+    assert groups("object", {**mv, "polish": "auto"}) == ((("sharp",), False), (("mvadapter",), True))
+    assert groups("object", {**mv, "polish": "on"}) == (
+        (("sharp",), False),
+        (("mvadapter",), True),
+        (("capture",), True),
+    )
+    assert groups("object", {"method": "billboard", "back_source": "mvadapter", "polish": "on"}) == ()
+    assert om.addon_fields("object", {**mv, "polish": "on"}, ("capture",)) == ("polish",)
+    assert om.addon_fields("object", {**mv, "polish": "on"}, ("mvadapter",)) == ("back_source",)
+    assert om.addon_fields("object", mv, ("sharp",)) == ("method",)
+    assert om.addon_fields("object", {"method": "billboard", "polish": "on"}, ("capture",)) == ()
 
 
 def test_thickness_and_back_apply_to_the_sharp360_built_in_back():

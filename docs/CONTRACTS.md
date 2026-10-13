@@ -483,16 +483,24 @@ left = right = 0x40000000). JPEG gets GPano XMP. Filenames carry Quest tokens (`
     and `sharp360`; plain `sharp` is unchanged byte for byte) and `_save_cutout(...)`.
   * `ObjectJob` fields `back_source="auto"`, `back_quality="balanced"`, `seam_deg=60.0`,
     `size_from="auto"`, `save_extras=False`; from 0.2.0 also `back_images=None`,
-    `back_relief="auto"`, `color_match=True`, `back_tries=0`, `back_steps=0`; `thickness`,
-    `back` and (from 0.2.0) `seed` also apply to `sharp360`.
+    `back_relief="auto"`, `color_match=True`, `back_tries=0`, `back_steps=0`; M4 / M5 add
+    `back_prompt=""`, `polish="auto"` (`run.POLISH_MODES`), `polish_steps=5000` and
+    `back_source="mvadapter"`; `thickness`, `back` and (from 0.2.0) `seed` also apply to
+    `sharp360`.
   * GUI (0.2.0): `FieldMeta.enabled_if_all`, `addon_optional`, `file_filter`;
     `options_meta.field_applies(kind, name, values, *, meta=None)` (transitive: a field under
     a greyed-out sibling is greyed out) and `required_addon_groups(kind, values) -> ((ids,
     optional), ...)` (greyed-out fields ask for nothing; `required_addon_candidates` is the
     flattened wrapper); `util.ask_choice(parent, title, text, buttons, *, default=0,
     escape=None, informative=None) -> int | None`. `main_window._check_addons`: a missing
-    required group shows the Yes/No dialog; a missing optional group (TRELLIS as the back
-    source) offers "Open Add-ons" / "Continue (the built-in back is used)" / "Cancel".
+    required group shows the Yes/No dialog; a missing optional group (TRELLIS or MV-Adapter as
+    the back source) offers "Open Add-ons" / "Continue (the built-in back is used)" / "Cancel";
+    for 'Brush polish' On without Capture (`addon_choices={"on": ("capture",)}`, optional;
+    Automatic asks for nothing) the text and the middle button say the polish is skipped
+    (`options_meta.addon_fields(kind, values, ids) -> option names` tells the groups apart).
+    'Describe the hidden side' (`back_prompt`, kind `text`) applies to back sources auto /
+    mvadapter; 'Brush steps' (`polish_steps`) only when `polish` is not off; the panel checks
+    the description's length at 'Create' (`sharp360._back_prompt`).
   * `geometry.splat`: `transform_splats(sc, R, t, s=1.0)` (proper rotations only; rotates
     quaternions and SH), `scale_splats(sc, k)`, `concat_splats(clouds)`, `subset_splats(sc, idx)`,
     `fit_plane_ransac(pts, tol, *, seed=0, iters=256) -> (normal, offset, inlier_frac)` (plane
@@ -514,7 +522,8 @@ left = right = 0x40000000). JPEG gets GPano XMP. Filenames carry Quest tokens (`
 Design and rationale: `docs/design/SHARP360.md`. 0.2.0-beta shipped the fusion core and the
 built-in `shell` back; 0.2.0 adds the `trellis` and `images` back sources, the registration
 library, view lifting, the CPU splat renderer, the previews and the seed ('Variation')
-option. MV-Adapter (`GenView.kind="ortho"`), Brush polish, SHARP multi-image relief
+option. M4 / M5 (unreleased) add the `mvadapter` add-on and back source (orthographic AI views,
+`GenView.kind="ortho"`), the view cache and the Brush polish. SHARP multi-image relief
 (`back_relief="sharp"`), YuNet and Qwen/ComfyUI arrive in later milestones behind the same
 interfaces.
 
@@ -647,6 +656,13 @@ def view_based_back(front, canon, ortho, views, *, depth_fn=None, relief="auto",
                   # when there is no back view, its outline does not match (IoU < 0.75 after the
                   # similarity + perspective fit) or it shows a different pose (outline_gap, 98th
                   # percentile, > 6 % of the subject's size after that fit)
+def views_from_cameras(cameras_json_path_or_dict, *, base_dir=None) -> [GenView]   # M4: kind "ortho", by phi;
+    # phi = phi_deg, else from c2w relative to the azimuth-0 view (c2w_opencv / c2w_opengl; world axes not
+    # assumed), else azimuth_deg; m None (= the levelled input's framing, m_in * S / width); InputError for a
+    # non-orthographic set, a view tilted > 2 deg, a picture or camera file that cannot be read
+def save_views_folder(views, folder, *, ortho) -> Path   # M4: editable "images"-style folder (see below)
+def qc_cost(diag | BackPart | None) -> float             # V11 cost of a view-based back; inf when unusable
+def choose_view_set(results) -> int | None               # index of the lowest qc_cost (first on a tie)
 def contact_sheet(ortho, views, *, tile=256, labels=True) -> uint8 RGB   # the _views.png preview
 # geometry/splat_render.py (CPU EWA splatting, numpy only; off the critical path)
 @dataclass class SplatCamera: R, center, width, height, kind="persp"|"ortho", fx, fy, m, cx=None, cy=None
@@ -660,18 +676,57 @@ def render_splats(sc | prepared, cam, *, background=(0,0,0), max_radius_px=64, b
 def turntable_sheet(sc, *, n=8, size=384, cols=4, background=(32,32,32), labels=True, progress=None,
                     cancel=None) -> uint8 RGB   # upright glTF-frame cloud, phi = 0, 360/n, ...
 # pipeline/sharp360.py
-QUALITY: dict[str, Quality(mould_long, stride, auto, tries=1, trellis_steps=(12, 12), relief="depth",
-                           fill_holes=True, preview_px=384)]
-    # fast: 512, 2, (shell,), relief "flat", no hole fill, 256 px | balanced: 768, 1, (trellis, shell)
-    # | best: 1024, 1, (trellis, shell), tries 2, steps 25/25, 512 px
-Opts(..., seed, tries=1, steps=0, color_match=True, relief="auto", back_images=None)
-SOURCES = {"shell": _src_shell, "trellis": _src_trellis, "images": _src_images}   # fn(ctx, rep) -> BackPart
-SOURCE_NAMES / SOURCE_LABELS / SOURCE_ADDONS = {"trellis": "trellis"}; MAX_TRIES = 4; MAX_STEPS = 100;
-MAX_SEED = 2**31 - 1; PREVIEW_VIEWS = 8
+QUALITY: dict[str, Quality(mould_long, stride, auto, tries=1, trellis_steps=(12, 12), mv_steps=30,
+                           mv_guidance=3.0, relief="depth", fill_holes=True, preview_px=384)]
+    # fast: 512, 2, (shell,), relief "flat", no hole fill, 256 px, mv 20 steps | balanced: 768, 1,
+    # (mvadapter, trellis, shell) | best: 1024, 1, (mvadapter, trellis, shell), tries 2, steps 25/25,
+    # mv 50 steps, 512 px
+Opts(..., seed, tries=1, steps=0, color_match=True, relief="auto", back_images=None, back_prompt="",
+     polish="auto", polish_steps=5000)
+SOURCES = {"shell": _src_shell, "trellis": _src_trellis, "images": _src_images,
+           "mvadapter": _src_mvadapter}                                          # fn(ctx, rep) -> BackPart
+SOURCE_NAMES / SOURCE_LABELS / SOURCE_ADDONS = {"trellis": "trellis", "mvadapter": "mvadapter"};
+GENERATED_VIEW_SOURCES = {"mvadapter"}; MAX_TRIES = 4; MAX_STEPS = 100; MAX_SEED = 2**31 - 1;
+PREVIEW_VIEWS = 8; MAX_PROMPT_CHARS = 300; PROMPT_SOURCES = ("auto", "mvadapter");
+POLISH_STEPS_RANGE = (1000, 30000); MV_DEFAULT_PROMPT = "a person, full body, high quality, realistic
+photo"; MV_STEPS_RANGE = (5, 100)
+Ctx(run, item, photo, alpha, sc_full, front, canon, opts, previews={}, levelled=None, polish=None)
+    # previews["views"] = (OrthoInput, [GenView]), previews["views_source"]; levelled: the shared
+    # OrthoInput; polish: (runs, note) of the Brush polish
+def mv_settings(opts) -> (steps, guidance, prompt)   # 'AI steps' (clamped to 5-100) else Quality.mv_steps
 def resolve_options(spec, *, installed: Callable[[str], bool]) -> Opts   # InputError before any work;
     # thickness clamped to THICKNESS_RANGE = (0.06, 0.18) (Opts.thickness_asked; the job warns)
 def run_sources(ctx, rep, attempts) -> BackPart | None                   # the fallback chain
 def mode_sharp360(run, item, photo, alpha, spec, *, placement, height, rep, opts=None) -> None
+# pipeline/view_cache.py (M4; design 3.5.3 "Cache")
+SUBDIR = "backviews"; DEFAULT_MAX_BYTES = 2_000_000_000; CACHE_VERSION = 1; ENTRY_FILE = "entry.json"
+def make_key(input_digest, *, source, params, worker) -> str   # 40 hex: sha256("v1|digest|source|sorted
+                                                                # params JSON|worker")
+def worker_version(manifest) -> str             # "<manifest version>+<12 hex of the worker script's sha256>"
+class ViewCache(root, max_bytes=DEFAULT_MAX_BYTES):
+    get(key) -> Path | None                      # complete entry folder; refreshes its LRU time
+    put(key, files, *, meta=None) -> Path | None # copies (flat, unique names); atomic; prunes to the cap
+    discard(key) -> bool                         # delete a damaged entry (made again next time)
+    salvage(folder, keys: {seed: key}) -> {seed: Path}   # finished sets of an interrupted worker run
+    prune(max_bytes=None) -> int; clear(); size_bytes(); len(); key in cache
+def default_root(settings=None) -> Path          # <settings.cache_dir>/backviews
+def get(key, *, root=None); put(key, files, *, root=None, meta=None); salvage(folder, keys, *, root=None)
+# pipeline/sharp360_polish.py (M5; design 3.11)
+POLISH_MODES = run.POLISH_MODES; DEFAULT_STEPS = 5000; TELEPHOTO_DIST_M = 40.0; ANCHORS; ANCHORS_BEST;
+CAP_RANGE = (300_000, 2_500_000); MIN_SPLATS = 1000; MAX_BOX_GROWTH = 1.5; MIN_KEPT_FRAC = 0.1
+def polish_allowed(opts, part, settings, *, quality, brush_installed=None) -> (bool, note)
+def polish_with_brush(run, item, merged, is_front, front, canon, part, *, steps, seed, quality,
+                      progress=None, cancel=None, seam_deg=60.0, photo_rgb=None, alpha=None,
+                      frame_center=None, brush_test=None) -> (cloud, is_front, diag)   # only Cancelled raises
+def build_frames(merged, is_front, front, canon, part, *, quality="best", seam_deg=60.0, masks=True,
+                 photo_rgb=None, alpha=None, frame_center=None, progress=None, cancel=None) -> ([Frame], info)
+def write_dataset(folder, frames, init, *, points=20000, seed=0) -> dict
+def check_polished(ply, init) -> (cloud | None, info)
+def front_copies(trained, front_rows, back_rows, *, search_m=COPY_SEARCH_M, cancel=None) -> bool mask
+    # trained Gaussians whose nearest initial row (voxel-hash search, 2.5 mm / 8 mm / 2 cm) is an
+    # exact front row within 2 cm rather than an unpolished back row: Brush's copies of the front
+def telephoto_camera(canon, phi_deg, m, size, offset_m, y0, *, distance=40.0) -> (K, R, t)
+def levelled_center(front, canon) -> (x0, y0)
 ```
 
 **Options (`resolve_options`, all before any work).** `back_source` in `run.BACK_SOURCES`,
@@ -681,9 +736,13 @@ whole floats from job files are accepted); `back_tries=0` = the quality's `tries
 `back_steps=0` = each source's own default (TRELLIS: the quality's `trellis_steps`). With
 `back_source="images"`, `back_images` must name an existing picture (or a folder of views)
 whose views include one from behind, with a readable header; it is ignored for the other
-sources. `auto` = the quality's `Quality.auto` sources whose add-on is installed (`fast`:
-only the shell), never `images`; an explicit source is tried even when its add-on is missing
-(warning, then the shell). `seed` ('Variation') is the AI sources' seed (attempt `i` uses
+sources. `auto` = the quality's `Quality.auto` sources whose add-on is installed (`balanced` / `best`:
+MV-Adapter, then TRELLIS; `fast`: only the shell), never `images`; an explicit source is tried
+even when its add-on is missing (warning, then the shell). `back_prompt` ('Describe the hidden
+side') is tidied (white space collapsed) and at most 300 characters when `back_source` is
+`auto` or `mvadapter` (`PROMPT_SOURCES`; the GUI greys it out for the others and the job
+ignores it there); `polish` is one of `run.POLISH_MODES` (auto | off | on) and `polish_steps`
+a whole number 1000-30000. `seed` ('Variation') is the AI sources' seed (attempt `i` uses
 `seed + i`) and the seam dither's; the photographed front never depends on it.
 
 **Front guarantee.** A SHARP Gaussian that faces the photo camera at less than `seam_deg - 10`
@@ -791,6 +850,143 @@ export's box crop never removes front rows.
     the truth": four views (90 / 270 / 135 / 315) keep the hull's corners between them, about
     1.3 x the body's depth along the photo's rays (median 3 cm beyond the true back); the
     tests bound that (median < 4 cm, < 1.45 x) and that the hull contains the body.
+* `mvadapter` (M4; design 3.5.3 / 4.3; authoritative where it differs). Input:
+  `levelled_ortho_input(size=512, ref=1024).rgba` (kept in `Ctx.levelled`, reused by a TRELLIS
+  fallback) saved as `mvadapter_input.png`. One `_run_addon("mvadapter", "image_to_views",
+  {"image"}, {"seeds": [missing seeds], "steps", "guidance", "prompt", "name": "views"})` for the
+  seeds `seed + i` (`i < Opts.tries`) not found in the view cache; `steps` / `guidance` /
+  `prompt` = `mv_settings(opts)` (20 / 30 / 50 steps by quality unless 'AI steps' is set; 3.0;
+  'Describe the hidden side' or `MV_DEFAULT_PROMPT`). Each returned set is stored in the cache
+  (key: `_mv_input_digest` - the photo, the matte, SHARP's camera, its cloud only coarsely (size,
+  median depth to 1 cm: GPU inference need not be bit-identical), the levelled sizes and
+  `_MV_LEVEL_VERSION`, NOT the levelled pixels, which differ slightly between the qualities' mould
+  grids (outline IoU 0.999, 0.01 px, frame 0.02 deg apart on the synthetic person; the lateral
+  check absorbs that) - source, `{steps, guidance, prompt, seed}`, worker version). The worker
+  writes each set as soon as it is made (`cameras.json` last, atomically), so after a failure or a
+  cancel the finished sets are salvaged into the cache (else read from the work folder) and, after
+  a failure, used in the same run with a note ("MV-Adapter could not make attempt 2 (...); the
+  views made before were used."). A cached set is read when it is looked up; one that cannot be
+  read is discarded and generated again (one found damaged only while lifting is discarded and
+  its attempt fails with "a saved AI view could not be read; it will be made again next time").
+  Then per set
+  `views_from_cameras(cameras.json)` -> `segment_views(the app's segmenter, else the grey key)`
+  -> `view_based_back(source="mvadapter", depth_fn / relief, color_match, stride, seed,
+  fill_holes)`; `choose_view_set` keeps the lowest QC cost. No usable set: `ok=False` with
+  the set's reason ("the generated views do not match the photo's outline (...)"; several sets:
+  "none of its N sets of views fit the photo: ..."), so the chain warns and falls back. An
+  add-on error with no set at all is re-raised (the chain's "could not make the back (CUDA out
+  of memory)"); with cached or finished sets they are used and a note names the failed attempt.
+  `BackPart.diag`: the chosen set's view-based diag plus `tries` (per set: seed, cached, ok,
+  qc, reason / error, seconds), `chosen`, `seed`, `steps`, `guidance`, `prompt`, `input`,
+  `cache` (`hits`, `root`, `input`: the first 16 hex of the input's digest), `worker` (`offload`,
+  `precision`, `worker_version`). The add-on
+  notice (`run.addon_notice`; MV-Adapter is not non-commercial, so it adds nothing today) and the
+  segmenter / depth-model notices are added when its back is used. Worker warnings reach the job
+  as "<title>: <warning>". The contact sheet shows the chosen set (else the first lifted set,
+  outlined as not used). **Deviation:** the cache key includes the steps, so another back quality
+  reuses the views only when 'AI steps' is set (each quality has its own default steps,
+  design 1.3); a seam / thickness / relief / colour-match / polish change always reuses them.
+* **Orthographic sets** in `views_lift` (M4; authoritative where they differ from design V2-V5,
+  V11): the lateral similarity is fitted for every set and applied when it moves the outline by
+  more than 0.5 px and raises the IoU by at least 0.02 (the design fitted only below IoU 0.85,
+  which left a 3 % scale or 3 px shift uncorrected); the 0.75 gate is applied after the fit. The
+  fit ignores a uniform outline offset (keyed mattes sit 0.3-0.5 px outside the true outline,
+  which a plain chamfer reads as a 1-1.5 % larger subject), and view 0's measured offset corrects
+  the row edges of V5 / V7. The azimuth-sign net compares the 90th percentile of the row
+  deviations (MAD cannot tell the hypotheses apart; consistent with the nominal path); when that
+  says "reversed", the design's second test decides (`_sign_render_check`): SHARP's cleaned front
+  rendered orthographically (`render_splats`, 192 px, in the levelled framing about each
+  hypothesis' own axis) at each quarter view's azimuth (the +-90 views without quarter views) -
+  not at +-40 as in the design - as named and mirrored, scored `IoU + 0.5 SSIM + 0.5 (1 - MAE /
+  0.25)` against the colour-matched view (the colour term is an addition: `IoU + 0.5 SSIM` alone
+  separated side views drawn 18 deg past their azimuth by only 0.03; with it 0.36). Every view -
+  also those dropped by the invariant rows - is turned round with a warning only when the mirrored
+  hypothesis scores 0.05 more per view; otherwise the named sides are kept with a warning ("...
+  SHARP's front does not confirm that their left and right were swapped ..."). The render test
+  runs only when the rows propose a flip (about 1 s per 150k front Gaussians). Colour: a per-channel linear gain, then the Huber affine, each
+  kept only when it lowers the median error (no Reinhard fallback: views stay unchanged). A cut-off
+  view or photo keeps the measured row ratio as a bound (a 9 % too large view filling its picture
+  is still dropped); quarter views must line up with the solved axis; nominal pictures in an
+  exact set are not used (warning); the row MAD gate is `max(3 cm, 2 % H)`. QC adds `1 - IoU`
+  of view 0 (`lateral`), 0.5 per dropped view (`dropped`) and `sign` (0.5 for a set turned round,
+  0.25 when the rows said "reversed" but the render test did not confirm it), so an unflipped
+  try wins; the `yaw` / `face` terms are 0 (side views drawn turned by up to ~15 deg are not
+  detected: a silent 2-8 cm axis error on the synthetic person). Hull voting (V6, both kinds of
+  set): a left / right view whose mirror partner (`phi + 180`) is not used has 2 votes (the two
+  carry the same orthographic silhouette; alone with 1 vote it stopped carving behind the body:
+  hull median 8.7 instead of 3.9 cm beyond the true back). Dropped views keep their reason
+  warnings, worded after the sign decision. `input_fill` / `ortho_half_extent` are stored, not
+  used.
+* **Saved views folder** (`save_views_folder`, written as `<base>_sharp360_views/` with
+  `save_extras` after a generated source, also when its set was rejected): one PNG per azimuth
+  named by the folder rule (`front.png` for 0, `back.png`, `right.png`, `left.png`,
+  `front_right.png`, `front_left.png`, `azNNN.png`) composited over 0.5 grey, and `views.json`:
+  `{"format": "vrphoto-views", "version": 1, "projection", "frame": {"size", "m", "center_S"},
+  "views": [{"file", "phi_deg", "kind", "width", "height", "m", "center_S", "color_match",
+  "used", "reason", "source_file"}]}`; of two views at one azimuth the one the back was built with
+  is saved (the other is logged). Picked as the 'Back photo' (`back.png`), `views_from_folder`
+  + `load_views` restore the exact cameras (a picture whose size changed becomes nominal).
+* **Worker `image_to_views`** (`addons/workers/mvadapter_worker.py`, manifest `mvadapter`,
+  task list `["image_to_views"]`): inputs `image` (square RGBA, 512 px, framed by the app; never
+  re-cropped, composited on 0.5 grey; another square size is resized with a warning, a
+  non-square picture is refused); params `steps` (30, clamped to 5-100), `guidance` (3.0,
+  1-10), `seeds` (list, at most 8; else `seed`), `prompt` / `negative_prompt` (500 characters),
+  `offload` (auto | model | sequential | none), `name`; outputs `{"sets": [{"seed", "views": [6
+  PNG paths], "cameras": path}], "frame": "opencv", "warnings", "input", "offload", "precision",
+  "steps", "guidance", "azimuths", "worker_version"}`, files `<out>/<name>_<seed>/view_0.png ...
+  view_5.png` + `cameras.json`. **`cameras.json`:** `{"projection": "orthographic",
+  "ortho_half_extent": 0.55, "distance": 1.8, "width": 512, "height": 512, "input_fill": 0.9,
+  "input_fill_measured", "pixel_center": 0.5, "convention": "c2w_opencv", "frame": "opencv",
+  "seed", "worker_version", "views": [{"file", "azimuth_deg", "phi_deg", "elevation_deg",
+  "c2w"}]}` (plus plain-text `world` / `azimuth_convention` / `phi_convention` notes). Frame:
+  the input view's OpenCV frame (x right in the input picture, y down, z away from the input
+  camera, origin on the orbit axis at the centre of every view); view 0 is `R = I` at
+  `(0, 0, -1.8)`; `phi_deg = atan2(C_x, -C_z)` of each camera centre (= MV-Adapter's azimuth,
+  the app's convention: 90 = camera on the input's +x side). Views share the input's pixel grid,
+  so metres per pixel = `m_in`. Runtime (deviations from design 4.3): `mvadapter.utils` is never
+  imported (its package pulls in nvdiffrast, triton, trimesh, ...; the camera function is ported
+  and `utils/geometry.py` loaded by path - no stubs); DDPM inside MV-Adapter's ShiftSNR wrapper;
+  fp32 VAE with cast inputs / outputs; the NaN / black retry upcasts the UNet, the text and the
+  condition encoders and is placed for fp32 at the free VRAM then (all on the GPU from 12 GB, model
+  offload from 10 GB, else sequential - fp32 weights plus the reference pass's cached attention
+  inputs do not fit 8 GB with model offload), never less memory-saving than before; the OOM ladder
+  frees memory and reloads with sequential offload, then a plain error; seeds use a CPU
+  generator; each set is written as soon as it is made (`cameras.json` last, atomically); the
+  worker refuses an adapter state dict that fits the code below 99 %; the MV-Adapter source
+  files it imports only have to exist (`mvadapter/__init__.py` is empty at the pinned commit) and
+  an import failure is a reinstall hint. Manifest: MV-Adapter pinned at
+  `4277e00...` (LICENSE Apache-2.0, so `noncommercial = false`), SD 2.1 base from the
+  `Manojb/stable-diffusion-2-1-base` clone (the stabilityai repo was removed), adapter file
+  0.71 GB, no peft (LoRA loading only); `disk_gb = 14` (the torch 2.8 + diffusers venv of about
+  9.5 GB, as `sharp` / `sdxl360`, plus 3.5 GB of weights).
+* **Brush polish** (M5; design 3.11; authoritative where it differs). `_polish_plan` (after the
+  back source) asks `polish_allowed`: `off` never; `auto` only with `best`, a back with
+  registered views (MV-Adapter, your back photo) and a passed self-test (`Settings.brush_test`);
+  `on` whenever the back has views and Brush is installed (then a warning when the self-test
+  has not passed). It is skipped quietly for `auto`; with `on` the job warns "Brush polish was
+  skipped (<note>)." `_stitch` runs it after merge / under-layer / feathering and before the
+  floater filter (design 4.2); `polish_with_brush` first drops Brush's copies of the front rows
+  (`front_copies`: `init.ply` holds them too, and in the protected outline band, where a mould
+  back's surface rows are kept, they survived next to the exact rows and drew the outline twice -
+  462 of 836 front rows on the test scene, outline-band alpha error 0.057 -> 0.105), re-merges the
+  rest as the back's kind ("mould": the rim wall survives), puts back the EXACT kept front rows
+  (bit-identical, in order, first) and runs feathering and the floater filter itself, so the job's floater pass is skipped
+  after a successful polish (`debug.json` `floaters` = the polish's). A failed polish is one
+  warning ("Brush polish did not work (...); the unpolished result was kept.") and the normal
+  floater pass. Details beyond the design: the self-test result is honoured (SH 1 when 0 failed,
+  no `--sh-degree` when Brush did not accept it, no masked pictures when masks could not be mixed
+  with RGBA); retries: an option Brush rejects is dropped, out of memory -> 768 px and the cap x
+  0.6, then SH 1, then (no passed test) no masked pictures; at most 6 runs; a run may take
+  900 s + 0.6 s per step; a timeout, a missing Brush or a cancel stops at once. Views within
+  22.5 deg of the front are skipped, 22.5-67.5 deg are masked RGB, the rest RGBA; anchor pixels
+  are trained as the front only on the photographed surface within the seam, at least 2 mould
+  cells inside the outline and with render alpha >= 0.95; `best` adds yaw +-18 deg at pitch
+  -8 deg and pitch +8 deg. The export is also rejected when fewer than 10 % as many back
+  Gaussians survive the re-merge as the unpolished back had (a cloud moved out of the photo's
+  frame). NaNs are read from the raw PLY. A failed Brush run's log is copied to
+  `<base>_sharp360_polish.log`. `debug.json` `polish`: `asked`, `run`, `note`, `steps` and the
+  polish diag (frames, dataset, attempts, check, `front_copies`, merge, floaters, ok / reason /
+  warning).
 * **Front untouched** (design 5.2), tested for the shell, TRELLIS and back-photo backs: seen
   from the photo's camera with `render_splats`, the fused cloud equals the cleaned front with
   the generated part showing only through it (`front + (1 - front alpha) * generated`; SHARP's
@@ -809,10 +1005,13 @@ plain-SHARP fallback.
   size=Quality.preview_px, cols=4)` - views at 0, 45, ..., 315 deg (0 = the photo's side, 90 =
   from the subject's left), 256 / 384 / 512 px each for fast / balanced / best.
 * `<base>_sharp360_views.png`: `contact_sheet(ortho, views, tile=256)` whenever the `images`
-  source made its levelled frame - also when its back was rejected (the photos are outlined
-  as not used).
+  source made its levelled frame or MV-Adapter made views - also when the back was rejected (the
+  pictures are outlined as not used). Output label "SHARP 360° back photos as lined up (PNG)" /
+  "SHARP 360° AI views as lined up (PNG)".
 * Progress ranges: SHARP 0.10-0.25, front 0.25-0.30, back 0.30-0.72, stitch 0.72-0.88,
   export 0.88-0.92, previews 0.92-0.97 ("Rendering a turntable preview"), scene 0.97-1.0.
+  When the Brush polish runs: stitch 0.72-0.82, "Polishing with Brush" 0.82-0.92 (design
+  1.4), export 0.92-0.94, previews 0.94-0.97.
 
 **Fallbacks.** SHARP is the only required add-on (a SHARP failure fails the job as for `sharp`).
 Back sources are tried in `Opts.sources` order (`auto` -> the quality's installed sources, then
@@ -831,10 +1030,12 @@ box crop of the generated rows (front rows are kept even outside the box) ->
 `decimate_splats(750k)` -> `write_splats`.
 
 **Outputs.** `<base>_cutout.png`, `<base>_sharp360.splat` (feet at y = 0, front facing +z,
-life-size), `<base>_sharp360_preview.jpg`, `<base>_sharp360_views.png` (only after the `images`
-source); with `save_extras` also `<base>_sharp360.ply`, `_sharp360_front.splat` (the cleaned
-SHARP front alone), `_sharp360_back.splat` (the generated part alone; both in the main splat's
-frame and size) and `_sharp360_debug.json`. The debug data (options, camera, front stats,
+life-size), `<base>_sharp360_preview.jpg`, `<base>_sharp360_views.png` (only after a view-based
+source: `images`, `mvadapter`); with `save_extras` also `<base>_sharp360.ply`,
+`_sharp360_front.splat` (the cleaned SHARP front alone), `_sharp360_back.splat` (the generated
+part alone; both in the main splat's frame and size), `_sharp360_debug.json` and, after
+MV-Adapter, the views folder `_sharp360_views/`; `_sharp360_polish.log` when a Brush polish
+failed. The debug data (options, camera, front stats,
 frame, source attempts, merge / floater counts, sizes, previews, timings, warnings) is always written to
 the job's work folder and summarised in one log line. None of these names ends in a Quest
 player token. Scene block (always `scale: 1.0`):

@@ -1,11 +1,13 @@
 """SHARP 360: lift pictures of the subject's back and sides onto SHARP's photographed front.
 
-The view-based back sources (docs/design/SHARP360.md sections 3.4, 3.5.2 V1-V11, 3.5.4 and
-3.13; frames: docs/CONTRACTS.md section 13).  This version handles NOMINAL views - the
-user's own back / side photos or AI edits made elsewhere (the ``images`` source); the
-orthographic MV-Adapter views (M4) and the Qwen / ComfyUI views (M7) reuse the same code
-behind :class:`GenView`.  Pure numpy / OpenCV, CPU only; the depth model is injected
-(``depth_fn``) so this module stays model-free.
+The view-based back sources (docs/design/SHARP360.md sections 3.4, 3.5.2 V1-V11, 3.5.3,
+3.5.4 and 3.13; frames: docs/CONTRACTS.md section 13).  Two kinds of views share the code
+behind :class:`GenView`: NOMINAL views - the user's own back / side photos or AI edits made
+elsewhere (the ``images`` source; Qwen / ComfyUI in M7), of which only the azimuth is known
+- and ORTHOGRAPHIC views with exact cameras (``kind="ortho"``: MV-Adapter's six views,
+:func:`views_from_cameras`, or a saved views folder, :func:`save_views_folder`).  Pure
+numpy / OpenCV, CPU only; the depth model is injected (``depth_fn``) so this module stays
+model-free.
 
 **Levelled frame.**  Everything is lined up in one upright orthographic frame of ``S x S``
 pixels with ``m`` metres per pixel (:func:`levelled_ortho_input`): the photo's visible front,
@@ -53,7 +55,8 @@ side view below).  Continuous coordinates as in design 3.0: pixel ``(i, j)`` spa
   views must agree.  A photo has no rotation centre of its own, so the orbit axis reported for nominal
   views is the middle of the subject's depth (photo front edge to side back edge).
 * V6 :func:`hull_intervals` - per mould-grid ray, the first contiguous run inside the
-  visual hull of the side / quarter views (all-but-one voting, 3 px dilation).
+  visual hull of the side / quarter views (all-but-one voting, 3 px dilation; a left / right
+  view without its mirror partner has two votes, as the pair would).
 * V7 back depth: with left/right views the back's per-row extent from their back edges,
   shaped across the row by the relief (``depth_fn`` disparity of the locked back view, else
   the silhouette's inflation profile); without them the shell prior plus bounded high-pass
@@ -63,7 +66,33 @@ side view below).  Continuous coordinates as in design 3.0: pixel ``(i, j)`` spa
   their mattes; visibility by point z-buffer, each Gaussian a disc of its own projected
   footprint (1-4 px) and a depth tolerance that grows on slanted surfaces.  V10 side-view
   pixels nothing covers are lifted onto the hull entry along that view's ray; V11 a QC
-  cost for choosing between tries.
+  cost for choosing between tries (:func:`qc_cost`, :func:`choose_view_set`).
+
+**Orthographic sets** (a back view of ``kind="ortho"``; design V2-V5 "mvadapter").  The
+generator keeps the levelled input's framing: ``m = m_in`` (at the input's size), the orbit
+axis on the centre column at ``x = x0``, rows centred on ``y0`` - so a view at ``phi`` has
+the offset ``o = x0 cos(phi) + z_a sin(phi)`` with one unknown, the axis depth ``z_a``.
+
+* V2 lateral check: view 0 against the levelled front silhouette; a symmetric-chamfer
+  similarity (scale, shift) is fitted and applied to EVERY view (they share the framing)
+  when it moves the outline by more than half a pixel and raises the overlap by a point;
+  below IoU 0.75 the set is rejected.  Invariant rows: each view's top / bottom rows give
+  its scale against view 0's; > 5 % off drops the view, otherwise it is rescaled about its
+  centre column with the bottom row aligned (a cut-off end is not used as an anchor).
+* V3 the back is locked onto the mirrored front silhouette (IoU gate 0.75, the outline-gap
+  pose gate, thin-plate spline) as for nominal views, without the similarity / perspective
+  stages (its camera is exact).
+* V4 colour: one Huber affine in linear RGB (:func:`~vrphoto.geometry.register.
+  color_affine_fit`) from view 0 to the levelled input on flat, confidently inside pixels,
+  applied to every view (one exposure); the bounded rim-band Reinhard without view 0.
+* V5 shared axis: ``z_a`` per row from the front edge of the +-90 views (else the +-45
+  views), median over both, which must agree (``max(4 cm, 2 % H)``) and keep their row MAD
+  small; sign safety net - with the azimuth sign reversed both views pick the back edge,
+  so they still agree but their row deviations grow: when the reversed hypothesis costs less
+  than half and SHARP's front rendered at the quarter views' azimuths agrees (design V5's
+  second test), every view - the dropped ones too - is turned round (``phi -> 360 - phi``)
+  with a warning; without that agreement the named sides are kept (warning).  Quarter views
+  must line up with the solved axis.
 
 ``ok=False`` with a plain ``reason`` (no back view, outline mismatch, different pose)
 makes the orchestrator fall back to the next source.
@@ -76,7 +105,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -86,7 +115,8 @@ import numpy as np
 
 from ..core.errors import Cancelled, InputError
 from ..core.fill import push_pull_fill
-from ..core.imaging import IMAGE_EXTS, load_image
+from ..core.fsutil import atomic_write_bytes
+from ..core.imaging import IMAGE_EXTS, load_image, save_image
 from ..core.log import get_logger
 from ..core.types import CancelToken, FloatMap, ProgressReporter, SplatCloud
 from ..segment.matte import clean_matte, to_alpha
@@ -103,10 +133,15 @@ from .back_mould import (
 from .billboard import _masked_blur, inflation_profile
 from .mesh import _as_reporter, _check
 from .register import (
+    _linear_to_srgb,
     _similarity_affine,
+    _srgb_to_linear,
+    apply_color_affine,
     chamfer_perspective_fit,
     chamfer_similarity_fit,
+    color_affine_fit,
     contour_points,
+    nelder_mead,
     outline_gap,
     point_zbuffer,
     silhouette_iou,
@@ -134,11 +169,14 @@ VIEW_NAMES: dict[str, float] = {
     "left": 270.0,
     "front_left": 315.0,
 }
-#: Canonical view name per azimuth (other azimuths are called ``azNNN``).
-PHI_NAMES: dict[int, str] = {45: "front_right", 90: "right", 135: "back_right", 180: "back"}
+#: Canonical view name per azimuth (other azimuths are called ``azNNN``).  ``front`` (0) is
+#: only a name for saved views: a folder's ``front`` picture is used through ``views.json``.
+PHI_NAMES: dict[int, str] = {0: "front", 45: "front_right", 90: "right", 135: "back_right", 180: "back"}
 PHI_NAMES.update({225: "back_left", 270: "left", 315: "front_left"})
-#: Optional camera file of a saved views folder (exact cameras arrive with M4).
+#: Camera file of a saved views folder: azimuths, and the exact orthographic cameras.
 VIEWS_JSON = "views.json"
+#: ``format`` written into a saved ``views.json``.
+VIEWS_FORMAT = "vrphoto-views"
 #: The photo is downscaled to this long side before forward splatting.
 MAX_PHOTO_LONG = 2048
 #: Views are downscaled to this long side by default.
@@ -197,6 +235,32 @@ _FLIP_PCT = 90.0  # row-offset percentile that judges the mirror hypothesis
 _AGREE_M = 0.04
 _AGREE_FRAC = 0.03
 
+# ---- orthographic sets (V2-V5 "mvadapter")
+_ORTHO_IOU_GATE = 0.75  # view 0 (after the similarity) / the back vs the photo's outline
+_ORTHO_FIT_GAIN = 0.02  # the lateral similarity is applied when it raises the IoU this much ...
+_ORTHO_FIT_PX = 0.5  # ... and moves the outline by more than this somewhere
+_ORTHO_SCALE_MAX = 0.05  # invariant rows: a view whose scale differs more is dropped
+_ORTHO_ROWS_PX = 0.25  # row corrections below this are not resampled
+_ORTHO_ELEV_MAX = 2.0  # deg: views must be level
+_AXIS_AGREE_FRAC = 0.02  # of the height: +-90 views' axis depths agree within max(4 cm, this)
+_SIGN_PCT = 90.0  # the azimuth-sign test compares this percentile of the row deviations ...
+_SIGN_MIN_MISFIT_M = 0.01  # ... and the named hypothesis must miss by this much (per view) to flip
+_SIGN_RENDER_PX = 192  # the second sign test: SHARP's front rendered at this size ...
+_SIGN_RENDER_MARGIN = 0.05  # ... the reversed hypothesis must score this much better per view
+_SIGN_SSIM_WEIGHT = 0.5  # score = IoU + 0.5 SSIM + 0.5 (1 - colour MAE / 0.25)
+_SIGN_COLOUR_WEIGHT = 0.5
+_SIGN_COLOUR_SCALE = 0.25
+_SIGN_RENDER_DIST_M = 10.0  # the orthographic render camera stands this far in front of the axis
+_OUTLINE_MAX_PX = 1.5  # lateral fit: a uniform outline offset up to this is not taken for a scale
+_OUTLINE_PTS = 1500  # outline points per mask of that fit
+_COLOR_FIT_ALPHA = 0.9  # V4 pixel pairs: both mattes above this ...
+_COLOR_FIT_ERODE = 4  # ... eroded by this many px ...
+_COLOR_FIT_GRAD_PCT = 30.0  # ... and the input's gradient at most its 30th percentile
+_COLOR_FIT_MIN = 64  # fewer pairs: the Reinhard rim-band transfer instead
+_QC_DROPPED = 0.5  # QC cost per view dropped from an orthographic set
+_QC_FLIPPED = 0.5  # ... for a set turned round (the generator's cameras were wrong) ...
+_QC_SIGN_UNSURE = 0.25  # ... and for one whose outlines fit better mirrored, its pictures not
+
 # ---- V6 hull
 _HULL_SAMPLES = 96
 _HULL_RANGE_M = 0.25
@@ -236,8 +300,12 @@ class GenView:
     """One picture of the subject from azimuth ``phi_deg`` (design 3.0: 0 = the photo's
     side, 90 = "you walked to your right", 180 = behind).
 
-    ``kind`` is ``"ortho"`` (exact orthographic camera: ``m`` metres per pixel known, M4) or
-    ``"nominal"`` (a user photo / AI edit: only the azimuth is known).  ``rgb`` is uint8
+    ``kind`` is ``"ortho"`` (an exact orthographic camera at elevation 0 whose picture
+    centre is on the orbit axis: MV-Adapter, a saved views folder) or ``"nominal"`` (a user
+    photo / AI edit: only the azimuth is known).  For ``"ortho"`` views ``m`` is the metres
+    per pixel and ``meta["frame_center_S"]`` the ``(x0, y0)`` (frame S) at the picture
+    centre; ``m=None`` / no centre means the levelled input's framing (the generator keeps
+    it: ``m = m_in * S / width``, centre ``OrthoInput.center_S``).  ``rgb`` is uint8
     ``H x W x 3``, ``alpha`` float32 ``H x W`` (1 = subject), ``depth`` an optional float32
     map, ``meta`` JSON-friendly notes (file, matte method, registration).  Views returned
     by :func:`view_based_back` are registered: ``S x S`` in the levelled frame, ``m`` set,
@@ -683,24 +751,41 @@ def _phi_of_stem(stem: str) -> float | None:
     return None
 
 
+def _views_json_records(folder: Path) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """``(records, top)`` of a saved folder's ``views.json``: ``records`` maps each listed
+    file name (lower case) to its entry with the azimuth as ``"phi"`` (from ``phi_deg``, else
+    ``azimuth_deg``; entries without a usable name or azimuth are skipped), ``top`` is the
+    whole document (the shared ``frame`` of :func:`save_views_folder`).  Both are empty when
+    the file is missing or unreadable."""
+    path = folder / VIEWS_JSON
+    if not path.is_file():
+        return {}, {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+        out: dict[str, dict[str, Any]] = {}
+        for v in data.get("views", []):
+            if not isinstance(v, dict):
+                continue
+            name = str(v.get("file", ""))
+            phi = v.get("phi_deg", v.get("azimuth_deg"))
+            try:
+                phi_f = float(phi) if phi is not None else math.nan
+            except (TypeError, ValueError):
+                phi_f = math.nan
+            if name and math.isfinite(phi_f):
+                out[Path(name).name.lower()] = {**v, "phi": phi_f % 360.0}
+        return out, data
+    except (OSError, ValueError, TypeError, AttributeError) as e:
+        log.warning("Ignoring %s: %s", path, e)
+        return {}, {}
+
+
 def _views_json(folder: Path) -> dict[str, float]:
     """``file name (lower case) -> azimuth`` from a saved folder's ``views.json`` (empty when
     missing or unreadable)."""
-    path = folder / VIEWS_JSON
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        out: dict[str, float] = {}
-        for v in data.get("views", []) if isinstance(data, dict) else []:
-            name = str(v.get("file", ""))
-            phi = v.get("phi_deg", v.get("azimuth_deg"))
-            if name and phi is not None and math.isfinite(float(phi)):
-                out[Path(name).name.lower()] = float(phi) % 360.0
-        return out
-    except (OSError, ValueError, TypeError, AttributeError) as e:
-        log.warning("Ignoring %s: %s", path, e)
-        return {}
+    return {k: float(r["phi"]) for k, r in _views_json_records(folder)[0].items()}
 
 
 def views_from_folder(back_path: str | Path) -> list[tuple[float, Path]]:
@@ -714,8 +799,9 @@ def views_from_folder(back_path: str | Path) -> list[tuple[float, Path]]:
     ``back`` / ``behind`` / ``rear`` (180) or ``azNNN`` (NNN degrees); compound names may use
     ``_``, ``-``, a space or nothing between the words.  Other names (also ``my_back``,
     ``left2``) are ignored.  A ``views.json`` with ``{"views": [{"file", "phi_deg" or
-    "azimuth_deg"}]}`` (a saved views folder) sets the azimuth of the files it lists (exact
-    cameras follow in M4).  One picture per azimuth: the given file first, then names in
+    "azimuth_deg"}]}`` (a saved views folder, :func:`save_views_folder`) sets the azimuth of
+    the files it lists, whatever their names; its exact orthographic cameras are restored
+    by :func:`load_views`.  One picture per azimuth: the given file first, then names in
     sorted order.  Raises :class:`InputError` when the picture does not exist or is not a
     picture."""
     p = Path(str(back_path)).expanduser()
@@ -765,10 +851,15 @@ def load_views(
     max_long: int = VIEW_MAX_LONG,
     dropped: list[str] | None = None,
 ) -> list[GenView]:
-    """Read the pictures of :func:`views_from_folder` as nominal :class:`GenView` objects,
+    """Read the pictures of :func:`views_from_folder` as :class:`GenView` objects,
     downscaled to a long side <= ``max_long`` (``INTER_AREA``).
 
-    A picture with a real alpha channel (a cut-out PNG) keeps it as its matte
+    A picture listed in its folder's ``views.json`` as ``"kind": "ortho"`` (a saved views
+    folder, :func:`save_views_folder`) whose size is still the recorded one becomes an
+    orthographic view with its exact camera restored (``m`` - adjusted when downscaled -,
+    ``meta["frame_center_S"]``, the colour match already applied, ``meta["camera"]``); a
+    picture replaced by one of another size (a photo) is nominal.  Other pictures are
+    nominal.  A picture with a real alpha channel (a cut-out PNG) keeps it as its matte
     (``meta["alpha_from_file"]``); otherwise ``alpha`` is all ones until
     :func:`segment_views`.  Unreadable pictures are skipped with a logged warning and a
     plain sentence appended to ``dropped`` (an addition, like :func:`segment_views`'s);
@@ -781,6 +872,7 @@ def load_views(
         raise InputError(f"max_long must be at least 16 pixels (got {max_long!r}).")
     out: list[GenView] = []
     errors: list[str] = []
+    saved: dict[Path, tuple[dict[str, dict[str, Any]], dict[str, Any]]] = {}
     for phi, path in entries:
         p = Path(path)
         try:
@@ -804,25 +896,353 @@ def load_views(
                 a8 = cv2.resize(a8, dsize, interpolation=cv2.INTER_AREA)
         from_file = a8 is not None and bool((a8 < 128).any()) and bool((a8 >= 128).any())
         alpha = a8.astype(np.float32) / 255.0 if from_file else np.ones(rgb.shape[:2], np.float32)
+        if p.parent not in saved:
+            saved[p.parent] = _views_json_records(p.parent)
+        records, top = saved[p.parent]
+        kind, m, extra = _saved_camera(records.get(p.name.lower()), top, (w0, h0), scale)
         out.append(
             GenView(
                 name=_phi_name(phi),
                 phi_deg=float(phi),
                 rgb=rgb,
                 alpha=alpha,
-                kind="nominal",
+                kind=kind,
+                m=m,
                 meta={
                     "file": p.name,
                     "path": str(p),
                     "source_size": [int(w0), int(h0)],  # as decoded (JPEG draft scaling)
                     "scale": float(scale),
                     "alpha_from_file": bool(from_file),
+                    **extra,
                 },
             )
         )
     if not out:
         detail = f" ({errors[0]})" if errors else ""
         raise InputError(f"None of the view pictures could be read{detail}.", hint="Check the back photo.")
+    return out
+
+
+def _pos_float(x: Any) -> float | None:
+    """``x`` as a finite positive float, else None."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def _pair(x: Any) -> list[float] | None:
+    """``x`` as a finite ``[a, b]``, else None."""
+    try:
+        a = [float(t) for t in np.asarray(x, dtype=np.float64).ravel()]
+    except (TypeError, ValueError):
+        return None
+    return a[:2] if len(a) >= 2 and all(math.isfinite(t) for t in a[:2]) else None
+
+
+def _saved_camera(
+    rec: dict[str, Any] | None, top: dict[str, Any], size: tuple[int, int], scale: float
+) -> tuple[str, float | None, dict[str, Any]]:
+    """``(kind, m, meta)`` of a picture from its ``views.json`` entry: an orthographic camera
+    when the entry says ``"kind": "ortho"`` and the picture still has the recorded size."""
+    if not rec or str(rec.get("kind", "")).strip().lower() != "ortho":
+        return "nominal", None, {}
+    w, h = rec.get("width"), rec.get("height")
+    try:
+        same = w is None or h is None or (int(w), int(h)) == (int(size[0]), int(size[1]))
+    except (TypeError, ValueError):
+        same = False
+    if not same:
+        log.info(
+            "View %s: %dx%d px instead of the saved %sx%s - used as a photo (its camera no longer applies)",
+            rec.get("file"),
+            size[0],
+            size[1],
+            w,
+            h,
+        )
+        return "nominal", None, {"camera_dropped": "the picture's size changed"}
+    frame = top.get("frame") if isinstance(top.get("frame"), dict) else {}
+    m = _pos_float(rec.get("m"))
+    extra: dict[str, Any] = {"framing": "saved", "camera": {k: v for k, v in rec.items() if k != "phi"}}
+    centre = _pair(rec.get("center_S", frame.get("center_S")))
+    if centre is not None:
+        extra["frame_center_S"] = centre
+    if rec.get("color_match"):
+        extra["color_match"] = str(rec["color_match"])
+    for key in ("ortho_half_extent", "input_fill"):
+        if key in top:
+            extra[key] = top[key]
+    return "ortho", (m / scale if m is not None else None), extra
+
+
+_C2W_CONVENTIONS = {"c2w_opencv": (1.0, 1.0), "c2w_opengl": (-1.0, -1.0)}  # signs of the y / z columns
+
+
+def _cam_axes(c2w: Any, convention: str, what: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(right, down, forward)`` unit vectors (world) of a camera-to-world matrix."""
+    try:
+        M = np.asarray(c2w, dtype=np.float64)
+    except (TypeError, ValueError):
+        M = np.zeros(0)
+    if M.ndim != 2 or M.shape[0] < 3 or M.shape[1] < 3 or not np.isfinite(M[:3, :3]).all():
+        raise InputError(f"The camera of {what} is not a 3 x 3 / 4 x 4 matrix.")
+    sd, sf = _C2W_CONVENTIONS[convention]
+    out = []
+    for col in (M[:3, 0], sd * M[:3, 1], sf * M[:3, 2]):
+        n = float(np.linalg.norm(col))
+        if not n > 1e-9:
+            raise InputError(f"The camera of {what} has a zero axis.")
+        out.append(col / n)
+    return out[0], out[1], out[2]
+
+
+def _phi_from_c2w(
+    axes: tuple[np.ndarray, np.ndarray, np.ndarray], ref: tuple[np.ndarray, np.ndarray, np.ndarray]
+) -> tuple[float, float]:
+    """``(phi, elevation)`` in degrees of a camera relative to the reference (input) camera,
+    world axes unknown: ``phi`` is the angle about the reference's up from its direction
+    (subject -> camera) toward its right (design 3.0: 90 = "you walked to your right")."""
+    right0, down0, fwd0 = ref
+    up = -down0
+    d = -axes[2]  # subject -> camera
+    elev = math.degrees(math.asin(float(np.clip(d @ up, -1.0, 1.0))))
+    dh = d - (d @ up) * up
+    phi = math.degrees(math.atan2(float(dh @ right0), float(dh @ -fwd0)))
+    return phi % 360.0, elev
+
+
+def views_from_cameras(
+    cameras_json_path_or_dict: str | Path | Mapping[str, Any], *, base_dir: str | Path | None = None
+) -> list[GenView]:
+    """The orthographic views of a generator's camera file (design 4.3 ``cameras.json``:
+    ``{"projection": "orthographic", "convention": "c2w_opencv", "ortho_half_extent",
+    "input_fill", "width", "height", "views": [{"file", "phi_deg", "azimuth_deg",
+    "elevation_deg", "c2w"}, ...]}``) as ``kind="ortho"`` :class:`GenView` objects sorted by
+    azimuth.
+
+    The azimuth is ``phi_deg`` (the app's convention, written by the worker), else derived
+    from ``c2w`` relative to the input's camera (the view whose ``azimuth_deg`` is 0, else
+    the first; ``c2w_opencv`` or ``c2w_opengl`` axes; the world axes are not assumed), else
+    the generator's own ``azimuth_deg`` (its sign is then only checked by the V5 safety
+    net).  Views must be level (within 2 deg).  ``m`` is left None: the generator keeps the
+    levelled input's framing, so ``m = m_in * S / width`` in :func:`view_based_back`;
+    ``meta`` keeps ``ortho_half_extent``, ``input_fill`` and the camera entry.  Picture paths
+    are relative to ``base_dir`` (default: the JSON file's folder; required for a relative
+    path in a dict).  A picture with a real alpha channel keeps it as its matte.  Two views
+    at one azimuth: the first is kept.  Raises :class:`InputError` (plain sentence) for an
+    unreadable or malformed file, a non-orthographic projection, a tilted view or a picture
+    that cannot be read."""
+    src = cameras_json_path_or_dict
+    base: Path | None = Path(base_dir).expanduser() if base_dir is not None else None
+    if isinstance(src, Mapping):
+        data: Any = dict(src)
+    elif isinstance(src, (str, Path)):
+        path = Path(src).expanduser()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise InputError(
+                f"The camera file of the generated views could not be read ({path.name}: {e})."
+            ) from e
+        if base is None:
+            base = path.parent
+    else:
+        raise InputError(f"Expected a camera file or its contents (got {type(src).__name__}).")
+    if not isinstance(data, dict):
+        raise InputError("The camera file of the generated views is not a JSON object.")
+    proj = str(data.get("projection", "orthographic")).strip().lower()
+    if proj != "orthographic":
+        raise InputError(f"The generated views use '{proj}' cameras; only orthographic views can be used.")
+    conv = str(data.get("convention", "c2w_opencv")).strip().lower()
+    if conv not in _C2W_CONVENTIONS:
+        raise InputError(f"Unknown camera convention {conv!r} in the camera file.")
+    entries = data.get("views")
+    if not isinstance(entries, list) or not entries:
+        raise InputError("The camera file lists no views.")
+    if not all(isinstance(e, dict) for e in entries):
+        raise InputError("The camera file's views must be objects with a 'file' and an azimuth.")
+    ref = None
+    with_c2w = [e for e in entries if "c2w" in e]
+    if any("phi_deg" not in e for e in with_c2w):
+        zero = [e for e in with_c2w if _az_diff(_num_or(e.get("azimuth_deg"), math.nan), 0.0) < 0.5]
+        first = (zero or with_c2w)[0]
+        ref = _cam_axes(first["c2w"], conv, str(first.get("file", "the first view")))
+    out: list[GenView] = []
+    for i, e in enumerate(entries):
+        file = str(e.get("file") or "").strip()
+        if not file:
+            raise InputError(f"View {i + 1} of the camera file names no picture.")
+        elev = _num_or(e.get("elevation_deg"), 0.0)
+        if "phi_deg" in e:
+            phi, how = _num_or(e.get("phi_deg"), math.nan), "phi_deg"
+        elif "c2w" in e and ref is not None:
+            phi, elev_c = _phi_from_c2w(_cam_axes(e["c2w"], conv, file), ref)
+            elev = elev_c if abs(elev_c) > abs(elev) else elev  # relative to the input's camera
+            how = "c2w"
+        elif "azimuth_deg" in e:
+            phi, how = _num_or(e.get("azimuth_deg"), math.nan), "azimuth_deg"
+        else:
+            raise InputError(f"The generated view {file} has no azimuth in the camera file.")
+        if not math.isfinite(phi) or not math.isfinite(elev):
+            raise InputError(f"The generated view {file} has an invalid camera in the camera file.")
+        if abs(elev) > _ORTHO_ELEV_MAX:
+            where = "above" if elev > 0 else "below"
+            raise InputError(
+                f"The generated view {file} is not level (its camera is {abs(elev):.0f}° {where} the "
+                f"subject's middle); only level views can be used."
+            )
+        p = Path(file).expanduser()
+        if not p.is_absolute():
+            if base is None:
+                raise InputError(f"The generated view {file} has a relative path, but no folder was given.")
+            p = base / p
+        try:
+            img = load_image(p, with_alpha=True, max_px=VIEW_MAX_LONG)
+        except (InputError, OSError, ValueError) as err:
+            raise InputError(f"The generated view {p.name} could not be read ({err}).") from err
+        h0, w0 = img.shape[:2]
+        rgb = np.ascontiguousarray(img[..., :3])
+        a8 = img[..., 3] if img.shape[2] == 4 else None
+        scale = min(1.0, VIEW_MAX_LONG / max(h0, w0))
+        if scale < 1.0:
+            dsize = (max(1, round(w0 * scale)), max(1, round(h0 * scale)))
+            rgb = cv2.resize(rgb, dsize, interpolation=cv2.INTER_AREA)
+            if a8 is not None:
+                a8 = cv2.resize(a8, dsize, interpolation=cv2.INTER_AREA)
+        from_file = a8 is not None and bool((a8 < 128).any()) and bool((a8 >= 128).any())
+        alpha = a8.astype(np.float32) / 255.0 if from_file else np.ones(rgb.shape[:2], np.float32)
+        phi = phi % 360.0
+        if any(_az_diff(v.phi_deg, phi) < 0.5 for v in out):
+            log.info("Generated view %s ignored: another view already shows %.0f deg", p.name, phi)
+            continue
+        meta: dict[str, Any] = {
+            "file": p.name,
+            "path": str(p),
+            "source_size": [int(w0), int(h0)],
+            "alpha_from_file": bool(from_file),
+            "framing": "input",
+            "camera": {
+                "index": i,
+                "phi_source": how,
+                "azimuth_deg": e.get("azimuth_deg"),
+                "elevation_deg": float(elev),
+            },
+        }
+        for key in ("ortho_half_extent", "input_fill"):
+            if key in data:
+                meta[key] = data[key]
+        if how == "azimuth_deg":
+            log.info("Generated view %s: azimuth from the generator's own angle (sign not confirmed)", p.name)
+        out.append(GenView(_phi_name(phi), phi, rgb, alpha, kind="ortho", m=None, meta=meta))
+    return sorted(out, key=lambda v: v.phi_deg)
+
+
+def _num_or(x: Any, default: float) -> float:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return default
+    return v
+
+
+def _ortho_framing_of(v: GenView, ortho: OrthoInput | None) -> tuple[float | None, list[float] | None]:
+    """``(m, (x0, y0))`` of an orthographic view's camera (None where unknown)."""
+    w = int(np.shape(v.alpha)[1])
+    m = _pos_float(v.m)
+    if m is None and ortho is not None:
+        m = float(ortho.m_in) * int(ortho.size) / max(w, 1)
+    centre = _pair(v.meta.get("frame_center_S"))
+    if centre is None and ortho is not None:
+        centre = _pair(ortho.center_S)
+    return m, centre
+
+
+def save_views_folder(views: Sequence[GenView], folder: str | Path, *, ortho: OrthoInput | None) -> Path:
+    """Write views as an editable "images"-style folder (design 0.3 "where generated views
+    are saved", 3.5.4): one PNG per azimuth named by the folder rule (``back.png``,
+    ``right.png``, ``left.png``, ``front_right.png``, ``front_left.png``, ... ``front.png``
+    for 0 deg, ``azNNN.png`` otherwise) composited over 0.5 grey like the generator's output
+    (any matte is re-made by :func:`segment_views`), plus ``views.json`` with every file's
+    azimuth and, for orthographic views, the exact camera: ``kind``, picture size, ``m``
+    (metres per pixel) and ``center_S`` (frame S at the picture centre; for views in the
+    levelled input's framing these come from ``ortho``, which also gives the shared
+    ``frame``), and the colour match already applied.  Pick ``back.png`` as the 'Back photo'
+    (source ``images``) to re-run with them: :func:`views_from_folder` + :func:`load_views`
+    restore the cameras, so an edited view goes through the same orthographic checks.
+
+    ``views`` are raw (:func:`views_from_cameras`) or registered (``BackPart.views``); of two
+    views at one azimuth the one the back was built with is saved and the other is skipped
+    (logged).  Returns ``folder``.  :class:`InputError` when
+    there is nothing to save; ``OSError`` from writing propagates."""
+    out = Path(folder).expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    recs: list[dict[str, Any]] = []
+    top_extra: dict[str, Any] = {}
+    for v in views:
+        if not isinstance(v, GenView):
+            raise InputError(f"Expected GenView objects (got {type(v).__name__}).")
+    # one picture per azimuth: the first view the back was built with, else the first one
+    chosen: dict[str, int] = {}
+    for i, v in enumerate(views):
+        file = f"{_phi_name(v.phi_deg)}.png"
+        j = chosen.get(file)
+        if j is None or (views[j].meta.get("used") is False and v.meta.get("used") is not False):
+            chosen[file] = i
+    for i, v in enumerate(views):
+        name = _phi_name(v.phi_deg)
+        file = f"{name}.png"
+        if chosen[file] != i:
+            log.warning(
+                "Saving views: %s (%s) was not saved - %s holds another view at %.0f deg",
+                v.name, v.meta.get("file", "?"), file, v.phi_deg,
+            )  # fmt: skip
+            continue
+        rgb = _rgb_u8(v.rgb, f"view '{v.name}'")
+        a = np.clip(np.nan_to_num(np.asarray(v.alpha, dtype=np.float32)), 0.0, 1.0)[..., None]
+        comp = np.clip(np.rint(rgb * a + _GREY * (1.0 - a)), 0, 255).astype(np.uint8)
+        save_image(out / file, comp)
+        h, w = comp.shape[:2]
+        rec: dict[str, Any] = {
+            "file": file,
+            "phi_deg": float(v.phi_deg),
+            "kind": v.kind,
+            "width": w,
+            "height": h,
+        }
+        if v.kind == "ortho":
+            m, centre = _ortho_framing_of(v, ortho)
+            if m is not None:
+                rec["m"] = m
+            if centre is not None:
+                rec["center_S"] = centre
+            for key in ("ortho_half_extent", "input_fill"):
+                if key in v.meta and key not in top_extra:
+                    top_extra[key] = v.meta[key]
+        if v.meta.get("color_match"):
+            rec["color_match"] = str(v.meta["color_match"])
+        if v.meta.get("used") is False:
+            rec["used"] = False
+            if v.meta.get("reason"):
+                rec["reason"] = str(v.meta["reason"])
+        if v.meta.get("file"):
+            rec["source_file"] = str(v.meta["file"])
+        recs.append(rec)
+    if not recs:
+        raise InputError("There are no views to save.")
+    doc: dict[str, Any] = {
+        "format": VIEWS_FORMAT,
+        "version": 1,
+        "projection": "orthographic" if any(r["kind"] == "ortho" for r in recs) else "nominal",
+        **top_extra,
+    }
+    if ortho is not None:
+        doc["frame"] = {"size": int(ortho.size), "m": float(ortho.m_in), "center_S": _pair(ortho.center_S)}
+    doc["views"] = recs
+    atomic_write_bytes(out / VIEWS_JSON, (json.dumps(_jsonable(doc), indent=2) + "\n").encode("utf-8"))
+    log.info("Saved %d view(s) to %s", len(recs), out)
     return out
 
 
@@ -1047,6 +1467,37 @@ def _contour_pairs(src: np.ndarray, dst: np.ndarray, n: int) -> tuple[np.ndarray
     return dense[pick], dst_pts
 
 
+def _tps_lock(
+    rgb_v: np.ndarray,
+    a_v: np.ndarray,
+    a_g: np.ndarray,
+    target: np.ndarray,
+    G: np.ndarray,
+    shrink: float,
+    fr: _Frame,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """V3 lock: a 64-point thin-plate spline from the globally fitted matte ``a_g`` onto
+    ``target``, composed with the global map ``G`` (3 x 3, source picture -> frame) into one
+    resampling of the source picture (area-prefiltered by about ``shrink`` when it shrinks).
+    Returns ``(rgb, alpha, largest spline move in px)``."""
+    S = fr.S
+    src_pts, dst_pts = _contour_pairs(a_g >= 0.5, target, _TPS_POINTS)
+    tps = tps_fit(src_pts, dst_pts, lam=_TPS_LAM)
+    disp = tps.max_displacement((S, S), mask=target)
+    mx, my = _composed_map(tps, G, S)
+    rgb_q, q = _prefilter(rgb_v, shrink)
+    rgb_l = cv2.remap(
+        rgb_q,
+        ((mx + 0.5) * q[0] - 0.5).astype(np.float32),
+        ((my + 0.5) * q[1] - 0.5).astype(np.float32),
+        cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(_GREY,) * 3,
+    )
+    a_l = cv2.remap(a_v, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return rgb_l, a_l, float(disp)
+
+
 def _lock_back(v: GenView, fr: _Frame, cancel: CancelToken | None) -> tuple[GenView, dict[str, Any]]:
     """V2 + V3 for the back view: similarity (roll <= 5 deg) to the mirrored front
     silhouette, perspective stage (a camera turn), IoU gate, pose gate (the outline gap
@@ -1113,23 +1564,10 @@ def _lock_back(v: GenView, fr: _Frame, cancel: CancelToken | None) -> tuple[GenV
             f"{100 * _POSE_MAX_FRAC:.0f} % is accepted)"
         )
     _check(cancel)
-    src_pts, dst_pts = _contour_pairs(a_g >= 0.5, target, _TPS_POINTS)
-    tps = tps_fit(src_pts, dst_pts, lam=_TPS_LAM)
-    disp = tps.max_displacement((S, S), mask=target)
-    info.update(tps_max_px=round(float(disp), 3), tps_max_frac=round(float(disp / fr.L_px), 4))
-    mx, my = _composed_map(tps, G, S)
     # the source is shrunk by about the similarity's scale (the perspective stage is close
     # to the identity), so the area prefilter keys on it
-    rgb_q, q = _prefilter(rgb_v, float(params["s"]))
-    rgb_l = cv2.remap(
-        rgb_q,
-        ((mx + 0.5) * q[0] - 0.5).astype(np.float32),
-        ((my + 0.5) * q[1] - 0.5).astype(np.float32),
-        cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=(_GREY,) * 3,
-    )
-    a_l = cv2.remap(a_v, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    rgb_l, a_l, disp = _tps_lock(rgb_v, a_v, a_g, target, G, float(params["s"]), fr)
+    info.update(tps_max_px=round(float(disp), 3), tps_max_frac=round(float(disp / fr.L_px), 4))
     iou_l = silhouette_iou(a_l >= 0.5, target)
     info.update(ok=True, iou_locked=round(iou_l, 4))
     log.info(
@@ -1149,8 +1587,9 @@ def _lock_back(v: GenView, fr: _Frame, cancel: CancelToken | None) -> tuple[GenV
 
 
 def _preregistered(v: GenView, fr: _Frame) -> bool:
-    """A view already in this levelled frame (``S x S``, same ``m``, a finite offset): exact
-    orthographic cameras (MV-Adapter, M4) or the registered views of an earlier run."""
+    """A nominal view already in this levelled frame (``S x S``, same ``m``, a finite offset):
+    the registered views of an earlier run.  (Orthographic sets always go through their own
+    checks, which leave an already registered set as it is.)"""
     try:
         o = float(v.meta.get("offset_m", math.nan))
     except (TypeError, ValueError):
@@ -1392,15 +1831,21 @@ def _row_percentile(rows: np.ndarray, vals: np.ndarray, n_rows: int, pct: float)
     return out
 
 
-def _offset_rows(alpha: np.ndarray, phi: float, P_S: np.ndarray, fr: _Frame) -> tuple[np.ndarray, np.ndarray]:
+def _offset_rows(
+    alpha: np.ndarray, phi: float, P_S: np.ndarray, fr: _Frame, bias: float = 0.0
+) -> tuple[np.ndarray, np.ndarray]:
     """Per row the offset estimate ``o(j) = r_f(j) - (u_f(j) - S/2) m`` of a view at ``phi``
     (``r = P.w``; the silhouette edge facing the photo camera against the front points'
-    extreme ``r``) and the opposite edge ``u_b(j)`` (NaN where unknown)."""
+    extreme ``r``) and the opposite edge ``u_b(j)`` (NaN where unknown).  ``bias`` (px,
+    an addition): the matte's outline lies this far outside the subject's (a keyed matte
+    of an orthographic set, measured on view 0), so both edges are moved inward by it."""
     sgn = 1.0 if _sin(phi) > 0 else -1.0
     w, _ = _axes(phi)
     rows = np.floor((P_S[:, 1] - fr.cy) / fr.m + fr.S / 2.0).astype(np.int64)
     r_f = sgn * _row_percentile(rows, sgn * (P_S @ w), fr.S, _EDGE_PCT)
     left, right = _row_edges(alpha)
+    if bias:
+        left, right = left + bias, right - bias
     u_f, u_b = (left, right) if sgn > 0 else (right, left)
     return r_f - (u_f - fr.S / 2.0) * fr.m, u_b
 
@@ -1645,10 +2090,950 @@ def _solve_offsets(
     return out, info
 
 
+# =========================================================================== orthographic sets (V2-V5)
+@dataclass
+class _Reg:
+    """What V2-V5 hand to the shared lifting stages (V6-V11)."""
+
+    back: GenView | None = None
+    binfo: dict[str, Any] = field(default_factory=dict)
+    sides: list[GenView] = field(default_factory=list)  # registered side / quarter views (used or not)
+    orbit: dict[str, Any] = field(default_factory=dict)
+    views: list[GenView] = field(default_factory=list)  # every view, for BackPart.views
+    qc: dict[str, float] = field(default_factory=dict)  # QC terms of the registration
+    reason: str = ""  # non-empty: the set cannot be used
+
+
+def _ortho_affine(v: GenView, fr: _Frame) -> np.ndarray:
+    """3 x 3 map (OpenCV pixel coordinates) of an orthographic view's picture into the
+    levelled frame: its pixel scale to ``m_in`` about the picture centre (on the orbit axis),
+    and its frame centre onto the levelled one - a saved set made with another levelled
+    picture moves by ``(x0' - x0) cos(phi)`` horizontally (the axis depth term cancels) and
+    ``y0' - y0`` vertically.  The identity for a generator's view at the input's size."""
+    h, w = np.shape(v.alpha)
+    m_v = _pos_float(v.m) or fr.m * fr.S / max(w, 1)
+    centre = _pair(v.meta.get("frame_center_S"))
+    cx_v, cy_v = centre if centre is not None else (fr.cx, fr.cy)
+    k = m_v / fr.m
+    dx = (cx_v - fr.cx) * math.cos(math.radians(float(v.phi_deg))) / fr.m
+    dy = (cy_v - fr.cy) / fr.m
+    S = fr.S
+    return np.array(
+        [
+            [k, 0.0, (0.5 - w / 2.0) * k + S / 2.0 - 0.5 + dx],
+            [0.0, k, (0.5 - h / 2.0) * k + S / 2.0 - 0.5 + dy],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+
+
+def _warp_alpha(alpha: np.ndarray, M: np.ndarray, S: int) -> np.ndarray:
+    a = np.clip(np.nan_to_num(np.asarray(alpha, dtype=np.float32)), 0.0, 1.0)
+    return cv2.warpAffine(
+        a, M[:2], (S, S), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+    )
+
+
+def _warp_rgb(rgb: np.ndarray, M: np.ndarray, S: int) -> np.ndarray:
+    """``rgb`` resampled by the affine ``M`` into ``S x S`` (area-prefiltered when shrunk)."""
+    s = math.sqrt(abs(float(np.linalg.det(M[:2, :2]))))
+    rgb_q, q = _prefilter(rgb, s)
+    Mq = np.asarray(M[:2], dtype=np.float64).copy()
+    Mq[:, :2] /= q[None, :]
+    Mq[:, 2] += M[:2, :2] @ (0.5 * (1.0 / q - 1.0))
+    return cv2.warpAffine(
+        rgb_q, Mq, (S, S), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(_GREY,) * 3
+    )
+
+
+def _corner_move(M: np.ndarray, x0: float, y0: float, x1: float, y1: float) -> float:
+    """Largest displacement (px) of the box corners under the affine ``M``."""
+    P = np.array([[x0, y0, 1.0], [x1, y0, 1.0], [x0, y1, 1.0], [x1, y1, 1.0]])
+    return float(np.abs(P @ M[:2].T - P[:, :2]).max())
+
+
+def _signed_dist(mask: np.ndarray) -> np.ndarray:
+    """Signed distance (px) of pixel centres to a binary mask's outline (the boundary
+    between its inside and outside pixels): negative inside, positive outside."""
+    m = np.ascontiguousarray(mask, dtype=np.uint8)
+    d_out = cv2.distanceTransform(1 - m, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    d_in = cv2.distanceTransform(m, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    return np.where(m > 0, 0.5 - d_in, d_out - 0.5).astype(np.float64)
+
+
+def _bilinear_at(img: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Bilinear lookup at OpenCV coordinates; outside the picture the distance to it is
+    added (a distance map never looks better off the frame)."""
+    H, W = img.shape
+    xc = np.clip(x, 0.0, W - 1.0)
+    yc = np.clip(y, 0.0, H - 1.0)
+    x0 = np.minimum(np.floor(xc).astype(np.int64), W - 2)
+    y0 = np.minimum(np.floor(yc).astype(np.int64), H - 2)
+    fx, fy = xc - x0, yc - y0
+    top = img[y0, x0] * (1.0 - fx) + img[y0, x0 + 1] * fx
+    bot = img[y0 + 1, x0] * (1.0 - fx) + img[y0 + 1, x0 + 1] * fx
+    return top * (1.0 - fy) + bot * fy + np.hypot(x - xc, y - yc)
+
+
+def _outline_pts(mask: np.ndarray) -> np.ndarray:
+    """``(n, 2)`` outline pixels (inside pixels with an outside neighbour), at most 1500."""
+    m8 = mask.astype(np.uint8)
+    er = cv2.erode(m8, np.ones((3, 3), np.uint8), borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    ys, xs = np.nonzero((m8 > 0) & (er == 0))
+    k = max(1, int(math.ceil(len(xs) / _OUTLINE_PTS)))
+    return np.stack([xs[::k], ys[::k]], axis=1).astype(np.float64)
+
+
+def _outline_fit(
+    src: np.ndarray, dst: np.ndarray, init: dict[str, float], cancel: CancelToken | None
+) -> tuple[np.ndarray, float, Callable[[np.ndarray], float]]:
+    """Similarity (scale, shift) laying ``src``'s outline onto ``dst``'s up to a uniform
+    outline offset: the cost is the mean absolute deviation of the signed distances of
+    each outline's points to the other outline from their median (both directions), the
+    median bounded to +-1.5 px.  A keyed matte lies ~half a pixel outside the subject's
+    outline all round; the plain chamfer takes that for a 1-1.5 % larger subject (limbs
+    are a few pixels wide) and shrinks every view.  Starts from the chamfer fit ``init``.
+    Returns ``(T 3 x 3, cost, offset(T))``: ``offset(T)`` (px) is how far ``src``'s outline
+    lies outside ``dst``'s under ``T``."""
+    sd_s, sd_d = _signed_dist(src), _signed_dist(dst)
+    P, Q = _outline_pts(src), _outline_pts(dst)
+    ys, xs = np.nonzero(src)
+    c = np.array([xs.mean(), ys.mean()])
+    s0 = float(init.get("s", 1.0))
+    c_in = np.array([float(init.get("cx", c[0])), float(init.get("cy", c[1]))])
+    t0 = np.array([float(init.get("tx", 0.0)), float(init.get("ty", 0.0))]) + (1.0 - s0) * (c_in - c)
+
+    def T_of(x: np.ndarray) -> np.ndarray:
+        s = math.exp(float(x[0]))
+        return np.array(
+            [[s, 0.0, (1.0 - s) * c[0] + x[1]], [0.0, s, (1.0 - s) * c[1] + x[2]], [0.0, 0.0, 1.0]]
+        )
+
+    def dists(T: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        s = math.sqrt(abs(float(np.linalg.det(T[:2, :2]))))
+        f = P @ T[:2, :2].T + T[:2, 2]
+        Ti = np.linalg.inv(T)
+        b = Q @ Ti[:2, :2].T + Ti[:2, 2]
+        return _bilinear_at(sd_d, f[:, 0], f[:, 1]), s * _bilinear_at(sd_s, b[:, 0], b[:, 1])
+
+    lo, hi = -0.5 - _OUTLINE_MAX_PX, -0.5 + _OUTLINE_MAX_PX  # outline pixels sit 0.5 px inside
+
+    def cost(x: np.ndarray) -> float:
+        df, db = dists(T_of(x))
+        mf = min(max(float(np.median(df)), lo), hi)
+        mb = min(max(float(np.median(db)), lo), hi)
+        return float(np.abs(df - mf).mean() + np.abs(db - mb).mean())
+
+    def offset(T: np.ndarray) -> float:
+        df, db = dists(T)
+        return 0.5 * ((float(np.median(df)) + 0.5) - (float(np.median(db)) + 0.5))
+
+    x0 = np.array([math.log(max(s0, 1e-6)), t0[0], t0[1]])
+    x, fx = nelder_mead(cost, x0, np.array([0.01, 1.0, 1.0]), max_iter=300, tol=1e-4, cancel=cancel)
+    return T_of(x), float(fx), offset
+
+
+def _lateral_fit(
+    a0w: np.ndarray, fr: _Frame, cancel: CancelToken | None
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """V2 lateral check: view 0 (in the levelled frame) against the front silhouette.  A
+    similarity (scale, shift; no roll) is always fitted (~0.1 s: the symmetric chamfer,
+    refined to ignore a uniform outline offset, :func:`_outline_fit`) and kept when it moves
+    the outline by more than half a pixel and raises the overlap by at least 2 points - the
+    design fits only below IoU 0.85, which leaves a 3 % scale or a 3 px shift of a 512 px
+    set (IoU 0.89) uncorrected.  Returns ``(T, info)``: ``T`` the 3 x 3 correction for every
+    view (the identity when not kept); ``info["iou"]`` the overlap after it and
+    ``info["outline_offset_px"]`` how far view 0's matte lies outside the photo's outline
+    (the matte bias every view's edges are corrected by in V5 / V7)."""
+    a = a0w >= 0.5
+    iou_raw = silhouette_iou(a, fr.alpha0)
+    info: dict[str, Any] = {
+        "iou_raw": round(iou_raw, 4),
+        "applied": False,
+        "iou": round(iou_raw, 4),
+        "outline_offset_px": 0.0,
+    }
+    if not a.any():
+        return np.eye(3), info
+    params, cost = chamfer_similarity_fit(a, fr.alpha0, allow_roll=False, cancel=cancel)
+    T, cost_o, offset = _outline_fit(a, fr.alpha0, params, cancel)
+    iou_fit = silhouette_iou(_warp_alpha(a0w, T, fr.S) >= 0.5, fr.alpha0)
+    rows = np.flatnonzero(a.any(axis=1))
+    cols = np.flatnonzero(a.any(axis=0))
+    move = _corner_move(T, float(cols[0]), float(rows[0]), float(cols[-1]), float(rows[-1]))
+    apply = iou_fit >= iou_raw + _ORTHO_FIT_GAIN and move > _ORTHO_FIT_PX
+    T_used = T if apply else np.eye(3)
+    bias = min(max(offset(T_used), -_OUTLINE_MAX_PX), _OUTLINE_MAX_PX)
+    info.update(
+        similarity={
+            "s": round(float(T[0, 0]), 5),
+            "tx": round(float(T[0, 2]), 4),
+            "ty": round(float(T[1, 2]), 4),
+        },
+        chamfer_px=round(float(cost), 3),
+        outline_cost_px=round(cost_o, 4),
+        iou_fit=round(iou_fit, 4),
+        move_px=round(move, 3),
+        applied=bool(apply),
+        iou=round(iou_fit if apply else iou_raw, 4),
+        outline_offset_px=round(bias, 4),
+    )
+    return T_used, info
+
+
+def _ortho_rows(
+    a_w: np.ndarray, ref: tuple[float, float], ref_ok: tuple[bool, bool], fr: _Frame
+) -> tuple[np.ndarray, dict[str, Any], str]:
+    """V2 invariant rows of one orthographic view (in the levelled frame): at elevation 0
+    the subject's top and bottom rows are the same in every view, so ``s = (b0 - t0) / (b -
+    t)`` against the reference rows (view 0's).  More than 5 % off: dropped (the reason is
+    returned); otherwise the 3 x 3 correction scales the view about its centre column (the
+    orbit axis) and puts its bottom row on the reference's.  A row cut off by the picture
+    border (or the photo's cut-off end, ``ref_ok`` False) is no anchor: one good row only
+    aligns (scale 1), none leaves the view as it is - but the measured ratio is still a
+    bound (a cut view shows less of the subject, a cut reference less of it), so a view
+    that is more than 5 % too large even so (e.g. one filling its picture top to bottom)
+    is dropped."""
+    S = fr.S
+    tb = _top_bottom(a_w)
+    if tb is None or tb[1] - tb[0] < 4:
+        return np.eye(3), {"scale": 1.0, "anchor": "none"}, "it shows no subject"
+    cut = _touches(a_w)
+    top_ok = ref_ok[0] and not cut[0]
+    bottom_ok = ref_ok[1] and not cut[1]
+    (t0, b0), (t, b) = ref, tb
+    s_meas = (b0 - t0) / (b - t)
+    view_cut, ref_cut = cut[0] or cut[1], not (ref_ok[0] and ref_ok[1])
+    s, ya, yb, anchor = 1.0, 0.0, 0.0, "none"
+    off = ""
+    if top_ok and bottom_ok:
+        s, anchor = s_meas, "rows"
+        if abs(s - 1.0) > _ORTHO_SCALE_MAX:
+            off = f"{100 * abs(s - 1.0):.0f} % off"
+        ya, yb = b - 0.5, b0 - 0.5
+    else:
+        if view_cut and not ref_cut and s_meas < 1.0 - _ORTHO_SCALE_MAX:  # s_true <= s_meas
+            off = f"at least {100 * (1.0 - s_meas):.0f} % too large"
+        elif ref_cut and not view_cut and s_meas > 1.0 + _ORTHO_SCALE_MAX:  # s_true >= s_meas
+            off = f"at least {100 * (s_meas - 1.0):.0f} % too small"
+        if bottom_ok:
+            ya, yb, anchor = b - 0.5, b0 - 0.5, "bottom"
+        elif top_ok:
+            ya, yb, anchor = t - 0.5, t0 - 0.5, "top"
+    if off:
+        info = {"scale": round(float(s_meas), 5), "anchor": anchor}
+        return (
+            np.eye(3),
+            info,
+            f"its size does not match the other views ({off}; at most {100 * _ORTHO_SCALE_MAX:.0f} % is accepted)",
+        )
+    xc = S / 2.0 - 0.5
+    C = np.array([[s, 0.0, xc * (1.0 - s)], [0.0, s, yb - s * ya], [0.0, 0.0, 1.0]])
+    move = _corner_move(C, 0.0, 0.0, S - 1.0, S - 1.0)
+    info = {"scale": round(float(s), 5), "anchor": anchor, "shift_px": round(float(yb - ya), 3)}
+    if move <= _ORTHO_ROWS_PX:
+        return np.eye(3), {**info, "applied": False}, ""
+    return C, {**info, "applied": True}, ""
+
+
+def _lock_back_ortho(
+    v: GenView, M: np.ndarray, fr: _Frame, cancel: CancelToken | None
+) -> tuple[GenView, dict[str, Any]]:
+    """V3 for an orthographic back view placed by ``M`` (its exact camera plus the set's V2
+    corrections): IoU gate 0.75 against the mirrored front silhouette, the outline-gap pose
+    gate and the thin-plate spline lock - no similarity / perspective stage, the camera is
+    exact.  Returns the view in the levelled back frame (offset ``-x0``) and the
+    diagnostics (``ok``, ``reason``)."""
+    S = fr.S
+    target = fr.alpha0[:, ::-1]
+    a_v = np.clip(np.nan_to_num(np.asarray(v.alpha, dtype=np.float32)), 0.0, 1.0)
+    a_g = _warp_alpha(a_v, M, S)
+    iou = silhouette_iou(a_g >= 0.5, target)
+    info: dict[str, Any] = {
+        "name": v.name,
+        "phi": float(v.phi_deg),
+        "file": v.meta.get("file"),
+        "camera": "exact",
+        "ok": False,
+        "iou": round(iou, 4),
+    }
+    rgb_v = _rgb_u8(v.rgb, f"view '{v.name}'")
+
+    def unused(reason: str) -> tuple[GenView, dict[str, Any]]:
+        info["reason"] = reason
+        rgb_s = _warp_rgb(rgb_v, M, S)
+        return _registered(v, rgb_s, a_g, fr, offset_m=-fr.cx, used=False, reason=reason), info
+
+    if not (a_g >= 0.5).any():
+        return unused("the back view shows no subject")
+    if iou < _ORTHO_IOU_GATE:
+        return unused(
+            f"the back view does not match the photo's outline (overlap {100 * iou:.0f} %, at least "
+            f"{100 * _ORTHO_IOU_GATE:.0f} % is needed)"
+        )
+    gap = outline_gap(a_g >= 0.5, target, _POSE_GAP_PCT)
+    frac = gap / fr.L_px
+    info.update(pose_px=round(gap, 3), pose_frac=round(frac, 4))
+    if frac > _POSE_MAX_FRAC:
+        return unused(
+            f"the back view shows a different pose (parts of its outline are {100 * frac:.0f} % of the "
+            f"subject's size away from the photo's; at most {100 * _POSE_MAX_FRAC:.0f} % is accepted)"
+        )
+    _check(cancel)
+    shrink = math.sqrt(abs(float(np.linalg.det(M[:2, :2]))))
+    rgb_l, a_l, disp = _tps_lock(rgb_v, a_v, a_g, target, M, shrink, fr)
+    iou_l = silhouette_iou(a_l >= 0.5, target)
+    info.update(
+        ok=True,
+        iou_locked=round(iou_l, 4),
+        tps_max_px=round(disp, 3),
+        tps_max_frac=round(disp / fr.L_px, 4),
+    )
+    log.info(
+        "Back view %s (exact camera): IoU %.3f -> %.3f after the lock (outlines %.1f %% apart)",
+        v.name,
+        iou,
+        iou_l,
+        100 * frac,
+    )
+    out = _registered(v, rgb_l, a_l, fr, offset_m=-fr.cx, used=True, reason="", iou=iou, iou_locked=iou_l)
+    return out, info
+
+
+def _colour_map_fit(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """``(A, b, info)``: the colour map ``lin_dst ~ A lin_src + b`` (linear RGB) of paired
+    sRGB colours (uint8 ``N x 3``).  A per-channel gain first (median ratio, clamped to
+    [0.6, 1.6]), then :func:`~vrphoto.geometry.register.color_affine_fit` on the
+    gain-corrected pairs, as for TRELLIS (docs/CONTRACTS.md section 13): view 0 is mostly a
+    few colours (the front of the clothes), with which a full affine cannot tell a gain from
+    an offset - an offset that fixes a red front adds red to a blue back.  Each stage is
+    kept only when it lowers the median colour error (the affine against the gain alone:
+    a few mismatched pairs, e.g. a detail the generator drew differently, tilt it); the
+    identity when neither does."""
+    Xs = _srgb_to_linear(np.asarray(src, dtype=np.float64) / 255.0)
+    Yd = _srgb_to_linear(np.asarray(dst, dtype=np.float64) / 255.0)
+    g = np.ones(3)
+    for c in range(3):
+        ok = Xs[:, c] > 0.01
+        if int(ok.sum()) >= 8:
+            g[c] = float(np.clip(np.median(Yd[ok, c] / Xs[ok, c]), 0.6, 1.6))
+    A_r, b_r, ok_r = color_affine_fit(_linear_to_srgb(Xs * g), np.asarray(dst, dtype=np.float64) / 255.0)
+
+    def err(A: np.ndarray, b: np.ndarray) -> float:
+        return float(np.median(np.linalg.norm(Xs @ A.T + b - Yd, axis=1)))
+
+    eye, zero = np.eye(3), np.zeros(3)
+    err0, err_g = err(eye, zero), err(np.diag(g), zero)
+    err_a = err(A_r @ np.diag(g), b_r) if ok_r else math.inf
+    info: dict[str, Any] = {
+        "gain": [round(float(x), 4) for x in g],
+        "error_before": round(err0, 5),
+        "error_gain": round(err_g, 5),
+        "error_affine": round(err_a, 5) if math.isfinite(err_a) else None,
+    }
+    if err_a < min(err_g, err0) - 1e-4:
+        return A_r @ np.diag(g), b_r, {**info, "kept": "affine", "error_after": round(err_a, 5)}
+    if err_g < err0 - 1e-4:
+        return np.diag(g), zero, {**info, "kept": "gain", "error_after": round(err_g, 5)}
+    return eye, zero, {**info, "kept": "none", "error_after": round(err0, 5)}
+
+
+def _ortho_colours(
+    views: list[GenView], v0: GenView | None, ortho: OrthoInput, fr: _Frame
+) -> tuple[list[GenView], dict[str, Any]]:
+    """V4 for an orthographic set: pixel pairs between view 0 (registered) and the levelled
+    input where both mattes exceed 0.9 (eroded 4 px) and the input's gradient is at most its
+    30th percentile; one colour map in linear RGB (:func:`_colour_map_fit`: a per-channel
+    gain, then the Huber affine) applied to every view (one exposure; ``meta["color_match"]``
+    ``"gain"`` / ``"affine"``, ``"identity"`` when nothing was changed).  When it does not
+    lower the colour error the views already match and are left as they are (the design's
+    Reinhard fallback would pull a back of another colour toward the front's lightness);
+    without view 0 or with fewer than 64 pairs, the bounded rim-band Reinhard of nominal
+    views (:func:`_match_colours`).  Views matched before (a saved set) are skipped."""
+    todo = [i for i, v in enumerate(views) if "color_match" not in v.meta]
+    info: dict[str, Any] = {"method": "none", "pairs": 0}
+    if not todo:
+        info["method"] = "matched before"
+        return views, info
+    out = list(views)
+    if v0 is not None:
+        ref = np.asarray(ortho.rgba)[..., :3]
+        a_in = np.asarray(ortho.rgba)[..., 3].astype(np.float32) / 255.0
+        both = (np.asarray(v0.alpha) >= _COLOR_FIT_ALPHA) & (a_in >= _COLOR_FIT_ALPHA)
+        both = cv2.erode(both.astype(np.uint8), _disc(_COLOR_FIT_ERODE)) > 0
+        sel = both
+        if both.any():
+            g = cv2.cvtColor(np.ascontiguousarray(ref), cv2.COLOR_RGB2GRAY).astype(np.float32)
+            grad = np.hypot(cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3))
+            sel = both & (grad <= np.percentile(grad[both], _COLOR_FIT_GRAD_PCT))
+        info["pairs"] = int(sel.sum())
+        if info["pairs"] >= _COLOR_FIT_MIN:
+            A, b, finfo = _colour_map_fit(v0.rgb[sel], ref[sel])
+            kept = finfo["kept"] != "none"
+            info.update(
+                finfo, A=[[round(float(x), 5) for x in r] for r in A], b=[round(float(x), 5) for x in b]
+            )
+            method = str(finfo["kept"]) if kept else "identity"  # "gain" / "affine"
+            for i in todo:
+                v = out[i]
+                rgb = apply_color_affine(v.rgb, A, b) if kept else v.rgb
+                out[i] = replace(v, rgb=rgb, meta={**v.meta, "color_match": method})
+            info["method"] = method
+            return out, info
+    done = _match_colours([out[i] for i in todo], ortho, fr)
+    for i, v in zip(todo, done, strict=True):
+        out[i] = v
+    info["method"] = "reinhard"
+    return out, info
+
+
+def _masked_ssim(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> float:
+    """Mean SSIM (Gaussian window, sigma 1.5 px) of two grey pictures in [0, 1] over ``mask``
+    (0 when the mask is empty)."""
+    if not mask.any():
+        return 0.0
+    c1, c2 = 0.01**2, 0.03**2
+
+    def blur(x: np.ndarray) -> np.ndarray:
+        return cv2.GaussianBlur(x, (0, 0), 1.5)
+
+    mu_a, mu_b = blur(a), blur(b)
+    s_aa = blur(a * a) - mu_a * mu_a
+    s_bb = blur(b * b) - mu_b * mu_b
+    s_ab = blur(a * b) - mu_a * mu_b
+    ssim = ((2 * mu_a * mu_b + c1) * (2 * s_ab + c2)) / ((mu_a**2 + mu_b**2 + c1) * (s_aa + s_bb + c2))
+    return float(np.mean(ssim[mask]))
+
+
+def _sign_render_check(
+    sides: list[GenView],
+    z_axes: Mapping[bool, float],
+    front_sc: SplatCloud | None,
+    fr: _Frame,
+    cancel: CancelToken | None,
+) -> dict[str, Any]:
+    """The second azimuth-sign test of design V5: SHARP's photographed front rendered
+    (:func:`~vrphoto.geometry.splat_render.render_splats`, orthographic, in the views'
+    levelled framing about each hypothesis' own orbit axis ``z_axes[flip]``) at each quarter
+    view's azimuth (the +-90 views when there is no quarter view) - as named and mirrored -
+    and compared with the (colour-matched) view at 192 px: ``IoU + 0.5 SSIM + 0.5 (1 - MAE /
+    0.25)`` with the grey SSIM and the mean absolute RGB difference over both mattes (the
+    render un-premultiplied).  The colour term is an addition to the design's ``IoU + 0.5
+    SSIM``: on the synthetic person that alone separated the hypotheses by only 0.03 for side
+    views drawn 18 deg off their azimuth (the mean colour difference: 0.10 vs 0.22).  The render
+    shows only the photographed half, so neither hypothesis scores 2; the right one scores
+    clearly more.  ``contradicts`` is True when the mirrored hypothesis scores at least 0.05
+    more per view (the cameras look reversed); ``ran`` is False when nothing could be
+    compared."""
+    out: dict[str, Any] = {"ran": False, "contradicts": False}
+    quarter = [v for v in sides if _SIDE_MIN_SIN < abs(_sin(v.phi_deg)) <= _SIDE_EXACT_SIN]
+    check = quarter or [v for v in sides if abs(_sin(v.phi_deg)) > _SIDE_EXACT_SIN]
+    if (
+        front_sc is None
+        or not len(front_sc)
+        or not check
+        or not all(math.isfinite(z) for z in z_axes.values())
+    ):
+        out["reason"] = "nothing to compare"
+        return out
+    from .splat_render import SplatCamera, prepare_splats, render_splats
+
+    S = fr.S
+    N = int(min(S, _SIGN_RENDER_PX))
+    m = fr.m * S / N
+    prep = prepare_splats(front_sc, cancel=cancel)
+    R = fr.R
+    down = R[:, 1]
+    scores: dict[bool, list[float]] = {False: [], True: []}
+    per_view = []
+    for v in check:
+        a_v = cv2.resize(np.asarray(v.alpha, dtype=np.float32), (N, N), interpolation=cv2.INTER_AREA)
+        c_v = (
+            cv2.resize(_rgb_u8(v.rgb, v.name), (N, N), interpolation=cv2.INTER_AREA).astype(np.float32)
+            / 255.0
+        )
+        g_v = cv2.cvtColor(c_v, cv2.COLOR_RGB2GRAY)
+        rec: dict[str, Any] = {"name": v.name, "phi": float(v.phi_deg)}
+        for flip in (False, True):
+            _check(cancel)
+            phi = (360.0 - float(v.phi_deg)) % 360.0 if flip else float(v.phi_deg)
+            p = math.radians(phi)
+            right = R @ np.array([math.cos(p), 0.0, math.sin(p)])
+            fwd = R @ np.array([-math.sin(p), 0.0, math.cos(p)])
+            o = fr.cx * math.cos(p) + z_axes[flip] * math.sin(p)
+            centre = fr.c + o * right + fr.cy * down - _SIGN_RENDER_DIST_M * fwd
+            cam = SplatCamera(
+                R=np.stack([right, down, fwd]), center=centre, width=N, height=N, kind="ortho", m=m
+            )
+            r = render_splats(prep, cam, cancel=cancel)
+            al = np.asarray(r.alpha, dtype=np.float32)
+            ra, va = al >= 0.5, a_v >= 0.5
+            both = ra & va
+            c_r = np.clip(
+                np.asarray(r.rgb, dtype=np.float32) / 255.0 / np.maximum(al, 1e-3)[..., None], 0.0, 1.0
+            )
+            g_r = cv2.cvtColor(c_r, cv2.COLOR_RGB2GRAY)
+            mae = float(np.abs(c_r - c_v)[both].mean()) if both.any() else 1.0
+            score = (
+                silhouette_iou(ra, va)
+                + _SIGN_SSIM_WEIGHT * _masked_ssim(g_r, g_v, both)
+                + _SIGN_COLOUR_WEIGHT * max(0.0, 1.0 - mae / _SIGN_COLOUR_SCALE)
+            )
+            scores[flip].append(score)
+            rec["reversed" if flip else "named"] = round(score, 4)
+        per_view.append(rec)
+    named, mirrored = float(np.mean(scores[False])), float(np.mean(scores[True]))
+    out.update(
+        ran=True,
+        views=per_view,
+        named=round(named, 4),
+        reversed=round(mirrored, 4),
+        contradicts=bool(mirrored > named + _SIGN_RENDER_MARGIN),
+    )
+    return out
+
+
+def _turned_round(v: GenView) -> GenView:
+    """``v`` at the mirrored azimuth ``360 - phi`` (the azimuth sign of its camera reversed),
+    renamed, with ``meta["flipped"]`` and the azimuth it was named for (``phi_named``)."""
+    phi = (360.0 - float(v.phi_deg)) % 360.0
+    return replace(
+        v, phi_deg=phi, name=_phi_name(phi), meta={**v.meta, "flipped": True, "phi_named": float(v.phi_deg)}
+    )
+
+
+def _ortho_axis(
+    sides: list[GenView],
+    Pf_S: np.ndarray,
+    fr: _Frame,
+    canon: Canon,
+    warnings: list[str],
+    front_sc: SplatCloud | None = None,
+    cancel: CancelToken | None = None,
+) -> tuple[list[GenView], dict[str, Any]]:
+    """V5 for an orthographic set: the shared orbit axis depth ``z_a`` (frame S) and the
+    azimuth sign.
+
+    In a view at ``phi`` the silhouette edge facing the photo camera is the photographed
+    front, so per row ``z_a(j) = (o(j) - x0 cos(phi)) / sin(phi)`` with ``o(j)`` the
+    front-edge offset of :func:`_offset_rows`.  The +-90 views (else the quarter views) give
+    ``z_a`` = the median over the rows of both; their medians must agree within ``max(4 cm,
+    2 % H)`` and each view's row MAD stay within ``max(3 cm, 2 % H)``, otherwise every side
+    and quarter view is dropped (their offsets depend on ``z_a``) with a warning.  Sign
+    safety net: with the sign reversed (``360 - phi``) each view picks its back edge, so the
+    two still agree; the rows then measure the subject's mid-depth, which changes only where
+    something sticks out at the front or the back (an arm in front, a bag, the feet), so the
+    test is the 90th percentile of the row deviations (the MAD of the design barely changes:
+    measured 2.5 vs 2.9 mm on the synthetic person, against 6 vs 40 mm at the 90th
+    percentile).  When the reversed hypothesis costs less than half (summed over the views),
+    the second test of the design decides (:func:`_sign_render_check`: SHARP's front rendered
+    at the quarter views' azimuths, as named and mirrored, compared with the views): every view
+    is turned round with a warning only when it agrees.  Otherwise the named sides are kept
+    with a warning (side views rendered ~18 deg off their azimuth also fit better mirrored by
+    rows; turning them round mirrored the subject).  Then every view's offset is ``x0 cos(phi) +
+    z_a sin(phi)``; a quarter view whose own front edge disagrees with that (beyond the same
+    tolerances) is dropped.  Row edges are corrected by each view's
+    ``meta["edge_bias_px"]`` (the matte's outline offset measured on view 0)."""
+    H = float(canon.height_s)
+    mad_max = max(_MAD_MAX_M, _MAD_MAX_FRAC * H)
+    tol = max(_AGREE_M, _AXIS_AGREE_FRAC * H)
+    info: dict[str, Any] = {"views": [], "agree_m": None, "agree_tol_m": tol, "mad_max_m": mad_max}
+    if not sides:
+        return sides, info
+    exact = [i for i, v in enumerate(sides) if abs(_sin(v.phi_deg)) > _SIDE_EXACT_SIN]
+    axis_idx = exact or list(range(len(sides)))
+
+    def bias(v: GenView) -> float:
+        return float(v.meta.get("edge_bias_px", 0.0))
+
+    def rows_z(v: GenView, phi: float) -> dict[str, Any] | None:
+        o_rows, _ = _offset_rows(v.alpha, phi, Pf_S, fr, bias(v))
+        z = (o_rows - fr.cx * math.cos(math.radians(phi))) / _sin(phi)
+        ok = np.isfinite(z)
+        sil_rows = int((np.asarray(v.alpha) >= 0.5).any(axis=1).sum())
+        if int(ok.sum()) < max(5, int(math.ceil(_MIN_ROWS_FRAC * sil_rows))):
+            return None
+        med = float(np.median(z[ok]))
+        dev = np.abs(z[ok] - med)
+        return {
+            "z": z[ok],
+            "med": med,
+            "mad": float(np.median(dev)),
+            "misfit": float(np.percentile(dev, _SIGN_PCT)),
+            "rows": int(ok.sum()),
+        }
+
+    hyp: dict[bool, tuple[list[dict[str, Any] | None], float, float]] = {}
+    for flip in (False, True):
+        res = [
+            rows_z(sides[i], (360.0 - sides[i].phi_deg) % 360.0 if flip else sides[i].phi_deg)
+            for i in axis_idx
+        ]
+        full = all(r is not None for r in res)
+        misfit = sum(r["misfit"] for r in res if r is not None) if full else math.inf
+        mad = sum(r["mad"] for r in res if r is not None) if full else math.inf
+        hyp[flip] = (res, misfit, mad)
+    named, reversed_ = hyp[False][1], hyp[True][1]
+    proposed = (
+        math.isfinite(reversed_)
+        and named > _SIGN_MIN_MISFIT_M * len(axis_idx)
+        and reversed_ < _FLIP_RATIO * named
+    )
+    info["sign"] = {
+        "named_misfit_m": named,
+        "reversed_misfit_m": reversed_,
+        "named_mad_m": hyp[False][2],
+        "reversed_mad_m": hyp[True][2],
+        "rows_say_reversed": bool(proposed),
+        "flipped": False,
+        "unconfirmed": False,
+    }
+    flip = False
+    if proposed:  # the second test (design V5): flip only when both contradict the cameras
+        z_axes = {
+            h: float(np.median(np.concatenate([r["z"] for r in hyp[h][0] if r is not None])))
+            for h in (False, True)
+        }
+        check = _sign_render_check(list(sides), z_axes, front_sc, fr, cancel)
+        info["sign"]["render"] = check
+        flip = bool(check.get("contradicts"))
+        info["sign"]["flipped"] = flip
+        if not flip:
+            info["sign"]["unconfirmed"] = True
+            msg = (
+                "The generated side views fit the photo better as mirror images, but SHARP's front "
+                "does not confirm that their left and right were swapped; they were used as made (the "
+                "AI may have drawn the subject turned)."
+            )
+            warnings.append(msg)
+            log.warning(msg)
+    if flip:
+        sides = [_turned_round(v) for v in sides]
+        msg = (
+            "The generated side views were turned round: the azimuth sign of their cameras looks "
+            "reversed (the left and right views were swapped)."
+        )
+        warnings.append(msg)
+        log.warning(msg)
+    res = hyp[flip][0]
+    info["axis_views"] = [sides[i].name for i in axis_idx]
+
+    def drop_all(reason: str, msg: str) -> tuple[list[GenView], dict[str, Any]]:
+        warnings.append(msg)
+        log.warning(msg)
+        info["dropped"] = reason
+        return [replace(v, meta={**v.meta, "used": False, "reason": reason}) for v in sides], info
+
+    if any(r is None for r in res):
+        return drop_all(
+            "not lined up",
+            "The generated side views could not be lined up with the photo; they were not used.",
+        )
+    good: list[dict[str, Any]] = [r for r in res if r is not None]
+    z_a = float(np.median(np.concatenate([r["z"] for r in good])))
+    for i, r in zip(axis_idx, good, strict=True):
+        info["views"].append(
+            {
+                "name": sides[i].name,
+                "phi": float(sides[i].phi_deg),
+                "z_m": r["med"],
+                "mad_m": r["mad"],
+                "rows": r["rows"],
+            }
+        )
+    pos = [r["med"] for i, r in zip(axis_idx, good, strict=True) if _sin(sides[i].phi_deg) > 0]
+    neg = [r["med"] for i, r in zip(axis_idx, good, strict=True) if _sin(sides[i].phi_deg) < 0]
+    if pos and neg:
+        agree = float(np.median(pos) - np.median(neg))
+        info["agree_m"] = agree
+        if abs(agree) > tol:
+            return drop_all(
+                "left and right disagree",
+                f"The generated left and right views do not agree on the subject's depth (by "
+                f"{100 * abs(agree):.0f} cm); the side views were not used.",
+            )
+    worst = max(r["mad"] for r in good)
+    if worst > mad_max:
+        return drop_all(
+            "does not line up",
+            f"The generated side views do not line up with the photo (their front edge wanders by "
+            f"{100 * worst:.0f} cm); they were not used.",
+        )
+    info.update(z_axis_S=z_a, z_axis=float(canon.z_axis) + z_a, z_axis_prior=float(canon.z_axis))
+    mads = {i: r["mad"] for i, r in zip(axis_idx, good, strict=True)}
+    out: list[GenView] = []
+    for i, v in enumerate(sides):
+        phi = float(v.phi_deg)
+        o = fr.cx * math.cos(math.radians(phi)) + z_a * _sin(phi)
+        mad, reason, dev = mads.get(i, 0.0), "", 0.0
+        if i not in mads:  # a quarter view: its own front edge must follow the solved axis
+            o_rows, _ = _offset_rows(v.alpha, phi, Pf_S, fr, bias(v))
+            ok = np.isfinite(o_rows)
+            if int(ok.sum()) >= 5:
+                dev = float(np.median(o_rows[ok]) - o)
+                mad = float(np.median(np.abs(o_rows[ok] - o - dev)))
+                if abs(dev) > tol or mad > mad_max:
+                    reason = f"it does not line up with the side views (its front edge is {100 * abs(dev):.0f} cm off)"
+            else:
+                reason = "it could not be lined up with the photo"
+            info["views"].append(
+                {"name": v.name, "phi": phi, "dev_m": dev, "mad_m": mad, "used": not reason, "reason": reason}
+            )
+            if reason:
+                msg = f"The {v.name} view ({v.meta.get('file', v.name)}) was not used: {reason}."
+                warnings.append(msg)
+                log.warning(msg)
+        out.append(
+            replace(v, meta={**v.meta, "offset_m": o, "mad_m": mad, "used": not reason, "reason": reason})
+        )
+    log.info(
+        "Orthographic views: orbit axis %.3f m (prior %.3f m), +-90 agree %s, row MAD %.1f mm%s",
+        float(canon.z_axis) + z_a,
+        float(canon.z_axis),
+        "n/a" if info["agree_m"] is None else f"{1000 * info['agree_m']:.1f} mm",
+        1000 * worst,
+        ", azimuth sign reversed" if flip else "",
+    )
+    return out, info
+
+
+def _register_ortho_set(
+    vlist: list[GenView],
+    canon: Canon,
+    ortho: OrthoInput,
+    fr: _Frame,
+    Pf_S: np.ndarray,
+    color_match: bool,
+    warnings: list[str],
+    diag: dict[str, Any],
+    rep: Any,
+    cancel: CancelToken | None,
+    front_sc: SplatCloud | None = None,
+) -> _Reg:
+    """V2-V5 for a set of orthographic views (see the module docstring); ``front_sc`` (SHARP's
+    cleaned front) is rendered by the second azimuth-sign test."""
+    reg = _Reg()
+    S = fr.S
+    rep(0.0, "Lining up the views")
+    view0: GenView | None = None
+    back: GenView | None = None
+    sides_in: list[GenView] = []
+    unused: list[GenView] = []
+    for v in vlist:
+        why = ""
+        if v.kind != "ortho":
+            why = "it was not made with the cameras of the other views"
+        elif _is_back(v.phi_deg):
+            if back is None:
+                back = v
+                continue
+            why = "second back"
+        elif _az_diff(v.phi_deg, 0.0) < 1.0:
+            if view0 is None:
+                view0 = v
+                continue
+            why = "second front view"
+        elif abs(_sin(v.phi_deg)) > _SIDE_MIN_SIN:
+            sides_in.append(v)
+            continue
+        else:
+            why = "a front view"
+        diag["views"].append({"name": v.name, "phi": v.phi_deg, "used": False, "reason": why})
+        if v.kind != "ortho":
+            msg = f"The {v.name} picture ({v.meta.get('file', v.name)}) was not used: {why}."
+            warnings.append(msg)
+            log.warning(msg)
+        unused.append(replace(v, meta={**v.meta, "used": False, "reason": why}))
+    assert back is not None  # the caller routes sets with an orthographic back here
+    items: list[tuple[GenView, np.ndarray]] = [(v, _ortho_affine(v, fr)) for v in (back, *sides_in)]
+    M0 = _ortho_affine(view0, fr) if view0 is not None else None
+
+    def shown(reason: str) -> list[GenView]:
+        """Every view in the levelled frame as far as it got, for the contact sheet."""
+        out = []
+        for v, M in ([(view0, M0)] if view0 is not None else []) + items:
+            a = _warp_alpha(v.alpha, M, S)
+            out.append(
+                _registered(v, _warp_rgb(_rgb_u8(v.rgb, v.name), M, S), a, fr, used=False, reason=reason)
+            )
+        return out + unused
+
+    # ---- V2: lateral check against the photo's outline (view 0)
+    lat: dict[str, Any] = {"skipped": "no front view"}
+    if view0 is not None and M0 is not None:
+        T, lat = _lateral_fit(_warp_alpha(view0.alpha, M0, S), fr, cancel)
+        if lat["iou"] < _ORTHO_IOU_GATE:
+            diag["lateral"] = lat
+            reg.reason = (
+                f"the generated views do not match the photo's outline (the front view overlaps it by "
+                f"{100 * lat['iou']:.0f} %, at least {100 * _ORTHO_IOU_GATE:.0f} % is needed)"
+            )
+            reg.views = shown(reg.reason)
+            return reg
+        if lat["applied"]:
+            M0 = T @ M0
+            items = [(v, T @ M) for v, M in items]
+    diag["lateral"] = lat
+    if view0 is not None:
+        diag["views"].append(
+            {
+                "name": view0.name,
+                "phi": view0.phi_deg,
+                "file": view0.meta.get("file"),
+                "used": True,
+                "role": "outline check and colour reference",
+            }
+        )
+    _check(cancel)
+
+    # ---- V2: invariant rows (against view 0's rows, else the photo's)
+    cut0 = (bool(getattr(canon, "cut_top", False)), bool(getattr(canon, "cut_bottom", False)))
+    a_ref = (
+        _warp_alpha(view0.alpha, M0, S)
+        if view0 is not None and M0 is not None
+        else fr.alpha0.astype(np.float32)
+    )
+    ref = _top_bottom(a_ref)
+    cut_ref = _touches(a_ref)
+    ref_ok = (not (cut0[0] or cut_ref[0]), not (cut0[1] or cut_ref[1]))
+    kept: list[tuple[GenView, np.ndarray, dict[str, Any]]] = []
+    recs: list[dict[str, Any]] = []  # diag records of the kept views (the back first)
+    rejected: list[GenView] = []
+    rejected_recs: list[dict[str, Any]] = []
+
+    def warn_rejected() -> None:
+        """The dropped views' warnings, named as finally placed (V5 may turn the set round)."""
+        for r in rejected:
+            msg = (
+                f"The {r.name} view ({r.meta.get('file', r.name)}) was not used: {r.meta.get('reason', '')}."
+            )
+            warnings.append(msg)
+            log.warning(msg)
+
+    for v, M in items:
+        a_w = _warp_alpha(v.alpha, M, S)
+        if ref is None:
+            C, rinfo, why = np.eye(3), {"scale": 1.0, "anchor": "none"}, ""
+        else:
+            C, rinfo, why = _ortho_rows(a_w, ref, ref_ok, fr)
+        rec = {"name": v.name, "phi": v.phi_deg, "file": v.meta.get("file"), "used": not why, **rinfo}
+        diag["views"].append(rec)
+        if why:
+            rec["reason"] = why
+        if why:
+            if v is back:
+                reg.reason = f"the back view could not be used ({why})"
+                warn_rejected()
+                reg.views = shown(reg.reason)
+                return reg
+            rgb = _warp_rgb(_rgb_u8(v.rgb, v.name), M, S)
+            rejected.append(_registered(v, rgb, a_w, fr, used=False, reason=why, scale=rinfo.get("scale")))
+            rejected_recs.append(rec)
+            continue
+        kept.append((v, C @ M, rinfo))
+        recs.append(rec)
+    _check(cancel)
+
+    # ---- V3: the back lock
+    rep(0.06, "Fitting the back view to the outline")
+    _, Mb, binfo_rows = kept[0]
+    back_r, binfo = _lock_back_ortho(back, Mb, fr, cancel)
+    diag["back"] = binfo
+    if not binfo["ok"]:
+        warn_rejected()
+        reg.reason = binfo["reason"]
+        reg.views = shown(reg.reason)  # [view 0, back, sides..., unused...]
+        reg.views[1 if view0 is not None else 0] = back_r
+        return reg
+    centre = [float(fr.cx), float(fr.cy)]
+    back_r = replace(
+        back_r, meta={**back_r.meta, "frame_center_S": centre, "scale": binfo_rows.get("scale", 1.0)}
+    )
+    sides: list[GenView] = []
+    edge_bias = float(lat.get("outline_offset_px", 0.0))  # the mattes' outline offset (view 0's)
+    for v, M, rinfo in kept[1:]:
+        _check(cancel)
+        rgb = _warp_rgb(_rgb_u8(v.rgb, v.name), M, S)
+        sides.append(
+            _registered(
+                v,
+                rgb,
+                _warp_alpha(v.alpha, M, S),
+                fr,
+                used=True,
+                reason="",
+                scale=rinfo.get("scale", 1.0),
+                anchor=rinfo.get("anchor"),
+                frame_center_S=centre,
+                edge_bias_px=edge_bias,
+            )
+        )
+    v0r: GenView | None = None
+    if view0 is not None and M0 is not None:
+        rgb0 = _warp_rgb(_rgb_u8(view0.rgb, view0.name), M0, S)
+        v0r = _registered(
+            view0,
+            rgb0,
+            _warp_alpha(view0.alpha, M0, S),
+            fr,
+            offset_m=fr.cx,
+            used=True,
+            reason="",
+            frame_center_S=centre,
+        )
+    _check(cancel)
+
+    # ---- V4: one colour map for the whole set
+    if color_match:
+        group = [*([v0r] if v0r is not None else []), back_r, *sides]
+        group, cinfo = _ortho_colours(group, v0r, ortho, fr)
+        if v0r is not None:
+            v0r, back_r, *sides = group
+        else:
+            back_r, *sides = group
+        diag["colour_fit"] = cinfo
+    diag["color_match"] = bool(color_match)
+    _check(cancel)
+
+    # ---- V5: the shared orbit axis and the azimuth sign
+    rep(0.12, "Finding the orbit axis")
+    sides, orbit = _ortho_axis(sides, Pf_S, fr, canon, warnings, front_sc=front_sc, cancel=cancel)
+    diag["orbit"] = orbit
+    for rec, v in zip(recs[1:], sides, strict=True):  # V5 may turn views round or drop them
+        rec.update(phi_used=float(v.phi_deg), used=bool(v.meta.get("used")))
+        if not v.meta.get("used"):
+            rec["reason"] = v.meta.get("reason", "")
+    if (orbit.get("sign") or {}).get("flipped"):  # the dropped side views are turned round too
+        rejected = [_turned_round(v) for v in rejected]
+        for rec, v in zip(rejected_recs, rejected, strict=True):
+            rec.update(phi_used=float(v.phi_deg))
+    warn_rejected()
+    n_dropped = len(rejected) + sum(1 for v in sides if not v.meta.get("used"))
+    spread = [abs(float(r.get("scale", 1.0)) - 1.0) for _, _, r in kept]
+    sign = orbit.get("sign") or {}
+    reg.qc = {
+        "height_spread": (max(spread) / _ORTHO_SCALE_MAX) if spread else 0.0,
+        "lateral": (1.0 - float(lat.get("iou", 0.0))) if v0r is not None else 0.0,
+        "dropped": _QC_DROPPED * n_dropped,
+        # an unflipped set wins between tries: a turned-round or doubtful one had wrong cameras
+        "sign": _QC_FLIPPED if sign.get("flipped") else (_QC_SIGN_UNSURE if sign.get("unconfirmed") else 0.0),
+    }
+    reg.back, reg.binfo, reg.sides, reg.orbit = back_r, binfo, sides, orbit
+    reg.views = [*([v0r] if v0r is not None else []), back_r, *sides, *rejected, *unused]
+    rep(0.2, "Lining up the views")
+    return reg
+
+
 # =========================================================================== V6 hull
-def _constraining(views: Sequence[GenView], fr: _Frame) -> list[tuple[float, float, np.ndarray]]:
-    """``(phi, offset, dilated matte (flat bool))`` of the registered side / quarter views."""
-    out = []
+def _constraining(views: Sequence[GenView], fr: _Frame) -> list[tuple[float, float, np.ndarray, int]]:
+    """``(phi, offset, dilated matte (flat bool), votes)`` of the registered side / quarter
+    views.  A left / right view (``|sin phi| > 0.95``) whose mirror partner (``phi + 180``)
+    is not among them has 2 votes: in orthographic projection the two carry the same
+    silhouette, so in a whole set that silhouette carves with two votes.  Alone with one
+    vote it no longer carved behind the body, where the quarter views' silhouettes are
+    wider in depth (measured: the hull 8.7 instead of 3.9 cm beyond the true back at the
+    median with the 270 view dropped)."""
+    out: list[tuple[float, float, np.ndarray, int]] = []
     for v in views:
         if not (v.meta.get("registered") and v.meta.get("used", True)):
             continue
@@ -1660,28 +3045,34 @@ def _constraining(views: Sequence[GenView], fr: _Frame) -> list[tuple[float, flo
         if a.shape != (fr.S, fr.S):
             continue
         dil = cv2.dilate((a >= 0.5).astype(np.uint8), _disc(_HULL_DILATE_PX)) > 0
-        out.append((float(v.phi_deg), float(v.meta["offset_m"]), dil.ravel()))
+        out.append((float(v.phi_deg), float(v.meta["offset_m"]), dil.ravel(), 1))
+    exact = [k for k, c in enumerate(out) if abs(_sin(c[0])) > _SIDE_EXACT_SIN]
+    for k in exact:
+        phi = out[k][0]
+        if not any(j != k and _az_diff(out[j][0], phi + 180.0) < 22.5 for j in exact):
+            out[k] = (*out[k][:3], 2)
     return out
 
 
 def _vote(
-    P_S: np.ndarray, cviews: list[tuple[float, float, np.ndarray]], fr: _Frame, rule: str
+    P_S: np.ndarray, cviews: list[tuple[float, float, np.ndarray, int]], fr: _Frame, rule: str
 ) -> np.ndarray:
-    """Inside the visual hull: inside at least K-1 of the K views that see the point (all of
-    them when K <= 2, or with ``rule="all"``); a point no view sees is not constrained."""
+    """Inside the visual hull: inside at least K-1 of the K votes of the views that see the
+    point (all of them when K <= 2, or with ``rule="all"``; a lone left / right view has 2
+    votes, :func:`_constraining`); a point no view sees is not constrained."""
     shape = P_S.shape[:-1]
     n_in = np.zeros(shape, np.int16)
     n_known = np.zeros(shape, np.int16)
     S = fr.S
-    for phi, o, mask in cviews:
+    for phi, o, mask, votes in cviews:
         u, v, _ = _project(P_S, phi, o, fr)
         with np.errstate(invalid="ignore"):
             ok = (u >= 0) & (u < S) & (v >= 0) & (v < S)
         iu = np.floor(np.where(ok, u, 0.0)).astype(np.int64)
         iv = np.floor(np.where(ok, v, 0.0)).astype(np.int64)
         flat = np.clip(iv * S + iu, 0, S * S - 1)
-        n_in += ok & mask[flat]
-        n_known += ok
+        n_in += (ok & mask[flat]) * np.int16(votes)
+        n_known += ok * np.int16(votes)
     if rule == "all":
         return n_in == n_known
     return np.where(n_known <= 2, n_in == n_known, n_in >= n_known - 1)
@@ -1862,7 +3253,7 @@ def _side_back_rows(sides: list[GenView], P_S: np.ndarray, fr: _Frame) -> np.nda
     for v in sides:
         if abs(_sin(v.phi_deg)) <= _SIDE_EXACT_SIN:
             continue
-        _, u_b = _offset_rows(v.alpha, v.phi_deg, P_S, fr)
+        _, u_b = _offset_rows(v.alpha, v.phi_deg, P_S, fr, float(v.meta.get("edge_bias_px", 0.0)))
         z = math.copysign(1.0, _sin(v.phi_deg)) * (v.meta["offset_m"] + (u_b - fr.S / 2.0) * fr.m)
         zb = np.fmax(zb, z)
     return zb
@@ -1984,7 +3375,7 @@ def _fill_holes(
     canon: Canon,
     matte: np.ndarray,
     D_f: np.ndarray,
-    cviews: list[tuple[float, float, np.ndarray]],
+    cviews: list[tuple[float, float, np.ndarray, int]],
     fr: _Frame,
     warnings: list[str],
     info: dict[str, Any],
@@ -2095,73 +3486,30 @@ def _jsonable(x: Any) -> Any:
     return x
 
 
-def view_based_back(
+def _register_nominal_set(
+    vlist: list[GenView],
     front: FrontModel,
     canon: Canon,
     ortho: OrthoInput,
-    views: Sequence[GenView],
-    *,
-    depth_fn: Callable[[np.ndarray], Any] | None = None,
-    relief: str = "auto",
-    color_match: bool = True,
-    stride: int = 1,
-    seed: int = 0,
-    fill_holes: bool = True,
-    source: str = "images",
-    progress: ProgressReporter | None = None,
-    cancel: CancelToken | None = None,
-) -> BackPart:
-    """The back from nominal views (design 3.5.2 V2-V11; see the module docstring).
-
-    ``views`` are segmented :class:`GenView` objects (:func:`segment_views`); one at
-    phi 180 (the back) is required, side / quarter views (|sin phi| > 0.3) are optional
-    (front views are ignored).  Side views already registered in this levelled frame
-    (``meta["registered"]``, ``S x S``, ``m == ortho.m_in``, ``meta["offset_m"]``: exact
-    cameras from M4, or the views of an earlier run) skip V2 and V5.
-    ``depth_fn(rgb) -> disparity`` (``S x S`` in [0, 1], 1 = nearest the back camera; a
-    ``DepthResult`` or None is accepted, a ``"heuristic"`` result counts as none) gives the
-    relief when ``relief != "flat"``.  ``color_match`` applies the Reinhard rim-band transfer
-    (V4).  ``stride`` is the mould's Gaussian stride, ``seed`` fixes the subsampling of
-    occluders, ``fill_holes`` (addition) switches V10 off for the fast quality, ``source``
-    (addition) names the result.
-
-    Returns ``BackPart(kind="mould", source=source, views=registered views, hull=...,
-    diag=...)``; ``ok=False`` with a plain ``reason`` when there is no back view, its outline
-    does not match the photo's (IoU < 0.75 after the similarity and perspective stages) or
-    it shows a different pose (after them, 2 % of the outlines are still more than 6 % of
-    the subject's size apart).  ``diag`` is JSON-ready: ``back`` (similarity, perspective
-    matrix, IoU after the similarity / perspective (``iou``) / lock, ``pose_frac`` - the
-    outline gap of the pose check - and the lock's largest move), ``orbit`` (per-view
-    offsets and row MAD, mirrored pairs and their naming decision, left/right agreement,
-    ``z_axis`` - the orbit axis depth in C when left / right views were used), ``views``
-    (also each side view's scale and anchor row), ``hull``, ``relief``, ``colours``,
-    ``holes``, ``qc`` (``cost`` and its terms); ``diag["warning"]`` joins the plain
-    sentences for the user (also listed in ``diag["warnings"]``).  Raises
-    :class:`InputError` for invalid inputs and :class:`Cancelled`."""
-    t_start = time.perf_counter()
-    rep = _as_reporter(progress)
-    mode = str(relief).strip().lower() if relief is not None else "auto"
-    if mode not in RELIEFS:
-        raise InputError(f"Unknown back relief {relief!r}.", hint=f"Choose one of: {', '.join(RELIEFS)}.")
-    fr = _frame(ortho, canon)
+    fr: _Frame,
+    color_match: bool,
+    warnings: list[str],
+    diag: dict[str, Any],
+    rep: Any,
+    cancel: CancelToken | None,
+) -> tuple[_Reg, np.ndarray]:
+    """V2-V5 for nominal views: the back lock, side registration, the rim-band colours and
+    the per-view offsets.  Returns the registration and the front points in S."""
+    reg = _Reg()
     matte, D_f = _front_maps(front)
-    vlist = list(views or [])
-    for v in vlist:
-        if not isinstance(v, GenView):
-            raise InputError(f"Expected GenView objects (got {type(v).__name__}).")
-    warnings: list[str] = []
-    diag: dict[str, Any] = {"source": source, "seed": int(seed), "views": [], "warnings": warnings}
-    _check(cancel)
-
     backs = [v for v in vlist if _is_back(v.phi_deg)]
     sides_in = [v for v in vlist if not _is_back(v.phi_deg) and abs(_sin(v.phi_deg)) > _SIDE_MIN_SIN]
     for v in vlist:
         if not _is_back(v.phi_deg) and abs(_sin(v.phi_deg)) <= _SIDE_MIN_SIN:
             diag["views"].append({"name": v.name, "phi": v.phi_deg, "used": False, "reason": "a front view"})
     if not backs:
-        return _failed(
-            source, "there is no picture of the back (a view from behind, 180°)", vlist, diag, t_start
-        )
+        reg.reason, reg.views = "there is no picture of the back (a view from behind, 180°)", vlist
+        return reg, np.zeros((0, 3))
 
     # ---- V2 / V3: the back
     rep(0.0, "Fitting your back photo to the outline")
@@ -2172,7 +3520,8 @@ def view_based_back(
             {"name": extra.name, "phi": extra.phi_deg, "used": False, "reason": "second back"}
         )
     if not binfo["ok"]:
-        return _failed(source, binfo["reason"], [back, *sides_in], _jsonable(diag), t_start)
+        reg.reason, reg.views = binfo["reason"], [back, *sides_in]
+        return reg, np.zeros((0, 3))
     _check(cancel)
 
     # ---- V2: side / quarter views
@@ -2183,7 +3532,7 @@ def view_based_back(
     sides: list[GenView] = []
     rejected: list[GenView] = []
     for v in sides_in:
-        if _preregistered(v, fr):  # exact cameras (M4) or a view set registered before
+        if _preregistered(v, fr):  # a view set registered before
             sides.append(replace(v, meta={**v.meta, "used": True, "reason": "", "offset_given": True}))
             diag["views"].append({"name": v.name, "phi": v.phi_deg, "used": True, "registered": "given"})
             continue
@@ -2212,12 +3561,138 @@ def view_based_back(
     if sides:
         sides, orbit = _solve_offsets(sides, Pf_S, fr, canon, warnings)
     diag["orbit"] = orbit
+    rep(0.2, "Lining up the side photos")
+    reg.back, reg.binfo, reg.sides, reg.orbit = back, binfo, sides, orbit
+    reg.views = [back, *sides, *rejected]
+    return reg, Pf_S
+
+
+def qc_cost(diag: Mapping[str, Any] | BackPart | None) -> float:
+    """V11: the QC cost of a view-based back for choosing between tries (lower is better):
+    ``diag["qc"]["cost"]`` of :func:`view_based_back` (the sum of its ``terms``: ``1 -
+    IoU_back``, the views' height spread, the orbit-axis disagreement of the +-90 views over
+    its tolerance, the worst row MAD / 3 cm, and for orthographic sets ``1 - IoU`` of view 0
+    and 0.5 per dropped view; the yaw and face terms are 0 until M6).  ``inf`` for an
+    unusable back (``ok`` False) or a diag without a QC cost.  Accepts the ``BackPart`` or
+    its ``diag``."""
+    if isinstance(diag, BackPart):
+        if not diag.ok:
+            return math.inf
+        diag = diag.diag
+    if not isinstance(diag, Mapping) or diag.get("ok") is False:
+        return math.inf
+    qc = diag.get("qc")
+    if not isinstance(qc, Mapping):
+        return math.inf
+    cost = qc.get("cost")
+    if cost is None:
+        terms = qc.get("terms")
+        if not isinstance(terms, Mapping):
+            return math.inf
+        cost = sum(_num_or(t, math.inf) for t in terms.values() if t is not None)
+    c = _num_or(cost, math.inf)
+    return c if math.isfinite(c) else math.inf
+
+
+def choose_view_set(results: Sequence[BackPart | Mapping[str, Any] | None]) -> int | None:
+    """Design 3.5.3: the index of the usable try with the lowest :func:`qc_cost` (the first
+    on a tie), None when no try is usable.  ``results`` are the ``BackPart`` objects (or
+    their diags) of :func:`view_based_back`, one per generated view set."""
+    best: int | None = None
+    best_c = math.inf
+    for i, r in enumerate(results):
+        c = qc_cost(r) if r is not None else math.inf
+        if c < best_c:
+            best, best_c = i, c
+    return best
+
+
+def view_based_back(
+    front: FrontModel,
+    canon: Canon,
+    ortho: OrthoInput,
+    views: Sequence[GenView],
+    *,
+    depth_fn: Callable[[np.ndarray], Any] | None = None,
+    relief: str = "auto",
+    color_match: bool = True,
+    stride: int = 1,
+    seed: int = 0,
+    fill_holes: bool = True,
+    source: str = "images",
+    progress: ProgressReporter | None = None,
+    cancel: CancelToken | None = None,
+) -> BackPart:
+    """The back from views of the subject (design 3.5.2 V2-V11; see the module docstring).
+
+    ``views`` are segmented :class:`GenView` objects (:func:`segment_views`); one at
+    phi 180 (the back) is required, side / quarter views (|sin phi| > 0.3) are optional
+    (front views are ignored).  When the back view is ``kind="ortho"`` the set has exact
+    orthographic cameras (MV-Adapter, :func:`views_from_cameras`, or a saved views folder):
+    the orthographic checks of the module docstring replace the nominal registration
+    (nominal pictures among them are not used, view 0 is the lateral check and the colour
+    reference).  Otherwise every view is nominal; side views already registered in this
+    levelled frame (``meta["registered"]``, ``S x S``, ``m == ortho.m_in``,
+    ``meta["offset_m"]``: the views of an earlier run) skip V2 and V5.
+    ``depth_fn(rgb) -> disparity`` (``S x S`` in [0, 1], 1 = nearest the back camera; a
+    ``DepthResult`` or None is accepted, a ``"heuristic"`` result counts as none) gives the
+    relief when ``relief != "flat"``.  ``color_match`` applies V4 (the Reinhard rim-band
+    transfer; one affine colour map for an orthographic set).  ``stride`` is the mould's
+    Gaussian stride, ``seed`` fixes the subsampling of occluders, ``fill_holes`` (addition)
+    switches V10 off for the fast quality, ``source`` (addition) names the result.
+
+    Returns ``BackPart(kind="mould", source=source, views=registered views, hull=...,
+    diag=...)``; ``ok=False`` with a plain ``reason`` when there is no back view, its outline
+    does not match the photo's (IoU < 0.75 after the similarity and perspective stages; for
+    an orthographic set also view 0's after the lateral similarity) or it shows a different
+    pose (after them, 2 % of the outlines are still more than 6 % of the subject's size
+    apart), or an orthographic back's size differs from view 0's by more than 5 %.  ``diag``
+    is JSON-ready: ``back`` (similarity, perspective matrix, IoU after the similarity /
+    perspective (``iou``) / lock, ``pose_frac`` - the outline gap of the pose check - and
+    the lock's largest move), ``orbit`` (per-view offsets and row MAD, mirrored pairs and
+    their naming decision, left/right agreement, ``z_axis`` - the orbit axis depth in C
+    when left / right views were used; for an orthographic set also ``sign`` - the MAD of
+    both azimuth-sign hypotheses and whether the views were turned round), ``lateral`` and
+    ``colour_fit`` (orthographic sets), ``views`` (also each side view's scale and anchor
+    row), ``hull``, ``relief``, ``colours``, ``holes``, ``qc`` (``cost`` and its terms,
+    :func:`qc_cost`); ``diag["warning"]`` joins the plain sentences for the user (also
+    listed in ``diag["warnings"]``).  Raises :class:`InputError` for invalid inputs and
+    :class:`Cancelled`."""
+    t_start = time.perf_counter()
+    rep = _as_reporter(progress)
+    mode = str(relief).strip().lower() if relief is not None else "auto"
+    if mode not in RELIEFS:
+        raise InputError(f"Unknown back relief {relief!r}.", hint=f"Choose one of: {', '.join(RELIEFS)}.")
+    fr = _frame(ortho, canon)
+    matte, D_f = _front_maps(front)
+    vlist = list(views or [])
+    for v in vlist:
+        if not isinstance(v, GenView):
+            raise InputError(f"Expected GenView objects (got {type(v).__name__}).")
+    warnings: list[str] = []
+    diag: dict[str, Any] = {"source": source, "seed": int(seed), "views": [], "warnings": warnings}
+    _check(cancel)
+
+    backs = [v for v in vlist if _is_back(v.phi_deg)]
+    if backs and backs[0].kind == "ortho":
+        diag["cameras"] = "orthographic"
+        Pf_S = fr.to_S(_front_points(front, D_f, matte))
+        reg = _register_ortho_set(
+            vlist, canon, ortho, fr, Pf_S, color_match, warnings, diag, rep, cancel, front_sc=front.sc
+        )
+    else:
+        reg, Pf_S = _register_nominal_set(
+            vlist, front, canon, ortho, fr, color_match, warnings, diag, rep, cancel
+        )
+    if reg.reason:
+        return _failed(source, reg.reason, reg.views, _jsonable(diag), t_start)
+    back, binfo, sides, orbit = reg.back, reg.binfo, reg.sides, reg.orbit
+    assert back is not None
     used_sides = [v for v in sides if v.meta.get("used")]
     exact = [v for v in used_sides if abs(_sin(v.phi_deg)) > _SIDE_EXACT_SIN]
     _check(cancel)
 
     # ---- V6: hull
-    rep(0.2, "Lining up the side photos")
     cviews = _constraining(used_sides, fr)
     hull: HullIntervals | None = None
     if cviews:
@@ -2336,7 +3811,7 @@ def view_based_back(
     diag["mould"] = {k: v for k, v in mdiag.items() if k != "warning"}
     if mdiag.get("warning"):
         warnings.append(str(mdiag["warning"]))
-    all_views = [back, *sides, *rejected]
+    all_views = reg.views
     if not part.ok or not len(part.sc):
         return _failed(source, part.reason or "the back came out empty", all_views, _jsonable(diag), t_start)
     _check(cancel)
@@ -2405,6 +3880,7 @@ def view_based_back(
         "mad": (max(mads) / 0.03) if mads else 0.0,
         "yaw": 0.0,
         "face": 0.0,
+        **reg.qc,  # orthographic sets: height spread, view 0's overlap, dropped views
     }
     diag["qc"] = {"cost": float(sum(terms.values())), "terms": terms}
     diag.update(
@@ -2528,17 +4004,22 @@ __all__ = [
     "MAX_PHOTO_LONG",
     "PHI_NAMES",
     "RELIEFS",
+    "VIEWS_FORMAT",
     "VIEWS_JSON",
     "VIEW_KINDS",
     "VIEW_MAX_LONG",
     "VIEW_NAMES",
     "GenView",
     "OrthoInput",
+    "choose_view_set",
     "contact_sheet",
     "hull_intervals",
     "levelled_ortho_input",
     "load_views",
+    "qc_cost",
+    "save_views_folder",
     "segment_views",
     "view_based_back",
+    "views_from_cameras",
     "views_from_folder",
 ]

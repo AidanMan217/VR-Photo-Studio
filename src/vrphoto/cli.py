@@ -329,6 +329,7 @@ def _choices_table() -> dict[tuple[str, str], tuple[str, ...]]:
         ("object", "back_source"): R.BACK_SOURCES,
         ("object", "back_quality"): R.BACK_QUALITIES,
         ("object", "back_relief"): R.BACK_RELIEFS,
+        ("object", "polish"): R.POLISH_MODES,
         ("object", "size_from"): R.SIZE_FROM,
         ("video", "output"): R.VIDEO_OUTPUTS,
         ("video", "encoder_preset"): presets,

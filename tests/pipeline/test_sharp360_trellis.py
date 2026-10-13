@@ -539,11 +539,13 @@ def _spec(**kw):
 
 
 def test_auto_tries_trellis_first_except_with_fast_quality():
+    """Without MV-Adapter, "auto" tries TRELLIS first (MV-Adapter comes before it when it is
+    installed: test_sharp360_mvadapter.py)."""
     asked = []
 
     def installed(addon_id):
         asked.append(addon_id)
-        return True
+        return addon_id == "trellis"
 
     for quality, chain in (
         ("fast", ("shell",)),
@@ -551,7 +553,7 @@ def test_auto_tries_trellis_first_except_with_fast_quality():
         ("best", ("trellis", "shell")),
     ):
         assert S.resolve_options(_spec(back_quality=quality), installed=installed).sources == chain
-    assert asked == ["trellis", "trellis"]
+    assert asked == ["mvadapter", "trellis", "mvadapter", "trellis"]
     assert S.resolve_options(_spec(), installed=lambda a: False).sources == ("shell",)
     # an explicit TRELLIS runs whatever the quality (and warns when it is missing)
     assert S.resolve_options(_spec(back_source="trellis", back_quality="fast"), installed=bool).sources == (

@@ -120,6 +120,8 @@ model weights from Hugging Face/GitHub). They are not part of the VR Photo Studi
 | | diff-gaussian-rasterization (Inria) | ⚠ NC - Gaussian-Splatting License (research / non-commercial) - https://github.com/graphdeco-inria/diff-gaussian-rasterization |
 | AI outpainting for VR180 / 360 | Stable Diffusion XL inpainting 0.1 | CreativeML Open RAIL++-M (use-based restrictions) - https://huggingface.co/diffusers/stable-diffusion-xl-1.0-inpainting-0.1 |
 | | SDXL VAE fp16 fix | MIT - https://huggingface.co/madebyollin/sdxl-vae-fp16-fix |
+| MV-Adapter (experimental; AI back and side views for "SHARP 360") | MV-Adapter code (pinned commit) and the image-to-multiview SD 2.1 weights (`mvadapter_i2mv_sd21.safetensors`) | Apache-2.0 - https://github.com/huanngzh/MV-Adapter , https://huggingface.co/huanngzh/mv-adapter |
+| | Stable Diffusion 2.1 base (Stability AI), downloaded from the copy `Manojb/stable-diffusion-2-1-base` because the original repository was removed | CreativeML Open RAIL++-M (use-based restrictions) - https://huggingface.co/Manojb/stable-diffusion-2-1-base |
 | SHARP (experimental; single photo → 3D Gaussian splat) | Apple ml-sharp code | Apple Sample Code License - https://github.com/apple/ml-sharp |
 | | SHARP model weights | ⚠ NC - Apple Machine Learning Research Model License (non-commercial research only) |
 | TRELLIS.2 (experimental) | Microsoft TRELLIS.2 code + weights | MIT - https://github.com/microsoft/TRELLIS.2 |

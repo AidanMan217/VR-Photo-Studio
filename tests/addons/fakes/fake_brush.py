@@ -4,11 +4,19 @@ Environment: FAKE_TOOL_LOG (jsonl argv log), FAKE_BRUSH_SLEEP (seconds to hang),
 FAKE_BRUSH_FAIL (exit 1 without output), FAKE_BRUSH_PLY (PLY file to export instead),
 FAKE_BRUSH_ECHO_INIT (export the dataset's init.ply with every mean moved by up to 2 mm),
 FAKE_BRUSH_FAIL_SH0 (exit 1 when ``--sh-degree 0`` is passed, like Brush 0.3.0's SH0 bug).
+SHARP 360 polish switches: FAKE_BRUSH_OOM_ABOVE=<px> (exit 1 with an out-of-memory panic
+unless ``--max-resolution`` is given and at most <px>), FAKE_BRUSH_REJECT_FLAGS (comma
+separated options this Brush "does not know": exit 2 with clap's "unexpected argument"
+error when one is passed), FAKE_BRUSH_ECHO_SCALE=<k> (with FAKE_BRUSH_ECHO_INIT: the echoed
+means are also scaled by k about their mean, a "diverged" training) and FAKE_BRUSH_ECHO_NAN
+(with FAKE_BRUSH_ECHO_INIT: the first rows' x becomes NaN).
 
 The dataset must hold a COLMAP model (``cameras.bin`` or ``cameras.txt`` anywhere below it,
 e.g. ``sparse/cameras.bin`` from the undistorter or ``sparse/0/cameras.txt`` from
 ``capture.write_colmap_text``).  With an ``init.ply`` (a known-camera dataset) every image
-listed in ``images.txt`` must exist in ``images/`` and every mask must belong to an image.
+listed in ``images.txt`` must exist in ``images/``, every mask must belong to an image,
+``init.ply`` must be the only ``.ply`` in the dataset folder and the export folder must lie
+outside it (an export there would be read back as an input next time).
 """
 
 import json
@@ -42,6 +50,15 @@ if os.environ.get("FAKE_BRUSH_FAIL"):
 if os.environ.get("FAKE_BRUSH_FAIL_SH0") and opt("sh-degree") == "0":
     print("thread 'main' panicked: index out of bounds (sh degree 0)", file=sys.stderr)
     sys.exit(101)
+for flag in filter(None, os.environ.get("FAKE_BRUSH_REJECT_FLAGS", "").split(",")):
+    if flag.strip() in args:
+        print(f"error: unexpected argument '{flag.strip()}' found", file=sys.stderr)
+        sys.exit(2)
+if os.environ.get("FAKE_BRUSH_OOM_ABOVE"):
+    res = opt("max-resolution")
+    if res is None or int(res) > int(os.environ["FAKE_BRUSH_OOM_ABOVE"]):
+        print("thread 'main' panicked: wgpu error: Out of Memory (allocation failed)", file=sys.stderr)
+        sys.exit(1)
 total = int(opt("total-steps", "30000"))
 dataset = Path(args[0])
 cameras = [p for p in dataset.rglob("cameras.*") if p.name in ("cameras.bin", "cameras.txt")]
@@ -69,6 +86,10 @@ if init.is_file():
         stems = {Path(n).stem for n in images}
         orphans = sorted(p.name for p in masks.iterdir() if p.stem not in stems)
         assert not orphans, f"masks without an image: {orphans}"
+    plys = sorted(str(p.relative_to(dataset)) for p in dataset.rglob("*.ply"))
+    assert plys == ["init.ply"], f"init.ply must be the only .ply in the dataset folder: {plys}"
+    export = Path(opt("export-path", ".")).resolve()
+    assert not export.is_relative_to(dataset.resolve()), f"the export folder {export} is inside the dataset"
 
 for it in range(200, total + 1, 200):
     print(f"[INFO brush_cli] Refine iter {it}, {it * 10} splats.")
@@ -98,6 +119,12 @@ if os.environ.get("FAKE_BRUSH_ECHO_INIT"):  # "training" that barely moves the i
     rng = np.random.default_rng(int(opt("seed", "0")))
     for k in ("x", "y", "z"):
         rec[k] += rng.uniform(-0.002, 0.002, n).astype(np.float32)
+    if os.environ.get("FAKE_BRUSH_ECHO_SCALE"):  # a "diverged" training: the cloud blows up
+        k_scale = float(os.environ["FAKE_BRUSH_ECHO_SCALE"])
+        for k in ("x", "y", "z"):
+            rec[k] = (rec[k].mean() + k_scale * (rec[k] - rec[k].mean())).astype(np.float32)
+    if os.environ.get("FAKE_BRUSH_ECHO_NAN"):
+        rec["x"][: max(1, n // 100)] = np.nan
     target.write_bytes(raw[:end] + rec.tobytes())
     print("Done training! Took 1s.")
     sys.exit(0)

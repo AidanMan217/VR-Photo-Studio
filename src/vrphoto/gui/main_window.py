@@ -469,8 +469,9 @@ class MainWindow(QMainWindow):
         checked) and, when an optional one is missing, the user chose to continue without it.
 
         A missing required add-on (e.g. SHARP) offers the Add-ons window and stops.  A missing
-        optional one (a SHARP 360 back source such as TRELLIS) asks "Open Add-ons / Continue
-        / Cancel": the job itself warns and uses the built-in back, so continuing is safe.
+        optional one (a SHARP 360 back source such as TRELLIS or MV-Adapter, or the Capture
+        add-on for 'Brush polish' On) asks "Open Add-ons / Continue / Cancel": the job itself
+        warns and uses the built-in back (or skips the polish), so continuing is safe.
         """
         groups = om.required_addon_groups(kind, values)
         if not groups:
@@ -494,17 +495,36 @@ class MainWindow(QMainWindow):
                 ):
                     self.open_addons()
                 return False
+            fields = om.addon_fields(kind, values, ids)
+            if fields and "back_source" not in fields and "polish" in fields:  # Brush polish 'On'
+                text = (
+                    f"Brush polish is set to 'On', but the '{title}' add-on (which brings Brush) is "
+                    "not installed."
+                )
+                informative = (
+                    "You can install it in the Add-ons window (a large download), or continue now: "
+                    "the job then skips the polish and says so in its warnings."
+                )
+                buttons = (
+                    OPTIONAL_ADDON_BUTTONS[0],
+                    "Continue without the polish",
+                    OPTIONAL_ADDON_BUTTONS[2],
+                )
+            else:
+                text = f"The back is set to be made by the '{title}' add-on, which is not installed."
+                informative = (
+                    "You can install it in the Add-ons window (a large download), or continue "
+                    "now: the job then uses the built-in back and says so in its warnings."
+                )
+                buttons = OPTIONAL_ADDON_BUTTONS
             choice = util.ask_choice(
                 self,
                 "Optional add-on not installed",
-                f"The back is set to be made by the '{title}' add-on, which is not installed.",
-                OPTIONAL_ADDON_BUTTONS,
+                text,
+                buttons,
                 default=0,
                 escape=2,
-                informative=(
-                    "You can install it in the Add-ons window (a large download), or continue "
-                    "now: the job then uses the built-in back and says so in its warnings."
-                ),
+                informative=informative,
             )
             if choice == 0:
                 self.open_addons()

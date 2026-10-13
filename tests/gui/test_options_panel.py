@@ -202,6 +202,9 @@ SHARP360_FIELDS = (
     "color_match",
     "back_tries",
     "back_steps",
+    "back_prompt",
+    "polish",
+    "polish_steps",
     "seam_deg",
     "size_from",
     "save_extras",
@@ -226,14 +229,21 @@ def test_sharp360_fields_follow_the_method(panel_factory, method):
     assert p.form.editors["back_images"].isEnabled() is on and p.form.labels["back_images"].isEnabled() is on
 
 
-#: (back source, back photo on, AI knobs on) for method sharp360
-SOURCES = (("auto", False, True), ("shell", False, False), ("trellis", False, True), ("images", True, False))
+#: (back source, back photo on, AI knobs on, prompt on) for method sharp360
+SOURCES = (
+    ("auto", False, True, True),
+    ("shell", False, False, False),
+    ("trellis", False, True, False),
+    ("images", True, False, False),
+    ("mvadapter", False, True, True),
+)
 
 
-@pytest.mark.parametrize("source,photo_on,ai_on", SOURCES)
-def test_sharp360_source_fields_follow_the_back_source(panel_factory, source, photo_on, ai_on):
-    """design §5.5: 'Back photo' only for images; 'AI attempts' / 'AI steps' for auto and
-    TRELLIS; the other back options for every source."""
+@pytest.mark.parametrize("source,photo_on,ai_on,prompt_on", SOURCES)
+def test_sharp360_source_fields_follow_the_back_source(panel_factory, source, photo_on, ai_on, prompt_on):
+    """design §5.5: 'Back photo' only for images; 'AI attempts' / 'AI steps' for auto,
+    TRELLIS and MV-Adapter; 'Describe the hidden side' for auto and MV-Adapter; the other
+    back options for every source."""
     p = panel_factory("object", show_experimental=True)
     p.form.set_values({"method": "sharp360", "back_source": source})
     form = p.form
@@ -241,6 +251,7 @@ def test_sharp360_source_fields_follow_the_back_source(panel_factory, source, ph
     for name in ("back_tries", "back_steps"):
         assert form.editors[name].isEnabled() is ai_on, name
         assert form.labels[name].isEnabled() is ai_on, name
+    assert form.editors["back_prompt"].isEnabled() is prompt_on
     for name in ("back_relief", "color_match", "back_quality", "seam_deg", "seed", "thickness"):
         assert form.editors[name].isEnabled(), name
     # switching the method away greys them all out, whatever the remembered source
@@ -249,18 +260,41 @@ def test_sharp360_source_fields_follow_the_back_source(panel_factory, source, ph
         assert not form.editors[name].isEnabled(), name
 
 
+def test_polish_steps_follow_the_polish_setting(panel_factory):
+    """design §5.5: 'Brush steps' is greyed out when 'Brush polish' is off."""
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values({"method": "sharp360", "polish": "auto"})
+    assert p.form.editors["polish"].isEnabled() and p.form.editors["polish_steps"].isEnabled()
+    p.form.set_values({"polish": "off"})
+    assert not p.form.editors["polish_steps"].isEnabled() and not p.form.labels["polish_steps"].isEnabled()
+    p.form.set_values({"polish": "on", "polish_steps": 8000, "back_prompt": "grey hoodie"})
+    assert p.form.editors["polish_steps"].isEnabled()
+    spec = p.build_spec(["x.jpg"])
+    assert (spec.polish, spec.polish_steps, spec.back_prompt) == ("on", 8000, "grey hoodie")
+    assert isinstance(spec.polish_steps, int)
+    # a description longer than the job accepts is caught at 'Create' (only when it is used)
+    p.form.set_values({"back_prompt": "x" * 301})
+    with pytest.raises(InputError, match="too long"):
+        p.build_spec(["x.jpg"])
+    p.form.set_values({"back_source": "trellis"})
+    assert p.build_spec(["x.jpg"]).back_prompt == "x" * 301  # greyed out: kept, not checked
+    p.form.set_values({"method": "billboard"})
+    assert not p.form.editors["polish"].isEnabled() and not p.form.editors["polish_steps"].isEnabled()
+
+
 def test_greyed_out_rows_match_options_meta(panel_factory):
     """The panel and the add-on check use the same rule (options_meta.field_applies)."""
     p = panel_factory("object", show_experimental=True)
     methods = p.form.editors["method"].values()
     for method in methods:
         for source in om.JOB_META["object"]["back_source"].choice_values():
-            p.form.set_values({"method": method, "back_source": source})
-            vals = p.form.values()
-            for name, ed in p.form.editors.items():
-                expected = om.field_applies("object", name, vals)
-                assert ed.isEnabled() is expected, (method, source, name)
-                assert p.form._applies(name) is expected, (method, source, name)
+            for polish in om.JOB_META["object"]["polish"].choice_values():
+                p.form.set_values({"method": method, "back_source": source, "polish": polish})
+                vals = p.form.values()
+                for name, ed in p.form.editors.items():
+                    expected = om.field_applies("object", name, vals)
+                    assert ed.isEnabled() is expected, (method, source, polish, name)
+                    assert p.form._applies(name) is expected, (method, source, polish, name)
 
 
 def _picture(path):

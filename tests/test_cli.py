@@ -766,9 +766,41 @@ def test_sharp360_trellis_options_parse():
     assert all(isinstance(v, int) for v in (spec.back_tries, spec.back_steps, spec.seed))
 
 
+def test_sharp360_mvadapter_and_polish_options_parse():
+    """design §1.6: the MV-Adapter example and the Brush polish flags."""
+    from vrphoto.pipeline import run as R
+
+    assert cli._choices_table()[("object", "polish")] == R.POLISH_MODES
+    args = [
+        "object",
+        "me.jpg",
+        "--method",
+        "sharp360",
+        "--back-source",
+        "mvadapter",
+        "--back-quality",
+        "best",
+    ]
+    args += ["--back-prompt", "grey hoodie, short hair", "--seam-deg", "55", "--height-m", "1.78"]
+    args += ["--save-extras", "--polish", "on", "--polish-steps", "8000"]
+    spec = cli.spec_from_namespace("object", cli.build_parser().parse_args(args))
+    assert (spec.back_source, spec.back_quality, spec.back_prompt) == (
+        "mvadapter",
+        "best",
+        "grey hoodie, short hair",
+    )
+    assert (spec.seam_deg, spec.height_m, spec.save_extras) == (55.0, 1.78, True)
+    assert (spec.polish, spec.polish_steps) == ("on", 8000) and isinstance(spec.polish_steps, int)
+    default = cli.spec_from_namespace("object", cli.build_parser().parse_args(["object", "me.jpg"]))
+    assert (default.back_prompt, default.polish, default.polish_steps) == ("", "auto", 5000)
+    helps = {a.dest: a.help for a in _subparser("object")._actions}
+    assert "Choices: auto, off, on." in helps["job__polish"]
+    assert "Default: 5000." in helps["job__polish_steps"]
+
+
 def test_sharp360_m2_help_texts():
     helps = {a.dest: a.help for a in _subparser("object")._actions}
-    assert "Choices: auto, shell, trellis, images." in helps["job__back_source"]
+    assert "Choices: auto, shell, trellis, images, mvadapter." in helps["job__back_source"]
     assert "Choices: auto, depth, flat." in helps["job__back_relief"]
     assert (
         "Default: none." in helps["job__back_images"] and "walked to your right" in helps["job__back_images"]
@@ -784,8 +816,9 @@ def test_sharp360_m2_help_texts():
 @pytest.mark.parametrize(
     "flag,value",
     [
-        ("--back-source", "mvadapter"),
+        ("--back-source", "qwen"),
         ("--back-quality", "ultra"),
+        ("--polish", "always"),
         ("--size-from", "guess"),
         ("--back-relief", "bumpy"),
     ],

@@ -4,6 +4,65 @@ All notable changes to VR Photo Studio are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**SHARP 360°: MV-Adapter AI views and the Brush polish.** Design: `docs/design/SHARP360.md`
+(milestones M4 and M5). Not yet tested on a GeForce GTX 1080 with the real models; the times below
+are estimates.
+
+### Added
+
+- **MV-Adapter add-on (experimental, about 14 GB):** MV-Adapter on Stable Diffusion 2.1 base paints
+  a cut-out person or object from six directions (front, both sides, straight from behind and the
+  two front quarters) with exact orthographic cameras. fp16 weights (fp32 math on GeForce
+  10-series cards), an fp32 VAE, model CPU offload below 7 GB of free graphics memory, an
+  out-of-memory ladder (free memory, then sequential offload) and an fp32 retry when a picture
+  comes out black or broken (with sequential offload on 8 GB cards, where the fp32 model does not
+  fit with model offload). Licences: Apache-2.0 (MV-Adapter) and CreativeML Open RAIL++-M
+  (Stable Diffusion 2.1).
+- **SHARP 360° back made by MV-Adapter** (*Back made by: MV-Adapter AI views*): the app gives
+  MV-Adapter a levelled, straight-on picture of the photo's front and lifts the back and sides
+  from the six views: the AI's front view must match the photo's outline (a small shift or size
+  difference is corrected), every view must show the person at the same height (a view more than
+  5 % off is left out), the back view is locked onto the mirrored front outline, the colours are
+  matched to the photo, the side views give the body's depth and a reversed left/right camera
+  convention is noticed (the views are turned round only when renders of SHARP's front at the
+  in-between angles agree, so side views the AI drew turned are not mirrored). A set that does
+  not fit is not used (note, then TRELLIS or the built-in
+  back). With two attempts (*Best*) the better-fitting set is kept. *Back made by: Automatic* now
+  tries MV-Adapter first, then TRELLIS, then the built-in shape (not with *Fast*). About 6-10
+  minutes with *Balanced* (estimate).
+- **Describe the hidden side** (*Advanced*): a few words for MV-Adapter about what the photo
+  cannot show (for example "long brown ponytail, black backpack").
+- **View cache:** the AI views are kept (up to 2 GB in the app's cache folder, least recently used
+  removed first), so a re-run of the same photo with another seam, colour match, relief or polish
+  setting - or another back quality with *AI steps* set - skips MV-Adapter. MV-Adapter saves each
+  attempt as soon as it is made: attempts finished before a failure (for example out of memory in
+  the second attempt) are used in the same run, those finished before a cancel are kept for the
+  next one. A saved set that cannot be read any more is made again.
+- **Brush polish** (*Advanced*: *Brush polish* Automatic / Off / On and *Brush steps*): Brush from
+  the Capture add-on trains the finished splat against the photo, renders of SHARP's front and the
+  views of a back made from views (MV-Adapter or your own back photo), so they agree and the join
+  softens; SHARP's photographed front is put back exactly afterwards (Brush's own copies of it are
+  removed first, so the outline is not drawn twice). *Automatic* polishes only
+  with *Best* back quality and after a passed *Test Brush on this PC*; a failed polish keeps the
+  unpolished result (Brush's log is saved next to the outputs). *Best* with MV-Adapter, two
+  attempts and the polish: about 15-30 minutes (estimate).
+- **Editable AI views folder:** with *Also save parts and debug data*, an MV-Adapter run also saves
+  `<name>_sharp360_views/` (`back.png`, `right.png`, ... and `views.json` with the exact cameras).
+  Edit a view and run again with *Your own back photo* and that `back.png`.
+- `<name>_sharp360_views.png` (the contact sheet) is also written for MV-Adapter's views.
+- Command line: `--back-source mvadapter`, `--back-prompt`, `--polish auto|off|on` and
+  `--polish-steps` for `--method sharp360`.
+- When *MV-Adapter* is chosen but not installed, or *Brush polish* is *On* without the Capture
+  add-on, the app asks whether to open the Add-ons window, continue without it, or cancel.
+
+### Changed
+
+- *AI attempts* and *AI steps* also apply to MV-Adapter (*Automatic*: 20 / 30 / 50 steps for
+  *Fast* / *Balanced* / *Best*). A too long *Describe the hidden side*, an unknown *Brush polish* or
+  *Brush steps* outside 1000-30000 stop the job before any slow work.
+
 ## [0.2.0b2] - 2026-10-13
 
 Second beta of **SHARP 360°: AI and photo backs, previews.** Design: `docs/design/SHARP360.md` (milestones M2

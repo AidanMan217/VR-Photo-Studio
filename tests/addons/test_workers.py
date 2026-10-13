@@ -556,7 +556,9 @@ def _import_worker(name: str):
     return importlib.import_module(name)
 
 
-@pytest.mark.parametrize("name", ["trellis_worker", "trellis2_worker", "hunyuan_worker", "sdxl360_worker"])
+@pytest.mark.parametrize(
+    "name", ["trellis_worker", "trellis2_worker", "hunyuan_worker", "sdxl360_worker", "mvadapter_worker"]
+)
 def test_worker_check_rejects_unsupported_gpu(common, monkeypatch, tmp_path, name):
     """The install check fails with a readable message instead of a mid-job "no kernel image"."""
     monkeypatch.setenv("VRPHOTO_ADDON_DIR", str(tmp_path))

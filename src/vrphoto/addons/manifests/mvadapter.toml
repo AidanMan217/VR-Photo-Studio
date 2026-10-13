@@ -1,0 +1,118 @@
+# MV-Adapter image-to-multiview (SD 2.1 base): 6 orthographic views at 512 px (front, both
+# sides, back and the two front quarters) of a cut-out person or object.  'SHARP 360' builds
+# the back of its splat from them (design docs/design/SHARP360.md 3.5.3 / 4.3).
+#
+# Sources checked for this manifest (2026-10-13):
+# * huanngzh/MV-Adapter at 4277e0018232bac82bb2c103caf0893cedb711be (HEAD, 2025-06-26).  LICENSE
+#   is the Apache-2.0 text (setup.py's classifier says MIT - permissive either way), so the
+#   add-on is not marked non-commercial (critic R12 resolved).  Its requirements.txt and setup.py
+#   pin nothing and also list the texturing tools (nvdiffrast, cvcuda_cu12, open3d, pymeshlab,
+#   gradio, ...).  The worker only imports the i2mv SD pipeline and the ShiftSNR scheduler (their
+#   imports: torch, diffusers, transformers, safetensors, einops) and loads utils/geometry.py by
+#   file path, so the package is NOT pip-installed (that would pull the whole list) and its
+#   mvadapter.utils package - which imports nvdiffrast, triton, trimesh, matplotlib, ... at load -
+#   is never imported, so nothing has to be stubbed.
+# * stabilityai/stable-diffusion-2-1-base has been removed from Hugging Face (404, late 2025;
+#   critic O5).  Manojb/stable-diffusion-2-1-base is a clone of it in the diffusers layout with
+#   the fp16 variants (unet 1.73 GB, text encoder 0.68 GB), pinned at its head commit.
+# * huanngzh/mv-adapter: mvadapter_i2mv_sd21.safetensors (708 MB) as listed at the pinned
+#   revision; the README / scripts/inference_i2mv_sd.py load exactly this file name.
+id = "mvadapter"
+title = "MV-Adapter (AI back and side views, experimental)"
+description = """Generates 6 matching views (front, both sides, back and two in-between) of a cut-out \
+person or object; 'SHARP 360' builds the back of the splat from them. A few minutes per run on \
+GTX 10-series GPUs."""
+version = "1.0.0"
+experimental = true
+license = "MV-Adapter code and weights: Apache-2.0; Stable Diffusion 2.1 base: CreativeML Open RAIL++-M (use-based restrictions)"
+noncommercial = false
+region_restricted = []
+min_vram_gb = 6
+disk_gb = 14  # the torch 2.8 + diffusers venv (~9.5 GB, as sharp / sdxl360) + 3.5 GB of weights + slack
+kind = "venv"
+python = "3.11"
+hf_gated = false
+homepage = "https://github.com/huanngzh/MV-Adapter"
+tasks = ["image_to_views"]
+worker = "mvadapter_worker.py"
+platforms = ["win32", "linux"]
+notes = "fp16 UNet and text encoder (fp32 math on GTX 10-series), fp32 VAE; model CPU offload below 7 GB free VRAM; orthographic cameras, elevation 0."
+
+[env]
+MVADAPTER_BASE = "{addon_dir}/MODELS/sd21-base"
+MVADAPTER_WEIGHTS = "{addon_dir}/MODELS/mv-adapter"
+PYTORCH_CUDA_ALLOC_CONF = "garbage_collection_threshold:0.65"
+TORCHDYNAMO_DISABLE = "1"
+
+[[steps]]
+type = "venv"
+
+[[steps]]
+type = "pip"
+title = "Installing PyTorch 2.8.0 (CUDA 12.8)"
+packages = ["torch==2.8.0", "torchvision==0.23.0"]
+index_url = "https://download.pytorch.org/whl/cu128"  # the Windows build includes sm_61 (GTX 10-series)
+
+[[steps]]
+type = "pip"
+title = "Installing diffusers"
+packages = [
+    "numpy==2.3.3",
+    "pillow==11.3.0",
+    # MV-Adapter pins nothing; its author's ComfyUI node uses diffusers 0.31.0 / transformers
+    # 4.46.3 (October 2024, older than torch 2.8).  These are the versions the sdxl360 add-on
+    # already runs on torch 2.8.0.  Every diffusers API the i2mv SD pipeline uses is unchanged in
+    # 0.35.1 (checked in the wheel): Attention + its processor-kwargs filter, StableDiffusionPipeline
+    # check_inputs / encode_prompt / prepare_latents / run_safety_checker, retrieve_timesteps,
+    # rescale_noise_cfg, T2IAdapter(in_channels, channels, num_res_blocks, downscale_factor), the
+    # UNet's down_intrablock_additional_residuals, utils._get_model_file and the offload hooks of
+    # AutoencoderKL.encode / decode.
+    "diffusers==0.35.1",
+    "transformers==4.56.2",
+    "accelerate==1.10.1",  # enable_model_cpu_offload / enable_sequential_cpu_offload
+    "safetensors==0.6.2",
+    "huggingface-hub==0.35.3",
+    "einops==0.8.1",  # mvadapter/models/attention_processor.py imports it
+    # peft is in MV-Adapter's requirements only for loading LoRAs (load_lora_weights), which the
+    # worker never does; without it diffusers' i2mv path is unchanged.
+    "setuptools==75.8.0",  # torch.utils.cpp_extension imports it; uv venvs do not include it
+]
+
+[[steps]]
+type = "github_archive"
+title = "Downloading MV-Adapter"
+repo = "huanngzh/MV-Adapter"
+ref = "4277e0018232bac82bb2c103caf0893cedb711be"
+dest = "src/mvadapter"
+pip_install = false
+
+[[steps]]
+type = "hf_download"
+title = "Downloading Stable Diffusion 2.1 base (fp16)"
+repo = "Manojb/stable-diffusion-2-1-base"
+revision = "0094d483a120f3f33dafbd187ea4aa60d10de75c"  # "Cloned from stabilityai/stable-diffusion-2-1-base"
+local_dir = "MODELS/sd21-base"
+allow_patterns = [
+    "model_index.json",
+    "scheduler/scheduler_config.json",
+    "tokenizer/*",
+    "text_encoder/config.json",
+    "text_encoder/model.fp16.safetensors",
+    "unet/config.json",
+    "unet/diffusion_pytorch_model.fp16.safetensors",
+    "vae/config.json",
+    "vae/diffusion_pytorch_model.safetensors",  # fp32: the VAE runs in full precision
+]
+size_gb = 2.8
+
+[[steps]]
+type = "hf_download"
+title = "Downloading the MV-Adapter weights"
+repo = "huanngzh/mv-adapter"
+revision = "022b85eaeaea388286f620d80ae18ce8888c1c52"
+local_dir = "MODELS/mv-adapter"
+allow_patterns = ["mvadapter_i2mv_sd21.safetensors"]
+size_gb = 0.71
+
+[[steps]]
+type = "check"

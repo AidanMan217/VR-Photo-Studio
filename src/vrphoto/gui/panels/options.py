@@ -961,6 +961,11 @@ class JobOptionsPanel(QWidget):
             from ...pipeline.sharp360 import _back_photo  # the job's own check (Qt-free, header only)
 
             _back_photo(back)  # missing, not a picture, no view from behind, unreadable; folders are fine
+        # 'Describe the hidden side' longer than the job accepts: say so at 'Create', not in the queue
+        if self.kind == "object" and d.get("back_prompt") and om.field_applies(self.kind, "back_prompt", d):
+            from ...pipeline.sharp360 import _back_prompt
+
+            _back_prompt(d["back_prompt"])
 
     def set_common_defaults(self, defaults: dict[str, Any], apply: dict[str, Any] | None = None) -> None:
         """Change the Common defaults (used by Reset/presets) and set ``apply`` values now."""

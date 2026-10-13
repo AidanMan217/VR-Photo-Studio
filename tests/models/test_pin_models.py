@@ -132,3 +132,18 @@ def test_diff_locks(pin_models_mod):
     assert "x.revision: '1' -> '3'" in diffs
     assert any(d.startswith("y:") for d in diffs) and any(d.startswith("z:") for d in diffs)
     assert pin_models_mod.diff_locks(a, a) == []
+
+
+def test_a_commit_pinned_url_model_keeps_its_table_pins(pin_models_mod):
+    """YuNet's URL is a Git LFS file at an exact opencv_zoo commit, not a GitHub release: the
+    weekly job keeps the registry table's revision / checksum instead of failing."""
+    spec = BASE_MODELS["yunet"]
+    assert spec.url and spec.pinned and "/releases/download/" not in spec.url
+
+    def no_fetch(url):
+        raise AssertionError(f"nothing to fetch for a pinned URL model: {url}")
+
+    out = pin_models_mod.pin_spec(spec, no_fetch)
+    assert out["revision"] == spec.revision and out["sha256"] == spec.sha256 and out["sizes"] == spec.sizes
+    doc, errors = pin_models_mod.build_lock(BASE_MODELS, no_fetch, ids=["yunet"])
+    assert errors == [] and doc["models"]["yunet"]["revision"] == spec.revision

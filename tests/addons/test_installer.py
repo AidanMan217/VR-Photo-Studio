@@ -260,3 +260,81 @@ def test_hf_download_failure_hints(ctx, monkeypatch):
         with pytest.raises(AddonError, match="Downloading org/model failed") as ei:
             installer.step_hf_download(ctx, step, ProgressReporter())
         assert ei.value.hint == want
+
+
+_FAKE_HF = {
+    "__init__.py": (
+        "import json, os\n"
+        "class _S:\n"
+        "    def __init__(self, name):\n"
+        "        self.rfilename, self.size = name, 10\n"
+        "class _Info:\n"
+        "    siblings = [_S(f) for f in json.loads(os.environ['FAKE_HF_FILES'])]\n"
+        "class HfApi:\n"
+        "    def repo_info(self, *a, **kw):\n"
+        "        return _Info()\n"
+        "def snapshot_download(**kw):\n"
+        "    with open(os.environ['FAKE_HF_CALLS'], 'a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps(kw['allow_patterns']) + '\\n')\n"
+        "    return kw.get('local_dir') or '.'\n"
+    ),
+    "utils.py": (
+        "import fnmatch\n"
+        "def filter_repo_objects(items, allow_patterns=None, ignore_patterns=None):\n"
+        "    for i in items:\n"
+        "        if allow_patterns and not any(fnmatch.fnmatch(i, p) for p in allow_patterns):\n"
+        "            continue\n"
+        "        if ignore_patterns and any(fnmatch.fnmatch(i, p) for p in ignore_patterns):\n"
+        "            continue\n"
+        "        yield i\n"
+    ),
+    "constants.py": "HF_HUB_CACHE = '.'\n",
+}
+
+
+@pytest.mark.parametrize("files, allow, missing", [
+    (["Qwen-Image-Edit-2511-Q4_K_M.gguf"], ["qwen-image-edit-2511-Q4_K_M.gguf"],
+     "org/model@main has no file qwen-image-edit-2511-Q4_K_M.gguf"),  # a wrong exact name
+    (["a.safetensors"], ["*.gguf"], "org/model@main has no file *.gguf"),  # nothing matches
+    (["a.gguf", "mmproj-a.gguf"], ["a.gguf", "mmproj-b.gguf"], "org/model@main has no file mmproj-b.gguf"),
+    (["split_files/vae/v.safetensors", "x.bin"], ["split_files/vae/v.safetensors"], ""),
+    (["a.gguf", "b.gguf"], ["*.gguf"], ""),
+])
+def test_hf_snippet_refuses_patterns_that_match_no_file(tmp_path, files, allow, missing):
+    """snapshot_download downloads nothing and succeeds when no file matches allow_patterns; the
+    snippet must fail instead (naming the file and repo@revision), so the step is not recorded as done."""
+    import subprocess
+
+    pkg = tmp_path / "fakehf" / "huggingface_hub"
+    pkg.mkdir(parents=True)
+    for name, text in _FAKE_HF.items():
+        (pkg / name).write_text(text, encoding="utf-8")
+    calls = tmp_path / "calls.jsonl"
+    env = {**os.environ, "PYTHONPATH": str(pkg.parent), "FAKE_HF_FILES": json.dumps(files),
+           "FAKE_HF_CALLS": str(calls)}
+    args = {"repo": "org/model", "revision": "main", "allow_patterns": allow, "local_dir": str(tmp_path / "dl")}
+    res = subprocess.run([sys.executable, "-c", installer.HF_SNIPPET], input=json.dumps(args) + "\n", env=env,
+                         capture_output=True, text=True, timeout=60)
+    tags = {ln[2:].partition(" ")[0]: json.loads(ln[2:].partition(" ")[2]) for ln in res.stdout.splitlines()
+            if ln.startswith("@@")}
+    if missing:
+        assert res.returncode == 1 and tags["error"] == {"type": "MissingFiles", "message": missing}, res
+        assert not calls.exists()  # nothing was downloaded
+    else:
+        assert res.returncode == 0 and "done" in tags and "error" not in tags, res
+        assert json.loads(calls.read_text(encoding="utf-8")) == allow
+
+
+def test_hf_download_missing_files_error(ctx, monkeypatch):
+    ctx.python.parent.mkdir(parents=True)
+    ctx.python.write_text("")
+
+    def fake_run_process(cmd, **kw):
+        kw["on_line"]("@@error " + json.dumps({"type": "MissingFiles", "message": "org/model@main has no file x.gguf"}))
+        return ProcResult(1, ["@@error ..."])
+
+    monkeypatch.setattr(installer, "run_process", fake_run_process)
+    step = {"type": "hf_download", "repo": "org/model", "revision": "main", "allow_patterns": ["x.gguf"]}
+    with pytest.raises(AddonError, match=r"Model files of org/model were not found .*has no file x\.gguf") as ei:
+        installer.step_hf_download(ctx, step, ProgressReporter())
+    assert "renamed or moved" in ei.value.hint

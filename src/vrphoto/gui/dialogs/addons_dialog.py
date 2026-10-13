@@ -1,7 +1,7 @@
 """Add-ons dialog: optional heavy AI tools (TRELLIS, Capture, SDXL outpaint...).
 
-One card per add-on with its description, GPU memory / disk requirements compared with
-this PC, license notes (non-commercial, region restrictions), Install with live progress
+One card per add-on with its description, GPU memory / system memory (``min_ram_gb``) / disk
+requirements compared with this PC, license notes (non-commercial, region restrictions), Install with live progress
 + log tail + cancel, Uninstall and "Open folder".  The installed Capture add-on also gets
 "Test Brush on this PC" (:func:`vrphoto.addons.capture.brush_selftest`); the result is
 kept in ``Settings.brush_test``.
@@ -71,7 +71,36 @@ def detect_gpu() -> dict[str, Any]:
     return info
 
 
-_HW_NOTICE_PREFIXES = ("Needs an NVIDIA GPU", "Needs a GPU", "Download/disk")
+_HW_NOTICE_PREFIXES = ("Needs an NVIDIA GPU", "Needs a GPU", "Needs at least", "Download/disk")
+#: A PC sold with N GB of RAM reports a little less (the OS / integrated graphics keep some).
+_RAM_SLACK_GB = 1.5
+
+
+def total_ram_gb() -> float | None:
+    """This PC's physical memory in GB (None when it cannot be read)."""
+    import os
+    import sys
+
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = _MemoryStatusEx()
+            st.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):  # type: ignore[attr-defined]
+                return None
+            return st.ullTotalPhys / 1024**3
+        pages, size = os.sysconf("SC_PHYS_PAGES"), os.sysconf("SC_PAGE_SIZE")
+        return pages * size / 1024**3 if pages > 0 and size > 0 else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def license_notices(m: Any) -> list[str]:
@@ -83,11 +112,13 @@ def license_notices(m: Any) -> list[str]:
     return [n for n in notices if not n.startswith(_HW_NOTICE_PREFIXES)]
 
 
-def requirement_notes(m: Any, gpu: dict[str, Any] | None, free_gb: float | None) -> list[tuple[str, str]]:
+def requirement_notes(m: Any, gpu: dict[str, Any] | None, free_gb: float | None,
+                      ram_gb: float | None | str = "auto") -> list[tuple[str, str]]:
     """``[(level, text)]`` comparing an add-on's needs with this PC; level ok|warn|info.
 
     ``venv`` add-ons (PyTorch/CUDA) need an NVIDIA GPU; ``binary`` add-ons (e.g. Capture)
-    run on any modern GPU.
+    run on any modern GPU.  An add-on with ``min_ram_gb`` also gets a system-memory line
+    (``ram_gb``: this PC's RAM, ``"auto"`` = measure it, None = unknown).
     """
     out: list[tuple[str, str]] = []
     need = float(getattr(m, "min_vram_gb", 0) or 0)
@@ -127,6 +158,16 @@ def requirement_notes(m: Any, gpu: dict[str, Any] | None, free_gb: float | None)
                 )
         else:
             out.append(("info", f"Needs {need:g} GB of video memory (yours could not be measured)."))
+    need_ram = float(getattr(m, "min_ram_gb", 0) or 0)
+    if need_ram:
+        have_ram = total_ram_gb() if ram_gb == "auto" else ram_gb
+        if not isinstance(have_ram, (int, float)) or have_ram <= 0:
+            out.append(("info", f"Needs {need_ram:g} GB of system memory (RAM)."))
+        elif have_ram + _RAM_SLACK_GB >= need_ram:
+            out.append(("ok", f"RAM: this PC has {have_ram:.0f} GB (needs {need_ram:g} GB)."))
+        else:
+            out.append(("warn", f"RAM: this PC has {have_ram:.0f} GB but this add-on needs {need_ram:g} GB of "
+                                "system memory. It will refuse to run."))
     disk = float(getattr(m, "disk_gb", 0) or 0)
     if disk:
         if free_gb is None:

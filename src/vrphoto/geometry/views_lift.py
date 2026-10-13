@@ -1892,7 +1892,8 @@ def _flip_decisions(views: list[GenView], hyps: list[list[dict[str, Any]]]) -> t
     front and back of a body have much the same outline except where something sticks out
     (a bag, an arm in front, the face), so the median (MAD) barely changes while the 90th
     percentile of the row offsets does.  A view alone is turned round when its mirror
-    misfit is under half its own.  Two views named as each other's mirror (right / left,
+    misfit is under half its own (left / right views only: a quarter view without its partner
+    is kept as named).  Two views named as each other's mirror (right / left,
     back_right / back_left, front_right / front_left) are judged TOGETHER - both or neither,
     on the summed misfits: in a perspective photo an arm raised toward one camera is
     magnified and can make one picture fit its wrong name, and turning only the other one
@@ -1933,7 +1934,11 @@ def _flip_decisions(views: list[GenView], hyps: list[list[dict[str, Any]]]) -> t
                 break
     for i in range(n):
         if i not in paired and not views[i].meta.get("offset_given"):
-            flip[i] = single(hyps[i])
+            # a quarter view (back_right / back_left / front_*) without its mirror partner is
+            # kept as named: from 45 deg off the axis the outlines of the two candidates are
+            # too alike to overrule the name (on the synthetic person a correctly named 225
+            # view fitted its mirror better and was turned to the wrong side)
+            flip[i] = single(hyps[i]) and abs(_sin(views[i].phi_deg)) > 0.95
     return flip, pairs
 
 
@@ -3607,6 +3612,27 @@ def choose_view_set(results: Sequence[BackPart | Mapping[str, Any] | None]) -> i
     return best
 
 
+def lock_back_view(
+    ortho: OrthoInput, canon: Canon, view: GenView, *, cancel: CancelToken | None = None
+) -> tuple[GenView, dict[str, Any]]:
+    """V2 + V3 for ONE nominal back view, without building a back: the similarity and
+    perspective fit to the mirrored front silhouette, the IoU gate (0.75), the pose gate
+    (outline gap) and the thin-plate lock - e.g. to choose between AI back candidates
+    (design 3.5.6) before the slow side views are made.
+
+    ``view`` is a segmented :class:`GenView` (:func:`segment_views`).  Returns the view in the
+    levelled back frame (``S x S``; ``meta["used"]`` False and ``meta["reason"]`` when a gate
+    failed) and JSON-ready diagnostics: ``ok``, ``reason``, ``iou`` (after the similarity and
+    perspective stages), ``iou_similarity``, ``iou_locked``, ``pose_frac``, ``similarity``,
+    ``tps_max_frac``.  :func:`view_based_back` repeats this for the view it is given.  Raises
+    :class:`InputError` for invalid inputs and :class:`Cancelled`."""
+    if not isinstance(view, GenView):
+        raise InputError(f"Expected a GenView (got {type(view).__name__}).")
+    fr = _frame(ortho, canon)
+    out, info = _lock_back(view, fr, cancel)
+    return out, _jsonable(info)
+
+
 def view_based_back(
     front: FrontModel,
     canon: Canon,
@@ -4016,6 +4042,7 @@ __all__ = [
     "hull_intervals",
     "levelled_ortho_input",
     "load_views",
+    "lock_back_view",
     "qc_cost",
     "save_views_folder",
     "segment_views",

@@ -381,7 +381,17 @@ _UNITS = {
     "_pct": "percent of the image width",
     "_px": "pixels",
 }
-_METAVARS = {"output_dir": "FOLDER", "name": "NAME", "keyframes": "JSON", "back_images": "FILE"}
+_METAVARS = {
+    "output_dir": "FOLDER",
+    "name": "NAME",
+    "keyframes": "JSON",
+    "back_images": "FILE",
+    "comfyui_workflow": "FILE",
+    "comfyui_url": "URL",
+}
+#: File options of a job (SHARP 360's back photo and ComfyUI workflow): a leading "~" is expanded
+#: and, in a job file, a name relative to the job file's folder is found there.
+_JOB_FILE_FIELDS = ("back_images", "comfyui_workflow")
 
 
 def _help_for(
@@ -522,10 +532,11 @@ def spec_from_namespace(kind: str, ns: argparse.Namespace) -> Any:
             common[key[8:]] = value
     if common.get("output_dir"):
         common["output_dir"] = os.path.abspath(os.path.expanduser(str(common["output_dir"])))
-    if d.get("back_images"):
-        # kept as given (D:/pics/back.jpg stays exactly that) apart from a leading "~", which
-        # Windows shells pass on unexpanded
-        d["back_images"] = os.path.expanduser(str(d["back_images"]))
+    for key in _JOB_FILE_FIELDS:
+        if d.get(key):
+            # kept as given (D:/pics/back.jpg stays exactly that) apart from a leading "~", which
+            # Windows shells pass on unexpanded
+            d[key] = os.path.expanduser(str(d[key]))
     d["common"] = common
     return job_from_dict(d)
 
@@ -774,12 +785,13 @@ def _cmd_run(console: Console, ns: argparse.Namespace) -> int:
                 q = base / q
             fixed.append(str(q))
         spec.inputs = fixed
-    # the SHARP 360 back photo follows the same rule: a job file kept next to its pictures
-    back = getattr(spec, "back_images", None)
-    if back:
-        q = Path(str(back).strip().strip('"').strip("'").strip()).expanduser()
-        if not q.is_absolute() and not q.exists() and (base / q).exists():
-            spec.back_images = str(base / q)
+    # the SHARP 360 back photo / ComfyUI workflow follow the same rule: a job file kept next to them
+    for key in _JOB_FILE_FIELDS:
+        value = getattr(spec, key, None)
+        if value:
+            q = Path(str(value).strip().strip('"').strip("'").strip()).expanduser()
+            if not q.is_absolute() and not q.exists() and (base / q).exists():
+                setattr(spec, key, str(base / q))
     return _cmd_job(console, spec, ns.dry_run)
 
 

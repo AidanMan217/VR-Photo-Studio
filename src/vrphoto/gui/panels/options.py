@@ -496,6 +496,8 @@ class PathEditor(TextEditor):
             from ..util import image_dialog_filter
 
             return image_dialog_filter()
+        if self.meta.file_filter == "comfyui_workflow":
+            return "ComfyUI workflow, API format (*.json);;All files (*)"
         if self.meta.file_filter:
             log.debug("Unknown file filter %r for %s", self.meta.file_filter, self.name)
         return ""
@@ -961,6 +963,16 @@ class JobOptionsPanel(QWidget):
             from ...pipeline.sharp360 import _back_photo  # the job's own check (Qt-free, header only)
 
             _back_photo(back)  # missing, not a picture, no view from behind, unreadable; folders are fine
+        # 'Your own ComfyUI': the address and the workflow file are checked like the job does
+        if (
+            self.kind == "object"
+            and "comfyui_workflow" in d
+            and om.field_applies(self.kind, "comfyui_workflow", d)
+        ):
+            from ...pipeline.sharp360 import _comfy_url, _comfy_workflow  # Qt-free, the job's own checks
+
+            _comfy_url(d.get("comfyui_url"))
+            _comfy_workflow(d.get("comfyui_workflow"))
         # 'Describe the hidden side' longer than the job accepts: say so at 'Create', not in the queue
         if self.kind == "object" and d.get("back_prompt") and om.field_applies(self.kind, "back_prompt", d):
             from ...pipeline.sharp360 import _back_prompt

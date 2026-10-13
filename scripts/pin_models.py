@@ -200,8 +200,21 @@ def pin_github(spec: ModelSpec, fetch: Fetch) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- lock document
+def pin_table(spec: ModelSpec) -> dict[str, Any]:
+    """The registry table's own pins of a URL model that is already pinned there and is not a
+    GitHub release (e.g. YuNet: a Git LFS file at an exact opencv_zoo commit); nothing to resolve."""
+    out: dict[str, Any] = {"revision": spec.revision, "sha256": dict(spec.sha256)}
+    if spec.sizes:
+        out["sizes"] = dict(spec.sizes)
+    if spec.size_mb:
+        out["size_mb"] = spec.size_mb
+    return out
+
+
 def pin_spec(spec: ModelSpec, fetch: Fetch) -> dict[str, Any]:
     if spec.url:
+        if spec.pinned and "/releases/download/" not in spec.url:
+            return pin_table(spec)
         return pin_github(spec, fetch)
     if spec.repo:
         return pin_hf(spec, fetch)

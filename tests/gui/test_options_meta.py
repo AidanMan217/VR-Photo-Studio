@@ -93,7 +93,7 @@ def test_metadata_is_consistent(name, meta, default):
     if meta.addon_optional:
         assert meta.addon_choices, f"{name}: addon_optional without addon_choices"
     if meta.file_filter:
-        assert meta.kind == "file" and meta.file_filter in ("images",), name
+        assert meta.kind == "file" and meta.file_filter in ("images", "comfyui_workflow"), name
 
 
 def test_enabled_if_refers_to_sibling_fields():
@@ -203,6 +203,8 @@ def test_field_applies_follows_enabled_if_and_enabled_if_all():
         ("auto", True),
         ("trellis", True),
         ("mvadapter", True),
+        ("qwen", True),
+        ("comfyui", True),
         ("shell", False),
         ("images", False),
     ):
@@ -272,12 +274,12 @@ SHARP360_M2_FIELDS = (
     ("back_images", ("images",)),
     ("back_relief", None),
     ("color_match", None),
-    ("back_tries", ("auto", "trellis", "mvadapter")),
-    ("back_steps", ("auto", "trellis", "mvadapter")),
+    ("back_tries", ("auto", "trellis", "mvadapter", "qwen", "comfyui")),
+    ("back_steps", ("auto", "trellis", "mvadapter", "qwen", "comfyui")),
 )
 #: M4 / M5 fields: (name, extra all-of condition or None)
 SHARP360_M4_FIELDS = (
-    ("back_prompt", ("back_source", ("auto", "mvadapter"))),
+    ("back_prompt", ("back_source", ("auto", "mvadapter", "qwen", "comfyui"))),
     ("polish", None),
     ("polish_steps", ("polish", ("auto", "on"))),
 )
@@ -320,7 +322,10 @@ def test_sharp360_fields_metadata():
         "trellis": "TRELLIS (add-on)",
         "images": "Your own back photo",
         "mvadapter": "MV-Adapter AI views (add-on)",
+        "qwen": "Qwen photo editor (add-on, experimental, slow)",
+        "comfyui": "Your own ComfyUI (expert)",
     }
+    assert obj["back_source"].experimental_choices == frozenset({"qwen", "comfyui"})
     assert not obj["back_source"].advanced and not obj["back_quality"].advanced
     assert dict(obj["back_quality"].choices)["best"].startswith("Best")
     seam = obj["seam_deg"]
@@ -334,7 +339,11 @@ def test_sharp360_fields_metadata():
     }
     assert obj["save_extras"].kind == "check" and obj["save_extras"].advanced
     # TRELLIS / MV-Adapter are optional: the job warns and falls back without them
-    assert obj["back_source"].addon_choices == {"trellis": ("trellis",), "mvadapter": ("mvadapter",)}
+    assert obj["back_source"].addon_choices == {
+        "trellis": ("trellis",),
+        "mvadapter": ("mvadapter",),
+        "qwen": ("qwenedit",),
+    }
     assert obj["back_source"].addon_optional
     assert not obj["method"].addon_optional  # SHARP itself is required
 
@@ -419,7 +428,14 @@ def test_sharp360_m4_fields_metadata():
     assert fa("object", "polish_steps", on) and fa("object", "polish_steps", {**on, "polish": "on"})
     assert not fa("object", "polish_steps", {**on, "polish": "off"})
     assert not fa("object", "polish_steps", {**on, "method": "billboard"})  # via 'polish'
-    for source, prompt_on in (("auto", True), ("mvadapter", True), ("trellis", False), ("images", False)):
+    for source, prompt_on in (
+        ("auto", True),
+        ("mvadapter", True),
+        ("qwen", True),
+        ("comfyui", True),
+        ("trellis", False),
+        ("images", False),
+    ):
         assert fa("object", "back_prompt", {**on, "back_source": source}) is prompt_on, source
 
 
@@ -498,3 +514,45 @@ def test_capture_subject_height_defaults_to_automatic():
     assert CaptureJob().subject_height_m == 0.0
     assert meta.kind == "spin" and meta.minimum == 0 and meta.zero_label == "Automatic"
     assert meta.unit == "m" and meta.advanced
+
+
+def test_sharp360_m6_m7_fields_metadata():
+    """'Back detail' Sharp (M6); the Qwen photo editor and your own ComfyUI (M7): the address
+    and workflow apply to the comfyui source only, Qwen needs its add-on (optionally)."""
+    from vrphoto.addons.workers._comfy import PLACEHOLDERS
+    from vrphoto.pipeline import run as R
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    obj = om.JOB_META["object"]
+    assert dict(obj["back_relief"].choices)["sharp"] == "Sharp (SHARP on the back view, slower)"
+    assert tuple(obj["back_relief"].choice_values()) == R.BACK_RELIEFS
+    assert "SHARP" in obj["back_relief"].tooltip and "'Best'" in obj["back_relief"].tooltip
+    for word in ("Qwen photo editor", "30 GB", "16 GB", "15-60 minutes", "Your own ComfyUI"):
+        assert word in obj["back_source"].tooltip, word
+    url, wf = obj["comfyui_url"], obj["comfyui_workflow"]
+    assert (url.kind, url.label, url.advanced) == ("text", "ComfyUI address", True)
+    assert url.placeholder == ObjectJob().comfyui_url
+    assert (wf.kind, wf.label, wf.advanced, wf.file_filter) == (
+        "file",
+        "ComfyUI workflow",
+        True,
+        "comfyui_workflow",
+    )
+    for name in PLACEHOLDERS:
+        assert "{{" + name + "}}" in wf.tooltip, name
+    assert "Export (API)" in wf.tooltip and ObjectJob().comfyui_workflow is None
+    fa = om.field_applies
+    on = {"method": "sharp360", "back_source": "comfyui"}
+    for name in ("comfyui_url", "comfyui_workflow"):
+        m = obj[name]
+        assert m.enabled_if == ("method", ("sharp360",)) and m.enabled_if_all == (
+            ("back_source", ("comfyui",)),
+        )
+        assert "SHARP 360" in m.tooltip, name
+        assert fa("object", name, on)
+        assert not fa("object", name, {**on, "back_source": "qwen"})
+        assert not fa("object", name, {**on, "method": "sharp"})
+    groups = om.required_addon_groups
+    qwen = {"method": "sharp360", "back_source": "qwen"}
+    assert groups("object", qwen) == ((("sharp",), False), (("qwenedit",), True))
+    assert groups("object", {"method": "sharp360", "back_source": "comfyui"}) == ((("sharp",), False),)

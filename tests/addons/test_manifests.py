@@ -21,7 +21,7 @@ from vrphoto.addons.manifest import (
 from vrphoto.core.errors import AddonError
 
 BUNDLED = sorted(manifests_dir().glob("*.toml"))
-EXPECTED_IDS = {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360", "capture", "mvadapter"}
+EXPECTED_IDS = {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360", "capture", "mvadapter", "qwenedit"}
 REQUIRED = ("id", "title", "description", "license", "kind", "tasks", "steps")
 
 
@@ -180,6 +180,8 @@ def test_parse_ok():
         ({"region_restricted": ["UK"]}, "GB not UK"),
         ({"region_restricted": ["deu"]}, "ISO 3166"),
         ({"min_vram_gb": -1}, "negative"),
+        ({"min_ram_gb": -2}, "min_ram_gb must not be negative"),
+        ({"min_ram_gb": "16"}, "'min_ram_gb' has the wrong type"),
         ({"steps": [{"type": "venv"}, {"type": "hf_download", "repo": "a/b", "repo_type": "zip"}]}, "repo_type"),
         ({"steps": [{"type": "venv"}, {"type": "worker"}]}, "missing required key 'args'"),
         ({"steps": [{"type": "venv"}, {"type": "archive", "url": "https://x/y.zip", "dest": "{src}/../../x"}]},
@@ -190,6 +192,38 @@ def test_parse_ok():
 def test_parse_errors(changes, match):
     with pytest.raises(AddonError, match=match):
         _parse(**changes)
+
+
+def test_min_ram_gb_is_optional_and_advisory():
+    """System memory (``min_ram_gb``): parsed, shown with the notices and in to_dict; 0 when absent."""
+    m = _parse(min_ram_gb=16)
+    assert m.min_ram_gb == 16.0 and m.to_dict()["min_ram_gb"] == 16.0
+    assert "Needs at least 16 GB of system memory (RAM)." in m.notices()
+    assert not m.requires_license_ack()  # advisory: no extra confirmation
+    plain = _parse()
+    assert plain.min_ram_gb == 0.0 and not any("system memory" in n for n in plain.notices())
+    assert _parse(min_ram_gb=12.5).min_ram_gb == 12.5
+    by_id = {x.id: x for x in manager.list_addons(include_experimental=True)}
+    assert by_id["qwenedit"].min_ram_gb == 16 and by_id["qwenedit"].experimental
+    assert not by_id["qwenedit"].noncommercial
+    assert all(x.min_ram_gb == 0 for x in by_id.values() if x.id != "qwenedit")
+
+
+def test_addons_dialog_shows_the_ram_requirement():
+    """The Add-ons dialog compares min_ram_gb with this PC's RAM (and keeps it out of the licence notes)."""
+    pytest.importorskip("PySide6")
+    from vrphoto.gui.dialogs.addons_dialog import license_notices, requirement_notes, total_ram_gb
+
+    m = _parse(min_ram_gb=16, min_vram_gb=6, disk_gb=30)
+    assert requirement_notes(m, None, None, ram_gb=31.9)[1] == ("ok", "RAM: this PC has 32 GB (needs 16 GB).")
+    assert requirement_notes(m, None, None, ram_gb=15.6)[1][0] == "ok"  # a "16 GB" PC reports a little less
+    level, text = requirement_notes(m, None, None, ram_gb=8)[1]
+    assert level == "warn" and "needs 16 GB of system memory" in text
+    assert requirement_notes(m, None, None, ram_gb=None)[1] == ("info", "Needs 16 GB of system memory (RAM).")
+    assert not any("RAM" in t for _lvl, t in requirement_notes(_parse(min_vram_gb=6, disk_gb=3), None, None))
+    assert not any("system memory" in n for n in license_notices(m))
+    gb = total_ram_gb()
+    assert gb is None or gb > 0.5
 
 
 def test_binary_kind_rules():
@@ -276,4 +310,4 @@ def test_torch_manifests_pin_setuptools(path: Path):
 def test_all_torch_addons_are_covered_by_the_setuptools_rule():
     torch_ids = {m.id for m in map(load_manifest, BUNDLED)
                  if any(p.startswith("torch==") for s in m.steps if s["type"] == "pip" for p in s["packages"])}
-    assert torch_ids == {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360", "mvadapter"}
+    assert torch_ids == {"trellis", "trellis2", "hunyuan", "sharp", "sdxl360", "mvadapter", "qwenedit"}

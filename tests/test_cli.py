@@ -800,8 +800,8 @@ def test_sharp360_mvadapter_and_polish_options_parse():
 
 def test_sharp360_m2_help_texts():
     helps = {a.dest: a.help for a in _subparser("object")._actions}
-    assert "Choices: auto, shell, trellis, images, mvadapter." in helps["job__back_source"]
-    assert "Choices: auto, depth, flat." in helps["job__back_relief"]
+    assert "Choices: auto, shell, trellis, images, mvadapter, qwen, comfyui." in helps["job__back_source"]
+    assert "Choices: auto, depth, flat, sharp." in helps["job__back_relief"]
     assert (
         "Default: none." in helps["job__back_images"] and "walked to your right" in helps["job__back_images"]
     )
@@ -816,7 +816,7 @@ def test_sharp360_m2_help_texts():
 @pytest.mark.parametrize(
     "flag,value",
     [
-        ("--back-source", "qwen"),
+        ("--back-source", "comfy"),
         ("--back-quality", "ultra"),
         ("--polish", "always"),
         ("--size-from", "guess"),
@@ -983,3 +983,46 @@ def test_unwritable_output_folder_is_a_friendly_early_error(photo, tmp_path, mon
     assert code == 1
     assert "Cannot save files into" in err and "Traceback" not in err and "Unexpected" not in err
     assert "Hint:" in err
+
+
+def test_sharp360_qwen_comfyui_and_sharp_relief_options_parse(tmp_path, monkeypatch):
+    """M6 / M7: the new back sources, the ComfyUI address and workflow, 'Back detail' sharp."""
+    from vrphoto.pipeline import run as R
+
+    t = cli._choices_table()
+    assert {"qwen", "comfyui"} <= set(t[("object", "back_source")]) and "sharp" in t[
+        ("object", "back_relief")
+    ]
+    args = ["object", "me.jpg", "--method", "sharp360", "--back-source", "qwen", "--back-relief", "sharp"]
+    spec = cli.spec_from_namespace("object", cli.build_parser().parse_args(args + ["--back-tries", "2"]))
+    assert (spec.back_source, spec.back_relief, spec.back_tries) == ("qwen", "sharp", 2)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    args = ["object", "me.jpg", "--method", "sharp360", "--back-source", "comfyui"]
+    args += ["--comfyui-url", "http://192.168.1.20:8188", "--comfyui-workflow", "~/wf_api.json"]
+    spec = cli.spec_from_namespace("object", cli.build_parser().parse_args(args))
+    assert (spec.back_source, spec.comfyui_url) == ("comfyui", "http://192.168.1.20:8188")
+    assert Path(spec.comfyui_workflow) == tmp_path / "wf_api.json"
+    assert R.BACK_SOURCES[-2:] == ("qwen", "comfyui")
+    text = _subparser("object").format_help()
+    assert "--comfyui-workflow FILE" in text and "--comfyui-url URL" in text
+
+
+def test_run_spec_finds_the_comfyui_workflow_next_to_the_job_file(photo, tmp_path, monkeypatch):
+    shoot, elsewhere = tmp_path / "shoot", tmp_path / "elsewhere"
+    shoot.mkdir()
+    elsewhere.mkdir()
+    shutil.copy(photo, shoot / "front.jpg")
+    (shoot / "wf_api.json").write_text("{}", encoding="utf-8")
+    d = {
+        "kind": "object",
+        "inputs": ["front.jpg"],
+        "method": "sharp360",
+        "back_source": "comfyui",
+        "comfyui_workflow": "wf_api.json",
+    }
+    (shoot / "job.json").write_text(json.dumps(d), encoding="utf-8")
+    monkeypatch.chdir(elsewhere)
+    code, out, err = run_cli(["run", "--spec", Path("..") / "shoot" / "job.json", "--dry-run"])
+    assert code == 0, err
+    assert Path(json.loads(out)["comfyui_workflow"]).resolve() == (shoot / "wf_api.json").resolve()

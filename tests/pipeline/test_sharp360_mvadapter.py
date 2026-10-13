@@ -576,6 +576,57 @@ def test_a_damaged_cached_set_is_made_again(direct):
     assert call(seed=4).diag["cache"]["hits"] == 1 and len(_seeds_asked(fm)) == 2
 
 
+
+@pytest.mark.parametrize("sharp_fails_on, model, notices", [(1, "da2-large", ["da2-large"]), (2, "sharp", [])])
+def test_the_chosen_sets_relief_model_is_recorded(direct, monkeypatch, sharp_fails_on, model, notices):
+    """'Back detail' Sharp with two MV-Adapter sets: SHARP shapes one set, the depth model the
+    other (SHARP failed there).  The relief model (debug.json) and the depth model's licence
+    notice are those of the CHOSEN set (set 1, the lower QC cost), not of the set lifted last;
+    each set's SHARP progress stays inside its own range."""
+    from types import SimpleNamespace
+
+    from vrphoto.geometry import views_lift
+    from vrphoto.geometry.back_mould import BackPart
+    from vrphoto.pipeline import run as R
+    from vrphoto.pipeline import sharp360_ai as A
+
+    monkeypatch.setattr(context.RunContext, "estimator", lambda self, *a, **k: None)
+    monkeypatch.setattr(context.RunContext, "depth", lambda self, rgb, **k: SimpleNamespace(model_id="da2-large"))
+    noticed: list[str] = []
+    monkeypatch.setattr(R._Run, "model_notice", lambda self, item, mid: noticed.append(mid))
+    reps: list = []
+
+    def fake_sharp_depth_fn(ctx, rep=None, *, ortho=None, explicit=False, fallback=None, used=None):
+        reps.append(rep)  # the real one's contract: SHARP_RELIEF in ``used`` on success, else the fallback
+
+        def fn(rgb):
+            if len(reps) == sharp_fails_on:
+                return fallback(rgb)
+            used.append(A.SHARP_RELIEF)
+            return np.zeros(rgb.shape[:2], np.float32)
+
+        return fn
+
+    monkeypatch.setattr(A, "sharp_depth_fn", fake_sharp_depth_fn)
+    lifted: list[int] = []
+
+    def lift(front, canon, ortho, views, *, source, depth_fn=None, **kw):
+        lifted.append(len(lifted) + 1)
+        depth_fn(np.zeros((8, 8, 3), np.uint8))
+        cost = 0.1 if len(lifted) == 1 else 0.3  # set 1 fits better
+        return BackPart(sc=S._empty_cloud(), kind="mould", source=source, ok=True, views=list(views),
+                        diag={"qc": {"cost": cost}, "relief": {"source": "depth"}})
+
+    monkeypatch.setattr(views_lift, "view_based_back", lift)
+    call, fm = direct()
+    part = call(tries=2, relief="sharp")
+    assert lifted == [1, 2] and len(reps) == 2  # one relief per set
+    (lo1, hi1), (lo2, hi2) = [(r._lo, r._hi) for r in reps]  # set 1 in 0.8-0.9, set 2 in 0.9-1.0
+    assert 0.8 <= lo1 < hi1 <= 0.9 <= lo2 < hi2 <= 1.0, (lo1, hi1, lo2, hi2)
+    assert part.diag["chosen"] == 1 and part.diag["relief"]["model"] == model
+    assert [m for m in noticed if m != "birefnet-lite"] == notices  # (the segmenter's own notice aside)
+
+
 def test_the_cache_digest_ignores_the_mould_grid_but_not_the_photo():
     from types import SimpleNamespace
 
@@ -659,7 +710,7 @@ def test_new_options_are_checked():
             S.resolve_options(_spec(back_source=source, back_prompt="x" * 400), installed=bool).back_prompt
             == ""
         )
-    assert S.PROMPT_SOURCES == ("auto", "mvadapter")
+    assert S.PROMPT_SOURCES == ("auto", "mvadapter", "qwen", "comfyui")
     for kw, match in (
         ({"back_prompt": "x" * 301}, "too long"),
         ({"back_source": "mvadapter", "back_prompt": "x" * 301}, "too long"),
@@ -858,3 +909,31 @@ def test_the_polish_plan_warns_only_when_the_polish_was_asked_for(fake_brush, mo
         False,
         ["Brush polish was skipped (the Capture add-on (Brush) is not installed)."],
     )
+
+
+def test_an_mvadapter_set_whose_back_view_shows_a_face_is_not_used(make_job, person, monkeypatch):
+    """M6: YuNet finds a face on the back view (the AI painted the front onto the back of the
+    head): the set is unusable and the chain falls back; a weaker face is only the QC term."""
+    from vrphoto.segment import faces
+
+    calls = []
+
+    def face(rgb, alpha=None, **kw):
+        calls.append(np.asarray(rgb).shape)
+        return 0.93
+
+    monkeypatch.setattr(faces, "frontal_face_score", face)
+    photo, fm = person()
+    res = run_job(_job(make_job, photo))
+    assert len(calls) == 1  # only the 180 deg view is checked (MV-Adapter has no 135 / 225 views)
+    assert _fallbacks(res) == [
+        "MV-Adapter could not make a usable back (a face was found on the back view (score 0.93)); the "
+        "built-in back was used instead."
+    ]
+    att = _debug(res)["sources"][0]
+    assert att["diag"]["tries"][0]["ok"] is False
+    monkeypatch.setattr(faces, "frontal_face_score", lambda rgb, alpha=None, **kw: 0.6)
+    res = run_job(_job(make_job, photo))
+    assert not _fallbacks(res), res.warnings
+    d = _debug(res)["back"]["diag"]
+    assert d["face"]["max"] == 0.6 and d["qc"]["terms"]["face"] == 0.6

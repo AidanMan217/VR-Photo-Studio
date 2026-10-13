@@ -218,3 +218,17 @@ def test_needs_license_ack():
     assert not registry.needs_license_ack("da2-small")
     get_settings().accept_license("da2-large")
     assert not registry.needs_license_ack("da2-large")
+
+
+def test_yunet_is_a_pinned_direct_download():
+    """SHARP 360's optional face check (segment/faces.py): a Git LFS file of opencv_zoo, fetched
+    from the LFS media host at a fixed commit and verified by sha256 + size."""
+    spec = get_spec("yunet")
+    f = "face_detection_yunet_2023mar.onnx"
+    assert spec.files == (f,) and spec.task in registry.TASKS and spec.license == "MIT"
+    assert spec.pinned and len(spec.revision) == 40 and spec.revision in spec.url
+    assert spec.url.startswith("https://media.githubusercontent.com/media/opencv/opencv_zoo/")
+    assert spec.url.endswith("/models/face_detection_yunet/" + f) and file_url(spec, f) == spec.url
+    assert spec.sha256[f] == "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
+    assert spec.sizes[f] == 232589 and spec.size_mb == pytest.approx(0.23)
+    assert not spec.noncommercial and not spec.is_hf and spec.experimental

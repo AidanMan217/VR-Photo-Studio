@@ -35,9 +35,15 @@ SHARP's front, see :func:`_src_trellis`) and ``images`` (the user's own back pho
 optional side photos, or back views made with any AI tool, bent onto the photo's outline
 and lifted onto a mould, see :func:`_src_images`; never chosen by "auto").  "auto" tries
 MV-Adapter, then TRELLIS, when installed (not with "fast" quality: the built-in back).
-Qwen / ComfyUI join in a later milestone.  The 'Variation' number (``seed``) is the AI
-sources' seed (attempt ``i`` uses ``seed + i``) and the seam dither's; the photographed
-front never depends on it.
+The experimental ``qwen`` (the Qwen photo editor add-on: Qwen-Image-Edit-2511 in a private
+headless ComfyUI) and the expert ``comfyui`` (the user's own ComfyUI server and workflow)
+sources make nominal back / side views of the plain cut-out, choose the back among
+candidates (outline fit, no face, rim colours) and lift them like back photos
+(:mod:`~vrphoto.pipeline.sharp360_ai`); "auto" never picks them.  The 'Variation' number
+(``seed``) is the AI sources' seed (attempt ``i`` uses ``seed + i``) and the seam dither's;
+the photographed front never depends on it.  'Back detail' "sharp" (and "auto" with 'Best'
+quality) runs SHARP once more on the lined-up back view and uses its surface as the back's
+relief (:func:`~vrphoto.pipeline.sharp360_ai.sharp_depth_fn`).
 
 Outputs: ``<base>_cutout.png``, ``<base>_sharp360.splat``, ``<base>_sharp360_preview.jpg``
 (a turntable sheet of the final splat, 8 views; a failure there is only a warning),
@@ -119,7 +125,10 @@ MAX_SEED = 2**31 - 1
 MAX_PROMPT_CHARS = 300
 #: The ``back_source`` choices that use 'Describe the hidden side' (the GUI greys it out
 #: for the others, and the job ignores it there).
-PROMPT_SOURCES = ("auto", "mvadapter")
+PROMPT_SOURCES = ("auto", "mvadapter", "qwen", "comfyui")
+#: Sources "auto" never picks: they need the user's own picture or server, or are
+#: experimental and slow (design 0.3 "Auto order").
+NEVER_AUTO = frozenset({"images", "qwen", "comfyui"})
 #: Brush polish training steps ('Brush steps' / ``polish_steps``).
 POLISH_STEPS_RANGE = (1000, 30000)
 
@@ -135,7 +144,9 @@ class Quality:
     trellis_steps: tuple[int, int] = (12, 12)  # TRELLIS sparse-structure / structured-latent steps
     mv_steps: int = 30  # MV-Adapter denoising steps when 'AI steps' is Automatic
     mv_guidance: float = 3.0  # MV-Adapter classifier-free guidance
-    relief: str = "depth"  # what 'Back detail' Automatic means for a back made from a picture
+    relief: str = (
+        "depth"  # what 'Back detail' Automatic means for a back made from a picture (sharp | depth | flat)
+    )
     fill_holes: bool = True  # side photos also fill side pixels nothing else covers (design V10)
     preview_px: int = 384  # size of one turntable preview view
 
@@ -155,6 +166,7 @@ QUALITY: dict[str, Quality] = {
         trellis_steps=(25, 25),
         preview_px=512,
         mv_steps=50,
+        relief="sharp",  # M6: SHARP on the back view (the depth model when SHARP cannot run)
     ),
 }
 
@@ -164,19 +176,23 @@ SOURCE_NAMES: dict[str, str] = {
     "trellis": "TRELLIS",
     "images": "your back photo",
     "mvadapter": "MV-Adapter",
+    "qwen": "the Qwen photo editor",
+    "comfyui": "your ComfyUI server",
 }
 SOURCE_LABELS: dict[str, str] = {
     "shell": "built-in back",
     "trellis": "back by TRELLIS",
     "images": "back from your photo",
     "mvadapter": "back by MV-Adapter",
+    "qwen": "back by the Qwen photo editor",
+    "comfyui": "back by your ComfyUI workflow",
 }
 #: The add-on a source needs; "auto" skips sources whose add-on is not installed.  The
-#: built-in back needs none.
-SOURCE_ADDONS: dict[str, str] = {"trellis": "trellis", "mvadapter": "mvadapter"}
+#: built-in back needs none ("comfyui" needs the user's own ComfyUI server instead).
+SOURCE_ADDONS: dict[str, str] = {"trellis": "trellis", "mvadapter": "mvadapter", "qwen": "qwenedit"}
 #: Sources whose views are made by an AI (saved as an editable views folder with
 #: ``save_extras``; the user's own photos are already in a folder).
-GENERATED_VIEW_SOURCES = frozenset({"mvadapter"})
+GENERATED_VIEW_SOURCES = frozenset({"mvadapter", "qwen", "comfyui"})
 
 
 @dataclass(frozen=True)
@@ -203,6 +219,8 @@ class Opts:
     back_prompt: str = ""  # 'Describe the hidden side' (AI view sources; "" = the source's default)
     polish: str = "auto"  # Brush polish: auto (best quality, view-based backs, Brush tested) | off | on
     polish_steps: int = 5000  # Brush training steps of the polish
+    comfyui_url: str = ""  # comfyui source: the server's address (checked); "" for the other sources
+    comfyui_workflow: str | None = None  # comfyui source: the API-format workflow file (checked)
 
 
 def _whole(value: Any, what: str, lo: int, hi: int, hint: str) -> int:
@@ -284,6 +302,74 @@ def _back_prompt(value: Any) -> str:
     return text
 
 
+def _comfy() -> Any:
+    """The stdlib-only ComfyUI client (``addons/workers/_comfy.py``, shared with the qwenedit
+    add-on worker)."""
+    from ..addons.workers import _comfy as comfy
+
+    return comfy
+
+
+def _unquote(value: Any) -> str:
+    """``value`` as text with surrounding white space and quotes removed (Windows Explorer's
+    'Copy as path' adds quotes)."""
+    return str(value).strip().strip('"').strip("'").strip() if value is not None else ""
+
+
+def _comfy_url(value: Any) -> str:
+    """'ComfyUI address' of the ``comfyui`` source, checked before any work: an http(s)
+    address (``127.0.0.1:8188`` -> ``http://127.0.0.1:8188``; empty -> the default).
+    :class:`InputError` otherwise.  Whether ComfyUI runs there is found out by the job (a
+    warning and the built-in back when it does not)."""
+    c = _comfy()
+    text = _unquote(value)
+    try:
+        return str(c.normalize_url(text or c.DEFAULT_URL))
+    except (c.ComfyError, ValueError) as e:  # ValueError: urllib's own (normalize_url catches those it knows)
+        raise InputError(
+            f"'{text}' is not an address of a ComfyUI server ('ComfyUI address').",
+            hint="Use an http:// or https:// address like http://127.0.0.1:8188 (ComfyUI shows it when it starts).",
+        ) from e
+
+
+def _comfy_workflow(value: Any) -> str:
+    """'ComfyUI workflow' of the ``comfyui`` source, checked before any work: an existing
+    JSON file in ComfyUI's API format (``Export (API)``) that uses the ``{{IMAGE}}``
+    placeholder and no placeholder the app does not fill in.  Returns the path; Qt-free (the
+    GUI checks a job with it before queueing).  :class:`InputError` otherwise."""
+    c = _comfy()
+    text = _unquote(value)
+    known = " ".join("{{" + n + "}}" for n in c.PLACEHOLDERS)
+    export_hint = (
+        "In ComfyUI open your workflow, save it with 'Export (API)' (Workflow menu), put {{IMAGE}} as the "
+        "file name of its 'Load Image' node in a text editor, then choose that file."
+    )
+    if not text:
+        raise InputError("'Your own ComfyUI' needs a workflow file ('ComfyUI workflow').", hint=export_hint)
+    path = Path(text).expanduser()
+    if not path.is_file():
+        raise InputError(f"The ComfyUI workflow {path} was not found.", hint=export_hint)
+    try:
+        graph = c.load_workflow(path)
+    except c.ComfyError as e:
+        raise InputError(str(e), hint=getattr(e, "hint", None) or export_hint) from e
+    names = c.placeholders(graph)
+    if "IMAGE" not in names:
+        raise InputError(
+            f"The ComfyUI workflow {path.name} has no {{{{IMAGE}}}} placeholder, so it cannot get the photo.",
+            hint="Open the exported .json in a text editor and put {{IMAGE}} as the image name of its "
+            f"'Load Image' node (the app fills in {known}).",
+        )
+    unknown = sorted(names - set(c.PLACEHOLDERS))
+    if unknown:
+        listed = ", ".join("{{" + n + "}}" for n in unknown)
+        raise InputError(
+            f"The ComfyUI workflow {path.name} uses {listed}, which VR Photo Studio does not fill in.",
+            hint=f"Use only {known} in the workflow.",
+        )
+    return str(path)
+
+
 def resolve_options(spec: Any, *, installed: Callable[[str], bool]) -> Opts:
     """Check the SHARP 360 options of an object job and pick the back sources to try.
 
@@ -303,12 +389,21 @@ def resolve_options(spec: Any, *, installed: Callable[[str], bool]) -> Opts:
     (:func:`_back_photo`); "auto" never picks that source (it needs the user's picture).
     ``back_prompt`` ('Describe the hidden side') is tidied and at most
     :data:`MAX_PROMPT_CHARS` characters (:func:`_back_prompt`) with ``back_source`` "auto" or
-    "mvadapter" (:data:`PROMPT_SOURCES`), ignored otherwise; ``polish`` must be one of
-    ``run.POLISH_MODES`` and ``polish_steps`` a whole number in :data:`POLISH_STEPS_RANGE`."""
+    "mvadapter", "qwen" or "comfyui" (:data:`PROMPT_SOURCES`), ignored otherwise; ``polish``
+    must be one of ``run.POLISH_MODES`` and ``polish_steps`` a whole number in
+    :data:`POLISH_STEPS_RANGE`.  With ``back_source="comfyui"`` the 'ComfyUI address'
+    (``comfyui_url``) must be an http(s) address (:func:`_comfy_url`) and the 'ComfyUI
+    workflow' (``comfyui_workflow``) an API-format workflow with ``{{IMAGE}}``
+    (:func:`_comfy_workflow`); both are ignored by the other sources.  "auto" never picks
+    the ``images``, ``qwen`` or ``comfyui`` sources (:data:`NEVER_AUTO`)."""
     source = R._choice(spec.back_source, R.BACK_SOURCES, "back source")
     quality = R._choice(spec.back_quality, R.BACK_QUALITIES, "back quality")
     relief = R._choice(getattr(spec, "back_relief", "auto"), R.BACK_RELIEFS, "'Back detail' setting")
     back_images = _back_photo(getattr(spec, "back_images", None)) if source == "images" else None
+    comfy_url, comfy_workflow = "", None
+    if source == "comfyui":
+        comfy_url = _comfy_url(getattr(spec, "comfyui_url", ""))
+        comfy_workflow = _comfy_workflow(getattr(spec, "comfyui_workflow", None))
     size_from = R._choice(spec.size_from, R.SIZE_FROM, "'Size from' setting")
     seam = _seam(spec.seam_deg)
     back = R._choice(spec.back, R.BACKS, "back texture")
@@ -343,7 +438,11 @@ def resolve_options(spec: Any, *, installed: Callable[[str], bool]) -> Opts:
     q = QUALITY[quality]
     if source == "auto":
         chain = [
-            s for s in q.auto if s in SOURCES and (s not in SOURCE_ADDONS or installed(SOURCE_ADDONS[s]))
+            s
+            for s in q.auto
+            if s in SOURCES
+            and s not in NEVER_AUTO
+            and (s not in SOURCE_ADDONS or installed(SOURCE_ADDONS[s]))
         ]
     else:
         chain = [source]
@@ -370,6 +469,8 @@ def resolve_options(spec: Any, *, installed: Callable[[str], bool]) -> Opts:
         back_prompt=prompt,
         polish=polish,
         polish_steps=polish_steps,
+        comfyui_url=comfy_url,
+        comfyui_workflow=comfy_workflow,
     )
 
 
@@ -395,6 +496,9 @@ class Ctx:
     levelled: Any = None
     #: ``(runs, note)`` of the Brush polish (:func:`_polish_plan`); None: no polish.
     polish: tuple[bool, str] | None = None
+    #: What the SHARP relief ('Back detail' "sharp", :func:`~vrphoto.pipeline.sharp360_ai.
+    #: sharp_depth_fn`) did, for debug.json: ``runs`` (one record per SHARP run).
+    relief: dict[str, Any] = field(default_factory=dict)
 
 
 def _src_shell(ctx: Ctx, rep: ProgressReporter) -> BackPart:
@@ -860,18 +964,26 @@ def _view_segmenter(run: Any) -> Any:
         return None
 
 
-def _relief_fn(ctx: Ctx) -> tuple[str, Callable[[np.ndarray], Any] | None, list[str]]:
+def _relief_fn(
+    ctx: Ctx, rep: ProgressReporter | None = None, *, ortho: Any = None
+) -> tuple[str, Callable[[np.ndarray], Any] | None, list[str]]:
     """``(relief mode, depth_fn, models used)`` for :func:`~vrphoto.geometry.views_lift.
     view_based_back`.  'Back detail' Automatic is the quality's :attr:`Quality.relief`
-    (smooth with "fast", design 1.3); otherwise the app's depth model
-    (``common.depth_model``) gives the disparity of the locked back view.  With the model-free
-    heuristic estimator, "auto" quietly makes a smooth back and "depth" says why it is
-    smooth (views_lift).  The ids of the models that ran are appended to the list, for the
-    licence notice."""
+    (smooth with "fast", SHARP with "best", else the depth model; design 1.3); "depth" is the
+    app's depth model (``common.depth_model``) on the locked back view; "sharp" (M6) runs
+    SHARP on it (:func:`~vrphoto.pipeline.sharp360_ai.sharp_depth_fn`, ``rep`` its progress,
+    ``ortho`` the levelled frame for the expected silhouette) and falls back to the depth
+    model - when the SHARP add-on is not installed, too.  With the model-free heuristic
+    estimator, "auto" quietly makes a smooth back and "depth" / "sharp" say why it is smooth
+    (views_lift).  The returned mode is what ``view_based_back`` takes ("auto" stays quiet,
+    "depth" warns).  The ids of the models that ran are appended to the list, for the licence
+    notice (:data:`~vrphoto.pipeline.sharp360_ai.SHARP_RELIEF` for SHARP; see
+    :func:`_relief_notice`)."""
     o, run = ctx.opts, ctx.run
     q = QUALITY.get(o.quality, QUALITY["balanced"])
     mode = o.relief
-    if mode == "flat" or (mode == "auto" and q.relief == "flat"):
+    want = q.relief if mode == "auto" else mode
+    if want == "flat":
         return "flat", None, []
     used: list[str] = []
 
@@ -881,7 +993,33 @@ def _relief_fn(ctx: Ctx) -> tuple[str, Callable[[np.ndarray], Any] | None, list[
         used.append(str(getattr(res, "model_id", "") or ""))
         return res
 
-    return mode, depth_fn, used
+    if want != "sharp":
+        return mode, depth_fn, used
+    if not R._addon_installed("sharp"):  # SHARP 360 needs it anyway; a job file may say "sharp" elsewhere
+        if mode == "sharp" and run is not None:
+            run.warn(
+                "'Back detail' Sharp needs the SHARP add-on, which is not installed; the depth model was used."
+            )
+        return ("auto" if mode == "auto" else "depth"), depth_fn, used
+    from .sharp360_ai import sharp_depth_fn
+
+    fn = sharp_depth_fn(ctx, rep, ortho=ortho, explicit=mode == "sharp", fallback=depth_fn, used=used)
+    return ("auto" if mode == "auto" else "depth"), fn, used
+
+
+def _relief_notice(run: Any, item: Any, diag: dict[str, Any] | None, used: list[str]) -> None:
+    """After a usable view-based back: the depth model's licence notice when its relief shaped
+    the result (SHARP's is always there: ``diag["relief"]["model"] = "sharp"`` instead)."""
+    from .sharp360_ai import SHARP_RELIEF
+
+    rel = (diag or {}).get("relief")
+    if not isinstance(rel, dict) or rel.get("source") != "depth" or not used:
+        return
+    if used[-1] == SHARP_RELIEF:
+        rel["model"] = "sharp"
+        return
+    rel["model"] = used[-1]
+    run.model_notice(item, used[-1])  # the depth model's output shapes the result
 
 
 def _src_images(ctx: Ctx, rep: ProgressReporter) -> BackPart:
@@ -956,7 +1094,7 @@ def _src_images(ctx: Ctx, rep: ProgressReporter) -> BackPart:
     )
     ctx.previews["views"] = (ortho, views)
     ctx.previews["views_source"] = "images"
-    relief, depth_fn, used = _relief_fn(ctx)
+    relief, depth_fn, used = _relief_fn(ctx, rep.sub(0.25, 1.0).sub(0.40, 0.45), ortho=ortho)
     part = vl.view_based_back(
         ctx.front,
         ctx.canon,
@@ -982,8 +1120,16 @@ def _src_images(ctx: Ctx, rep: ProgressReporter) -> BackPart:
             notes = [*dropped, str(diag["warning"])] if diag.get("warning") else dropped
             diag["warning"] = " ".join(dict.fromkeys(notes))
     part.diag = diag
-    if part.ok and (diag.get("relief") or {}).get("source") == "depth" and used:
-        run.model_notice(item, used[-1])  # the depth model's output shapes the result
+    if part.ok:
+        from .sharp360_ai import face_scores, with_face_check
+
+        # a face on the user's own back photo is only a warning (it may be a real photo)
+        back_file = next((str(v.meta.get("file", v.name)) for v in views if _is_back(v.phi_deg)), "")
+        what = f"your back photo ({back_file})" if back_file else "your back photo"
+        part = with_face_check(
+            part, face_scores([v for v in views if _is_back(v.phi_deg)], run), reject=False, what=what
+        )
+        _relief_notice(run, item, part.diag, used)
     return part
 
 
@@ -1015,6 +1161,7 @@ class _ViewSet:
     part: BackPart | None = None
     error: str = ""
     seconds: float = 0.0
+    used: list[str] = field(default_factory=list)  # relief models that shaped THIS set (licence notice)
 
     def summary(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -1305,12 +1452,13 @@ def _src_mvadapter(ctx: Ctx, rep: ProgressReporter) -> BackPart:
     # ---- lift every set, keep the one that fits best
     ready = [t for t in sets if t.cameras is not None]
     seg = _view_segmenter(run) if ready else None
-    relief, depth_fn, used = _relief_fn(ctx)
     span = 0.2 / max(1, len(ready))
     for k, t in enumerate(ready):
         lo = 0.8 + k * span
         label = "" if len(sets) == 1 else f" (set {t.index}/{len(sets)})"
         rep(lo, f"Lining up the AI views{label}")
+        # per set: which relief model shaped it (SHARP may fail on one set only) and its progress range
+        relief, depth_fn, t.used = _relief_fn(ctx, rep.sub(lo, lo + span).sub(0.40, 0.45), ortho=ortho)
         t0 = time.perf_counter()
         try:
             assert t.cameras is not None
@@ -1334,6 +1482,10 @@ def _src_mvadapter(ctx: Ctx, rep: ProgressReporter) -> BackPart:
             )
             if dropped:
                 t.part.diag = {**(t.part.diag or {}), "dropped": dropped}
+            if t.part.ok:  # a set whose back view shows a face is not used (design 3.5.6 / M6)
+                from .sharp360_ai import face_scores, with_face_check
+
+                t.part = with_face_check(t.part, face_scores(t.views, run), reject=True)
         except Cancelled:
             raise
         except (InputError, OSError) as e:  # an unreadable picture / camera file of this set
@@ -1392,8 +1544,7 @@ def _src_mvadapter(ctx: Ctx, rep: ProgressReporter) -> BackPart:
     run.addon_notice(item, manifest)  # its output is in the result from here on
     if seg is not None and any(getattr(v, "meta", {}).get("matte") == "segmenter" for v in chosen.views):
         run.model_notice(item, str(getattr(seg, "resolved", None) or getattr(seg, "id", "") or ""))
-    if (diag.get("relief") or {}).get("source") == "depth" and used:
-        run.model_notice(item, used[-1])  # the depth model's output shapes the result
+    _relief_notice(run, item, part.diag, chosen.used)  # the chosen set's relief, not the last one's
     log.info(
         "MV-Adapter back: set %d/%d (seed %d%s), %d Gaussians, QC %.3f",
         chosen.index,
@@ -1407,6 +1558,20 @@ def _src_mvadapter(ctx: Ctx, rep: ProgressReporter) -> BackPart:
     return part
 
 
+def _src_qwen(ctx: Ctx, rep: ProgressReporter) -> BackPart:
+    """The Qwen photo editor back (experimental; :func:`vrphoto.pipeline.sharp360_ai._src_qwen`)."""
+    from .sharp360_ai import _src_qwen as src
+
+    return src(ctx, rep)
+
+
+def _src_comfyui(ctx: Ctx, rep: ProgressReporter) -> BackPart:
+    """Your own ComfyUI server (expert; :func:`vrphoto.pipeline.sharp360_ai._src_comfyui`)."""
+    from .sharp360_ai import _src_comfyui as src
+
+    return src(ctx, rep)
+
+
 #: Back sources by id: ``fn(ctx, rep) -> BackPart`` in frame C.  A source raises (or returns
 #: ``ok=False`` with a plain-language ``reason``) when it cannot make a back.
 SOURCES: dict[str, Callable[[Ctx, ProgressReporter], BackPart]] = {
@@ -1414,6 +1579,8 @@ SOURCES: dict[str, Callable[[Ctx, ProgressReporter], BackPart]] = {
     "trellis": _src_trellis,
     "images": _src_images,
     "mvadapter": _src_mvadapter,
+    "qwen": _src_qwen,
+    "comfyui": _src_comfyui,
 }
 
 
@@ -1759,11 +1926,20 @@ def mode_sharp360(
     frame = str(outs.get("frame", "opencv") or "opencv").lower()
     if frame != "opencv":
         log.warning("SHARP reported frame %r; SHARP 360 assumes OpenCV camera coordinates", frame)
-    sc_full = read_splats(ply)
+    sc_full, _rows, n_file = read_splats(ply, return_rows=True)
     if not len(sc_full):
         raise AddonError(
             f"{manifest.title} returned an empty 3D result.",
             hint=f"Try again; if it keeps happening, reinstall the add-on in the {UI_ADDONS}.",
+        )
+    # M6 provenance: SHARP writes its Gaussians in grid order, so the grid is detected from the
+    # file's row count (rows with NaN positions / scales - the last ones too - were dropped by read_splats)
+    dbg["sharp"] = {"gaussians": len(sc_full), "file_rows": n_file, "dropped_rows": n_file - len(sc_full)}
+    if n_file > len(sc_full):
+        log.warning(
+            "SHARP 360: %d of SHARP's %d Gaussians were not finite and were dropped",
+            n_file - len(sc_full),
+            n_file,
         )
     t = lap("sharp", t)
     run.check()
@@ -1771,7 +1947,7 @@ def mode_sharp360(
     # ---- 2. clean the front, find the upright frame
     rep(0.25, "Cleaning the SHARP front (removing background layers and edge streaks)")
     try:
-        cam = SharpCam.from_outputs(outs, params, n_raw=len(sc_full), shape=alpha.shape)
+        cam = SharpCam.from_outputs(outs, params, n_raw=n_file, shape=alpha.shape)
         dbg["camera"] = {k: getattr(cam, k) for k in ("f", "width", "height", "n_raw", "grid", "layers")}
         front = sharp_front(
             sc_full,
@@ -1808,6 +1984,8 @@ def mode_sharp360(
     attempts: list[dict[str, Any]] = []
     part = run_sources(ctx, rep.sub(0.30, 0.72), attempts)
     dbg["sources"] = attempts
+    if ctx.relief:
+        dbg["relief"] = ctx.relief
     if part is not None:
         dbg["back"] = {"source": part.source, "kind": part.kind, "n": len(part.sc), "diag": part.diag or {}}
         warning = (part.diag or {}).get("warning")
@@ -2103,6 +2281,7 @@ __all__ = [
     "MAX_TRIES",
     "MV_DEFAULT_PROMPT",
     "MV_STEPS_RANGE",
+    "NEVER_AUTO",
     "POLISH_STEPS_RANGE",
     "PREVIEW_VIEWS",
     "PROMPT_SOURCES",

@@ -7,7 +7,8 @@ Top-level keys::
 
     id, title, description, version, experimental, license, noncommercial,
     region_restricted (ISO 3166-1 alpha-2 codes where the license does NOT apply),
-    min_vram_gb, disk_gb, kind ("venv" | "binary"), python ("3.11"), hf_gated, homepage,
+    min_vram_gb, min_ram_gb (system memory; advisory, shown in the UI), disk_gb,
+    kind ("venv" | "binary"), python ("3.11"), hf_gated, homepage,
     tasks (list), worker (file in addons/workers; required for kind="venv"),
     notes, platforms (sys.platform values; empty = all), cwd (worker cwd, relative to
     the add-on folder), entry ("module:function" for kind="binary" tasks),
@@ -106,6 +107,7 @@ _TOP_KEYS: dict[str, tuple[type | tuple[type, ...], bool]] = {
     "noncommercial": (bool, False),
     "region_restricted": (list, False),
     "min_vram_gb": ((int, float), False),
+    "min_ram_gb": ((int, float), False),
     "disk_gb": ((int, float), False),
     "kind": (str, True),
     "python": (str, False),
@@ -162,6 +164,8 @@ class AddonManifest:
     binaries: dict[str, dict] = field(default_factory=dict)
     path: Path | None = None
     sha256: str = ""
+    #: System memory (GB) the add-on needs; advisory (the UI shows it, the worker enforces its own limit).
+    min_ram_gb: float = 0.0
 
     # ----------------------------------------------------------------- derived
     @property
@@ -201,6 +205,8 @@ class AddonManifest:
         if self.min_vram_gb:
             gpu = "an NVIDIA GPU" if self.kind == "venv" else "a GPU"
             out.append(f"Needs {gpu} with at least {self.min_vram_gb:g} GB VRAM.")
+        if self.min_ram_gb:
+            out.append(f"Needs at least {self.min_ram_gb:g} GB of system memory (RAM).")
         if self.disk_gb:
             out.append(f"Download/disk space: about {self.disk_gb:g} GB.")
         if not self.supported:
@@ -223,6 +229,7 @@ class AddonManifest:
             "noncommercial": self.noncommercial,
             "region_restricted": list(self.region_restricted),
             "min_vram_gb": self.min_vram_gb,
+            "min_ram_gb": self.min_ram_gb,
             "disk_gb": self.disk_gb,
             "kind": self.kind,
             "python": self.python,
@@ -379,7 +386,7 @@ def parse_manifest(data: dict[str, Any], path: Path, *, sha256: str = "") -> Add
     bad = [p for p in platforms if p not in PLATFORMS]
     if bad:
         raise _err(path, f"platforms: unknown platform(s) {bad}")
-    for key in ("min_vram_gb", "disk_gb"):
+    for key in ("min_vram_gb", "min_ram_gb", "disk_gb"):
         if float(data.get(key, 0)) < 0:
             raise _err(path, f"{key} must not be negative")
     steps_raw = data["steps"]
@@ -424,6 +431,7 @@ def parse_manifest(data: dict[str, Any], path: Path, *, sha256: str = "") -> Add
         noncommercial=bool(data.get("noncommercial", False)),
         region_restricted=region,
         min_vram_gb=float(data.get("min_vram_gb", 0)),
+        min_ram_gb=float(data.get("min_ram_gb", 0)),
         disk_gb=float(data.get("disk_gb", 0)),
         python=python,
         kind=kind,

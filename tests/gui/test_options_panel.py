@@ -236,6 +236,8 @@ SOURCES = (
     ("trellis", False, True, False),
     ("images", True, False, False),
     ("mvadapter", False, True, True),
+    ("qwen", False, True, True),
+    ("comfyui", False, True, True),
 )
 
 
@@ -640,3 +642,39 @@ def test_lenient_values_skip_invalid_entries(panel_factory):
         p.options_dict()
     d = p.options_dict(strict=False)
     assert "keyframes" not in d and d["common"]["depth_model"] == "moge2"
+
+
+def test_comfyui_options_are_checked_before_the_job(panel_factory, tmp_path):
+    """'Your own ComfyUI': the address and the workflow are checked at 'Create' with the job's
+    own rules; the workflow dialog offers .json files; greyed out for the other sources."""
+    p = panel_factory("object", show_experimental=True)
+    assert "comfyui" in p.form.editors["back_source"].values()
+    p.form.set_values({"method": "sharp360", "back_source": "comfyui"})
+    assert p.form.editors["comfyui_url"].isEnabled() and p.form.editors["comfyui_workflow"].isEnabled()
+    assert "*.json" in p.form.editors["comfyui_workflow"].name_filter()
+    with pytest.raises(InputError, match="needs a workflow file"):
+        p.build_spec(["x.jpg"])
+    ui = tmp_path / "ui.json"
+    ui.write_text(json.dumps({"nodes": [], "links": []}), encoding="utf-8")
+    p.form.set_values({"comfyui_workflow": str(ui)})
+    with pytest.raises(InputError, match="API format") as e:
+        p.build_spec(["x.jpg"])
+    assert "Export (API)" in e.value.hint
+    api = tmp_path / "api.json"
+    api.write_text(
+        json.dumps({"1": {"class_type": "LoadImage", "inputs": {"image": "{{IMAGE}}"}}}), encoding="utf-8"
+    )
+    p.form.set_values({"comfyui_workflow": str(api), "comfyui_url": "ftp://x"})
+    with pytest.raises(InputError, match="not an address"):
+        p.build_spec(["x.jpg"])
+    p.form.set_values({"comfyui_url": "127.0.0.1:8188"})
+    spec = p.build_spec(["x.jpg"])
+    assert (spec.back_source, spec.comfyui_workflow, spec.comfyui_url) == (
+        "comfyui",
+        str(api),
+        "127.0.0.1:8188",
+    )
+    p.form.set_values({"back_source": "qwen"})  # greyed out: kept, not checked
+    assert not p.form.editors["comfyui_workflow"].isEnabled()
+    p.form.set_values({"comfyui_workflow": str(ui)})
+    assert p.build_spec(["x.jpg"]).comfyui_workflow == str(ui)

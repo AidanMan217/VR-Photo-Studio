@@ -307,6 +307,33 @@ _BUILTIN: tuple[ModelSpec, ...] = (
         notes="rembg release asset (md5 from rembg sessions/u2net.py).",
         homepage="https://github.com/xuebinqin/U-2-Net",
     ),
+    ModelSpec(
+        id="yunet",
+        task="segment",
+        title="YuNet face detector (checks AI back views)",
+        repo="",
+        # opencv_zoo commit; the file is a Git LFS object, so the URL is the LFS media host
+        # (github.com/opencv/opencv_zoo/raw/<commit>/... redirects there)
+        revision="47534e27c9851bb1128ccc0102f1145e27f23f98",
+        files=("face_detection_yunet_2023mar.onnx",),
+        url=(
+            "https://media.githubusercontent.com/media/opencv/opencv_zoo/"
+            "47534e27c9851bb1128ccc0102f1145e27f23f98/models/face_detection_yunet/"
+            "face_detection_yunet_2023mar.onnx"
+        ),
+        sha256={"face_detection_yunet_2023mar.onnx": "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"},
+        sizes={"face_detection_yunet_2023mar.onnx": 232589},
+        size_mb=0.23,
+        license="MIT",
+        experimental=True,
+        notes=(
+            "Optional helper for 'SHARP 360': rejects an AI back view that shows a face "
+            "(segment/faces.py). Run by OpenCV's cv2.FaceDetectorYN, not onnxruntime; without it "
+            "the check is skipped. Faces of about 10-300 px; 15 outputs per face (box, 5 "
+            "landmarks, score)."
+        ),
+        homepage="https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet",
+    ),
 )
 
 BASE_MODELS: dict[str, ModelSpec] = {s.id: s for s in _BUILTIN}

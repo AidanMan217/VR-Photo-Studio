@@ -4,6 +4,59 @@ All notable changes to VR Photo Studio are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**SHARP 360°: SHARP relief, face check (M6) and the AI photo-editor backs (M7, experimental).**
+Design: `docs/design/SHARP360.md` (sections 3.5.6 and 4.4). Nothing here has run with the real models
+on a GeForce GTX 1080 yet; the times are estimates.
+
+### Added
+
+- **Qwen photo editor add-on (`qwenedit`, experimental, slow, about 30 GB):** Qwen-Image-Edit-2511
+  (Q4_K_M GGUF), the Qwen2.5-VL-7B text encoder (GGUF), fal's Multiple-Angles camera LoRA and the
+  4-step Lightning LoRA, run by a pinned, headless ComfyUI (v0.39.2 with ComfyUI-GGUF) that the add-on
+  starts as a separate program. Needs 16 GB of system memory (32 GB recommended; the manifest's new
+  `min_ram_gb`, shown in the Add-ons window); several minutes per view on a GTX 1080. Out-of-memory
+  ladder (less graphics memory, smaller pictures, skip the view), a full-precision retry for black
+  pictures, and every finished view kept when a run fails or is cancelled.
+- **SHARP 360° back made by the Qwen photo editor** (*Back made by: Qwen photo editor*, experimental,
+  never *Automatic*): the plain cut-out on light grey -> back views (one per *AI attempt*) -> the one
+  that fits the photo's outline best and shows no face -> left / right side views (with *Best* also
+  the back quarters) made with the chosen back as a second picture -> lined up and lifted like back
+  photos. The views go to the view cache, so a re-run with other stitching options skips the
+  minutes of painting. 15-60 minutes per person (estimate).
+- **SHARP 360° back from your own ComfyUI** (*Back made by: Your own ComfyUI*, expert): the app
+  uploads the cut-out to your ComfyUI server and queues your API-format workflow once per view with
+  `{{IMAGE}} {{PROMPT}} {{SEED}} {{AZIMUTH}} {{WIDTH}} {{HEIGHT}}` filled in (new options *ComfyUI
+  address* and *ComfyUI workflow*, also `--comfyui-url` / `--comfyui-workflow`). A workflow file
+  that is missing, saved in ComfyUI's normal format or lacks `{{IMAGE}}` stops the job before any
+  work; a server that does not answer or rejects the workflow is a note and the built-in back.
+- **Face check (YuNet):** an AI back view that shows a frontal face (the AI painted the front onto
+  the back of the head) is not used - Qwen / ComfyUI back candidates and MV-Adapter sets; a face on
+  your own back photo is only a note. The 0.23 MB OpenCV model downloads on first use; without it
+  the check is skipped.
+- **Back detail: Sharp:** SHARP runs once more on the lined-up back view (the SHARP add-on now takes
+  a list of pictures) and its 3D surface shapes the back's relief; *Automatic* uses it with *Best*
+  quality. If SHARP cannot run, the depth model is used.
+
+### Changed
+
+- The SHARP add-on's worker accepts several pictures in one run (the model loads once); a picture
+  that runs out of graphics memory is made on the CPU and the next one is tried on the GPU again.
+- `read_splats(..., return_rows=True)` also returns the file rows of the Gaussians it kept and the
+  file's own row count, `(cloud, rows, n_file)` (provenance in diagnostics; dropped rows at the end
+  of SHARP's file are counted too).
+- The frozen app includes the add-ons' standard-library ComfyUI client
+  (`vrphoto.addons.workers._comfy`), which the *Your own ComfyUI* source uses.
+
+### Fixed
+
+- Add-on installs: a Hugging Face download step whose file names match nothing in the model's
+  repository now fails with the missing file and `repo@revision` named, instead of downloading
+  nothing and being recorded as done.
+- SHARP 360° with MV-Adapter and several *AI attempts*: the relief model (and its licence notice)
+  recorded for the back is that of the attempt that was kept, not of the last one lined up.
+
 ## [0.3.0b1] - 2026-10-13
 
 **SHARP 360°: MV-Adapter AI views and the Brush polish.** Design: `docs/design/SHARP360.md`

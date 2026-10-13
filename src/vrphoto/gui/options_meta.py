@@ -170,6 +170,8 @@ _FILL_CHOICES = (
     ("outpaint", "AI outpaint (needs the 360 outpaint add-on)"),
 )
 _OUTPAINT_ADDONS = ("sdxl360",)
+#: SHARP 360 back sources made by an AI ('AI attempts' / 'AI steps' apply to them).
+AI_BACK_SOURCES = ("auto", "trellis", "mvadapter", "qwen", "comfyui")
 
 _STRENGTH = FieldMeta(
     "3D strength",
@@ -740,8 +742,13 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             "its back half: real volume (hair, shoulders, a bag) but a soft, flat-lit texture. "
             "'Your own back photo' (no download, about 1-3 minutes) fits a photo of the person from "
             "behind - or a back view made with any AI tool - to the outline; this can look the most "
-            "real (choose the picture under 'Back photo'). If the chosen back cannot be made, the "
-            "next one is used and the job says why.",
+            "real (choose the picture under 'Back photo'). Experimental: 'Qwen photo editor' (add-on, "
+            "about 30 GB, needs 16 GB of memory - 32 GB recommended) turns the person round with a "
+            "photo-editing AI and gives the most photo-like backs, but it is slow on a GTX 1080 "
+            "(several minutes per view, about 15-60 minutes per person); 'Your own ComfyUI' (expert) "
+            "sends the photo to your own ComfyUI server and workflow (see 'ComfyUI workflow'). "
+            "'Automatic' never picks these two. If the chosen back cannot be made, the next one is "
+            "used and the job says why.",
             "combo",
             choices=(
                 ("auto", "Automatic (best installed)"),
@@ -749,10 +756,13 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
                 ("trellis", "TRELLIS (add-on)"),
                 ("images", "Your own back photo"),
                 ("mvadapter", "MV-Adapter AI views (add-on)"),
+                ("qwen", "Qwen photo editor (add-on, experimental, slow)"),
+                ("comfyui", "Your own ComfyUI (expert)"),
             ),
+            experimental_choices=frozenset({"qwen", "comfyui"}),
             enabled_if=("method", ("sharp360",)),
             # optional: a missing AI add-on is a warning and the next back, never a failure
-            addon_choices={"trellis": ("trellis",), "mvadapter": ("mvadapter",)},
+            addon_choices={"trellis": ("trellis",), "mvadapter": ("mvadapter",), "qwen": ("qwenedit",)},
             addon_optional=True,
         ),
         "back_quality": FieldMeta(
@@ -787,14 +797,22 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         ),
         "back_relief": FieldMeta(
             "Back detail",
-            "SHARP 360° with a back made from a picture (your own back photo): how the surface "
-            "of the back gets its shape detail. 'From the picture' lets the depth model add folds, "
-            "hair and clothing relief seen in the back picture (a few seconds more); 'Smooth' keeps "
-            "the rounded shape and only takes the colours from the picture - use it if the back "
-            "looks bumpy or dented. 'Automatic' uses the picture, except with 'Fast' back quality "
-            "(smooth). The built-in shape and TRELLIS do not use this.",
+            "SHARP 360° with a back made from a picture (your own back photo, or AI views): how "
+            "the surface of the back gets its shape detail. 'From the picture' lets the depth model "
+            "add folds, hair and clothing relief seen in the back picture (a few seconds more); "
+            "'Sharp' runs SHARP once more on the back picture and uses its 3D surface - usually the "
+            "crispest relief (about half a minute more on a GTX 1080; if SHARP cannot run, the depth "
+            "model is used); 'Smooth' keeps the rounded shape and only takes the colours from the "
+            "picture - use it if the back looks bumpy or dented. 'Automatic' uses SHARP with 'Best' "
+            "back quality, the depth model with 'Balanced' and a smooth back with 'Fast'. The "
+            "built-in shape and TRELLIS do not use this.",
             "combo",
-            choices=(("auto", "Automatic"), ("depth", "From the picture (depth model)"), ("flat", "Smooth")),
+            choices=(
+                ("auto", "Automatic"),
+                ("depth", "From the picture (depth model)"),
+                ("flat", "Smooth"),
+                ("sharp", "Sharp (SHARP on the back view, slower)"),
+            ),
             advanced=True,
             enabled_if=("method", ("sharp360",)),
         ),
@@ -810,10 +828,12 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         ),
         "back_tries": FieldMeta(
             "AI attempts",
-            "SHARP 360° with an AI-made back (MV-Adapter or TRELLIS, also under 'Automatic'): how "
-            "many backs the AI makes; the one that fits your photo best is kept. 'Automatic' makes "
-            "1 attempt (2 with 'Best' back quality). Each attempt takes roughly 2-5 minutes on a "
-            "GTX 1080 (MV-Adapter: 3-7 minutes). Change 'Variation' to get different attempts.",
+            "SHARP 360° with an AI-made back (MV-Adapter or TRELLIS, also under 'Automatic', the Qwen "
+            "photo editor or your own ComfyUI): how many backs the AI makes; the one that fits your "
+            "photo best is kept (with the photo editors: back views showing a face are never used). "
+            "'Automatic' makes 1 attempt (2 with 'Best' back quality). Each attempt takes roughly "
+            "2-5 minutes on a GTX 1080 (MV-Adapter: 3-7 minutes; the Qwen photo editor: several "
+            "minutes per back view). Change 'Variation' to get different attempts.",
             "spin",
             minimum=0,
             maximum=4,
@@ -821,15 +841,17 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             zero_label="Automatic",
             advanced=True,
             enabled_if=("method", ("sharp360",)),
-            enabled_if_all=(("back_source", ("auto", "trellis", "mvadapter")),),
+            enabled_if_all=(("back_source", AI_BACK_SOURCES),),
         ),
         "back_steps": FieldMeta(
             "AI steps",
-            "SHARP 360° with an AI-made back (MV-Adapter or TRELLIS, also under 'Automatic'): how "
-            "many refining steps the AI takes per attempt. More steps can give a cleaner, more "
-            "detailed result but take longer. 'Automatic' uses TRELLIS 12 (25 with 'Best' back "
-            "quality) and MV-Adapter 20 / 30 / 50 (Fast / Balanced / Best); on a GTX 1080 the AI "
-            "part of an attempt takes roughly twice as long with twice the steps.",
+            "SHARP 360° with an AI-made back (MV-Adapter or TRELLIS, also under 'Automatic', or the "
+            "Qwen photo editor): how many refining steps the AI takes per attempt. More steps can "
+            "give a cleaner, more detailed result but take longer. 'Automatic' uses TRELLIS 12 (25 "
+            "with 'Best' back quality), MV-Adapter 20 / 30 / 50 (Fast / Balanced / Best) and the "
+            "Qwen photo editor 4 (what its Lightning LoRA is made for; up to 40); on a GTX 1080 the AI part of an "
+            "attempt takes roughly twice as long with twice the steps. Your own ComfyUI workflow "
+            "keeps its own steps.",
             "spin",
             minimum=0,
             maximum=100,
@@ -837,11 +859,12 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             zero_label="Automatic",
             advanced=True,
             enabled_if=("method", ("sharp360",)),
-            enabled_if_all=(("back_source", ("auto", "trellis", "mvadapter")),),
+            enabled_if_all=(("back_source", AI_BACK_SOURCES),),
         ),
         "back_prompt": FieldMeta(
             "Describe the hidden side",
-            "SHARP 360° with MV-Adapter AI views (also under 'Automatic'): a few words about what "
+            "SHARP 360° with MV-Adapter AI views (also under 'Automatic'), the Qwen photo editor or "
+            "your own ComfyUI ({{PROMPT}}): a few words about what "
             "the photo cannot show, so the AI paints the right back and sides - for example 'long "
             "brown ponytail, black backpack' or 'grey hoodie, short hair'. Describe the person or "
             "object as a whole, not the camera or the background. Leave it empty for a neutral "
@@ -851,7 +874,38 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             placeholder="e.g. long brown ponytail, black backpack",
             advanced=True,
             enabled_if=("method", ("sharp360",)),
-            enabled_if_all=(("back_source", ("auto", "mvadapter")),),
+            enabled_if_all=(("back_source", ("auto", "mvadapter", "qwen", "comfyui")),),
+        ),
+        "comfyui_url": FieldMeta(
+            "ComfyUI address",
+            "SHARP 360° with 'Your own ComfyUI' (expert): the address of your running ComfyUI "
+            "server, as ComfyUI prints it when it starts (http://127.0.0.1:8188 when it runs on this "
+            "PC). If ComfyUI does not answer, the built-in back is used and the job says so. "
+            "ComfyUI may share the graphics card with VR Photo Studio: the app frees its own AI "
+            "models first.",
+            "text",
+            placeholder="http://127.0.0.1:8188",
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+            enabled_if_all=(("back_source", ("comfyui",)),),
+        ),
+        "comfyui_workflow": FieldMeta(
+            "ComfyUI workflow",
+            "SHARP 360° with 'Your own ComfyUI' (expert): your image-editing workflow in ComfyUI's "
+            "API format (Workflow menu > Export (API)). Open the .json in a text editor and write "
+            "these placeholders where the values go: {{IMAGE}} (required: the image name of the "
+            "'Load Image' node - the app uploads the cut-out person on light grey), {{PROMPT}} (the "
+            "wanted view, e.g. 'the same person seen from directly behind', plus 'Describe the "
+            "hidden side'), {{SEED}} ('Variation', + 1 per attempt), {{AZIMUTH}} (the view's angle "
+            "in degrees: 180 = from behind, 90 = from the person's left, 270 = from their right), "
+            "{{WIDTH}} and {{HEIGHT}} (the picture size, long side 768). The workflow runs once per "
+            "view (the back, then the sides); its last 'Save Image' picture is used.",
+            "file",
+            placeholder="Choose the workflow (API format) .json",
+            file_filter="comfyui_workflow",
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+            enabled_if_all=(("back_source", ("comfyui",)),),
         ),
         "polish": FieldMeta(
             "Brush polish",

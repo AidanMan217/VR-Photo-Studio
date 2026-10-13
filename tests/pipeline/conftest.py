@@ -13,6 +13,15 @@ import pytest
 NO_MODELS = {"depth_model": "heuristic", "inpaint_model": "opencv", "segment_model": "grabcut"}
 
 
+@pytest.fixture(autouse=True)
+def no_face_model(monkeypatch):
+    """No YuNet download in the pipeline tests: the SHARP 360 face check of AI back views is
+    skipped (as offline) unless a test monkeypatches ``faces.frontal_face_score`` itself."""
+    from vrphoto.segment import faces
+
+    monkeypatch.setattr(faces, "get_detector", lambda **kw: None)
+
+
 @pytest.fixture
 def out_dir(tmp_path) -> Path:
     d = tmp_path / "out"

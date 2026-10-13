@@ -225,7 +225,8 @@ puts behind the person, **adds a back**, and makes the result life-size, so in t
 person stands on your floor and you can walk all the way round.
 
 It needs only the **SHARP** add-on (see [section 8](#8-add-ons)); turn on *Show experimental
-features* in Settings to see the method. The back can come from four places (*Back made by*):
+features* in Settings to see the method. The back can come from four places (*Back made by*),
+plus two experimental ones described further down (*Qwen photo editor* and *Your own ComfyUI*):
 
 * **Built-in shape** (no download): the outline "inflated" into a smooth, rounded back in the
   colours from around the person's outline - like the person from behind in soft focus.
@@ -242,17 +243,23 @@ features* in Settings to see the method. The back can come from four places (*Ba
 * **Your own back photo** (no download): a photo of the same person from behind - or a back
   view you made with any AI photo tool - bent onto the outline of your front photo. Optional
   side photos make the sides more accurate. This can look the most real.
+* **Qwen photo editor** (experimental add-on, about 30 GB, **slow**): a photo-editing AI turns
+  the person round; the most photo-like AI backs, at several minutes per view on a GTX 1080 (see
+  *The Qwen photo-editor back* below).
+* **Your own ComfyUI** (expert, no download): your own ComfyUI server runs your own image-editing
+  workflow (see *Your own ComfyUI* below).
 
 | Option | What it does | Recommended |
 |---|---|---|
-| Back made by | *Automatic* uses MV-Adapter when its add-on is installed, else TRELLIS when that is installed, else the built-in shape (with *Fast* back quality always the built-in shape; it never picks your own back photo). *Built-in shape*, *MV-Adapter AI views*, *TRELLIS* or *Your own back photo* choose one. If the chosen back cannot be made, the next one is used and a note says why. | Automatic |
+| Back made by | *Automatic* uses MV-Adapter when its add-on is installed, else TRELLIS when that is installed, else the built-in shape (with *Fast* back quality always the built-in shape; it never picks your own back photo, the Qwen photo editor or your own ComfyUI). *Built-in shape*, *MV-Adapter AI views*, *TRELLIS*, *Your own back photo* or - with *Show experimental features* - *Qwen photo editor* and *Your own ComfyUI* choose one. If the chosen back cannot be made, the next one is used and a note says why. | Automatic |
 | Back photo | (Your own back photo) the picture of the back; side photos in the same folder are found by their names (see *Taking the back and side photos* below). | - |
 | Back quality | *Fast* builds a coarser back, never runs an AI back by itself and makes small previews; *Balanced*; *Best* builds the finest back surface, gives MV-Adapter and TRELLIS more steps and two attempts, and (with *Brush polish* on *Automatic*) polishes a back made from views (slower). The photographed front is the same with all three. | Balanced |
 | Thickness / Back side | As for Billboard: how deep the built-in back is (and a back photo's, unless side photos show it), and its colours. SHARP 360° keeps *Thickness* within 0.06-0.18, because its back is life-size (the presets set *Thickness* for Billboard; a note says when it was changed). | 0.11, soft colours |
-| Back detail *(Advanced)* | (Your own back photo) *From the picture* lets the depth model add folds, hair and clothing relief seen in the back photo; *Smooth* keeps the rounded shape and only takes the colours. *Automatic* uses the picture (smooth with *Fast*, or when only the built-in *Heuristic* depth model is available). | Automatic |
+| Back detail *(Advanced)* | (A back made from pictures: your own back photo, MV-Adapter, the Qwen photo editor, your own ComfyUI) *From the picture* lets the depth model add folds, hair and clothing relief seen in the back picture; *Sharp* runs SHARP once more on the lined-up back picture and uses its 3D surface - usually the crispest relief, about half a minute more on a GTX 1080 (if SHARP cannot run, the depth model is used and a note says so); *Smooth* keeps the rounded shape and only takes the colours. *Automatic* uses SHARP with *Best*, the depth model with *Balanced* (smooth when only the built-in *Heuristic* depth model is available) and a smooth back with *Fast*. | Automatic |
 | Match colours to the photo *(Advanced)* | Adjusts the brightness and colours of the AI back (MV-Adapter, TRELLIS) or your back photo to the front photo, so the join does not show as a change of light. Turn it off if your back photo already has the right colours. | On |
-| AI attempts / AI steps *(Advanced)* | (MV-Adapter, TRELLIS) how many backs the AI makes - the best-fitting one is kept - and how many refining steps each takes. *Automatic*: 1 attempt (2 for *Best*); TRELLIS 12 steps (25 for *Best*), MV-Adapter 20 / 30 / 50 steps for *Fast* / *Balanced* / *Best*. Each attempt takes a few minutes. | Automatic |
-| Describe the hidden side *(Advanced)* | (MV-Adapter) a few words about what the photo cannot show, for example *long brown ponytail, black backpack*. Empty: a neutral description. See *The MV-Adapter back* below. | Empty |
+| AI attempts / AI steps *(Advanced)* | (MV-Adapter, TRELLIS, the Qwen photo editor, your own ComfyUI) how many backs the AI makes - the best-fitting one is kept - and how many refining steps each takes. *Automatic*: 1 attempt (2 for *Best*); TRELLIS 12 steps (25 for *Best*), MV-Adapter 20 / 30 / 50 steps for *Fast* / *Balanced* / *Best*, the Qwen photo editor 4 steps (what its Lightning LoRA is made for; up to 40). Your own ComfyUI workflow keeps its own steps. Each attempt takes a few minutes (the Qwen photo editor: several minutes per back view). | Automatic |
+| Describe the hidden side *(Advanced)* | (MV-Adapter, the Qwen photo editor, your own ComfyUI) a few words about what the photo cannot show, for example *long brown ponytail, black backpack*. Empty: a neutral description. See *The MV-Adapter back* below. | Empty |
+| ComfyUI address / ComfyUI workflow *(Advanced)* | (Your own ComfyUI) the address of your ComfyUI server and your workflow file in ComfyUI's API format; see *Your own ComfyUI* below. | http://127.0.0.1:8188 |
 | Brush polish *(Advanced)* | (A back made from views: MV-Adapter or your own back photo) Brush - the trainer of the Capture add-on - trains the finished splat against all the pictures at once, so the views agree with each other and the join softens; SHARP's photographed front is put back exactly afterwards. *Automatic*: only with *Best* back quality and after a passed Brush test (see below); *On*: whenever possible (a note says when it is not); *Off*. If the polish fails, the unpolished result is kept. | Automatic |
 | Brush steps *(Advanced)* | How long Brush trains (1000-30000). | 5000 |
 | Keep the photo up to *(Advanced)* | Where SHARP's photo ends and the made-up back begins: the photo is kept wherever the body faces the camera within this angle and blended into the back over the next 10-20°. Higher keeps more of the sharp photo on the sides but can show stretched edges. | 60° |
@@ -306,6 +313,72 @@ features* in Settings to see the method. The back can come from four places (*Ba
   saves each attempt as soon as it is finished: if the second attempt runs out of memory, the
   first one is used; after a cancel, the finished attempts are not painted again next time.
 
+**The Qwen photo-editor back** (experimental; the *Qwen photo editor* add-on, see
+[section 8](#8-add-ons); *Show experimental features* must be on):
+
+* **What it is:** Qwen-Image-Edit-2511, a photo-editing AI, with a "camera angle" add-on that
+  turns the person round, run by a private copy of ComfyUI that the add-on installs and starts by
+  itself (you do not need to know ComfyUI). It gets the plain cut-out of the person on light grey
+  and makes **back views** first (one per *AI attempt*); the app keeps the one that fits your
+  photo's outline best and **never uses a back view that shows a face** (the AI sometimes paints
+  the front onto the back of the head; a small face detector checks every back view). Then it
+  makes the **side views** (left and right; with *Best* also the two back quarters) with the
+  chosen back as a second picture, so the sides match it. *Fast* makes the back view only. The
+  views are lined up like your own back photos.
+* **What to expect:** the most photo-like AI backs - real-looking fabric, hair and folds - but
+  each view is a separate picture, so the pose can drift a little (a back that does not fit is
+  not used: you get a note and the built-in back).
+* **Time, honestly:** it is **slow on a GeForce GTX 1080** - the card has no fast half-precision
+  maths, so every view takes **several minutes** (estimate), and a whole person **15-60 minutes**
+  (more with *Best* or more *AI attempts*). The first run also starts ComfyUI and loads about
+  20 GB of models (a few minutes). The default is 4 *AI steps*, which its Lightning LoRA is made
+  for; without that LoRA (its download is optional) every view takes 40 steps - about 20 times
+  longer - and a note says so. When a run is slow, a note says how long it took.
+* **What it needs:** about **30 GB** of disk space; an NVIDIA graphics card with 6 GB or more;
+  at least **16 GB of system memory (RAM)** - **32 GB recommended**. With less than 16 GB the add-on
+  refuses to run (you get a note and the built-in back); with 16-24 GB it runs without ComfyUI's
+  memory cache (slower). Close games and browsers with many tabs first.
+* **Made once, re-used:** like MV-Adapter's, the views are kept in the view cache, so running
+  the same photo again with another *Keep the photo up to*, *Back quality* or *Brush polish* skips
+  the minutes of painting; after a failure or a cancel the finished views are kept too.
+* If a view runs out of memory, the add-on restarts ComfyUI with less graphics memory, then makes
+  the pictures a bit smaller, then skips the view (with a note).
+
+**Your own ComfyUI** (expert; *Show experimental features* must be on): if you run
+[ComfyUI](https://github.com/comfyanonymous/ComfyUI) yourself, the app can send the cut-out to
+your server and use **your own** image-editing workflow (FLUX Kontext, Qwen with other LoRAs, ...)
+to make the back and side views. Nothing is installed; your server, models and licences are your
+own.
+
+1. In ComfyUI, build a workflow that turns a person round from one picture and saves the result
+   with a *Save Image* node. Check it works by hand.
+2. Save it with **Workflow → Export (API)** - the normal *Save* format does not work (the app says
+   so).
+3. Open the exported `.json` in a text editor and write these **placeholders** where the values go
+   (with the double braces, inside the quotes):
+   * `{{IMAGE}}` (**required**) - the image name of the *Load Image* node: the app uploads the
+     cut-out person on light grey and puts its name here;
+   * `{{PROMPT}}` - the text: the wanted view (for example *the same person seen from directly
+     behind (back view), full body, same pose, same clothes, plain light grey background*) followed
+     by *Describe the hidden side*;
+   * `{{SEED}}` - the seed (*Variation*; + 1 for each further attempt);
+   * `{{AZIMUTH}}` - the view's angle in degrees: 180 = from behind, 90 = from the person's left
+     ("you walked to your right"), 270 = from their right, 135 / 225 the back quarters (handy for
+     angle LoRAs or a file name prefix);
+   * `{{WIDTH}}`, `{{HEIGHT}}` - the picture size (the cut-out's shape, long side 768).
+   A number placeholder alone in its value (`"seed": "{{SEED}}"`) becomes a number. Other
+   `{{...}}` names are refused.
+4. In VR Photo Studio choose *Back made by: Your own ComfyUI*, enter the server's address under
+   *ComfyUI address* (`http://127.0.0.1:8188` when ComfyUI runs on this PC) and pick the file under
+   *ComfyUI workflow*.
+
+The workflow runs once per view (the back views, then the sides; references are not passed, so
+the sides are made from the cut-out alone) and the last *Save Image* picture of each run is used;
+the app chooses the back and lines the views up exactly as for the Qwen photo editor. If ComfyUI
+is not running, rejects the workflow (a missing node or model) or fails, you get a note with
+ComfyUI's own message and the built-in back. A cancel stops the running prompt. The app frees its
+own AI models first, in case ComfyUI shares the graphics card.
+
 **Brush polish and the Brush test:** the polish needs the **Capture to 3D** add-on (it brings
 Brush). Brush's behaviour on older graphics cards (GeForce 10-series) is not known in advance, so
 test it once: open **Add-ons**, select *Capture to 3D* and click **Test Brush on this PC** (or run
@@ -326,8 +399,10 @@ headset on):
 
 * `<name>_sharp360_preview.jpg` - the finished splat from 8 directions around the person (0° is
   the photo's side, 90° from the person's left, 180° from behind).
-* `<name>_sharp360_views.png` - only with *MV-Adapter AI views* or *Your own back photo*: the
-  levelled front photo and the AI views (or your back and side photos) as the app lined them up.
+* `<name>_sharp360_views.png` - only with *MV-Adapter AI views*, *Your own back photo*, the *Qwen
+  photo editor* or *Your own ComfyUI*: the levelled front photo and the AI views (or your back and
+  side photos) as the app lined them up; back views that were not chosen (for example because they
+  show a face) are shown too.
   Green is the outline the app expected, blue the person found in the picture; a picture outlined
   in red was not used (the note says why).
 
@@ -347,11 +422,16 @@ headset on):
     by the AI - it can get details wrong. Its colours are matched to your photo.
   * *Your own back photo*: the most real back - your photo's colours and detail on a shape that
     follows the outline (side photos make the sides follow them too). Areas no photo shows (for
-    example between the legs) take neighbouring colours.
+    example between the legs) take neighbouring colours. If the app finds a face on your back
+    photo, a note says so (it is used anyway: check that it really shows the person from behind).
+  * *Qwen photo editor* / *Your own ComfyUI*: the most photo-like AI backs, but each view is
+    painted separately, so details can disagree between the back and the sides.
 * **Time on a GeForce GTX 1080** (estimates): built-in shape 1-2 minutes in all, most of it
   loading SHARP; your own back photo 1-3 minutes; TRELLIS 4-8 minutes (*Best*: two longer
   attempts, about 10-20 minutes); MV-Adapter 6-10 minutes (*Best* with two attempts and the Brush
-  polish: 15-30 minutes). The turntable preview adds a few seconds to about half a minute.
+  polish: 15-30 minutes); the Qwen photo editor 15-60 minutes (several minutes per view). *Back
+  detail: Sharp* adds about half a minute per back. The turntable preview adds a few seconds to
+  about half a minute.
 * **Size:** the splat is saved life-size (feet on the floor), so the viewer shows it 1:1. With
   *Size from: Automatic* and feet or head cut off by the photo edge, SHARP's own estimate is
   used and a note says so.
@@ -617,6 +697,7 @@ Installing downloads PyTorch, NVIDIA CUDA libraries and the AI model (several GB
 | **TRELLIS.2** (experimental) | Newer, more detailed photo-to-3D | NVIDIA, 12 GB+ (16-24 GB recommended) | ~36 GB | MIT + Meta DINOv3 license (needs a Hugging Face token) + **non-commercial** NVIDIA parts |
 | **Hunyuan3D-2** (experimental) | Alternative photo-to-3D by Tencent; a grey shape, or coloured with *Paint texture* | NVIDIA, 6 GB+ (more for textures) | ~16 GB | Tencent community license - **not licensed in the EU, the UK and South Korea** |
 | **MV-Adapter** (experimental) | AI back and side views for *SHARP 360°* (*Back made by: MV-Adapter AI views*): six matching views of the person, including straight from behind | NVIDIA, 6 GB+ (runs on a GTX 1080's 8 GB with part of the model in system memory) | ~14 GB | Apache-2.0 (MV-Adapter) + CreativeML Open RAIL++-M (Stable Diffusion 2.1: use restrictions) |
+| **Qwen photo editor** (experimental, slow) | Photo-like AI back and side views for *SHARP 360°* (*Back made by: Qwen photo editor*): Qwen-Image-Edit-2511 with a camera-angle LoRA, run by a private ComfyUI; several minutes per view on a GTX 1080 | NVIDIA, 6 GB+; **16 GB of system memory (32 GB recommended)** | ~30 GB | Apache-2.0 (Qwen models, LoRAs, ComfyUI-GGUF); ComfyUI GPL-3.0 (runs as a separate program) |
 
 The numbers are guides; the Add-ons window shows each add-on's exact requirements and checks your
 GPU. Experimental add-ons appear when *Show experimental add-ons* (in the Add-ons window) or *Show
@@ -791,6 +872,14 @@ Then choose **Capture**, add all the photos (or the video) as one job, and click
   note like "the generated views do not match the photo's outline" means the AI drew the person in another
   shape or place - try another *Variation*, a short *Describe the hidden side*, or *Best* (two attempts).
   If *Brush polish* never runs, run **Test Brush on this PC** (Add-ons window, *Capture to 3D*) first.
+* **SHARP 360° with the Qwen photo editor:** "needs at least 16 GB" - the PC has too little system memory
+  (RAM) for it; use *Your own back photo* or the built-in back. "a face was found on all back views" - the
+  AI painted the front onto the back of the head; try another *Variation*, more *AI attempts*, or describe
+  the back (*Describe the hidden side*, e.g. "back of the head, long hair"). It is slow on GTX 10-series
+  cards by nature (several minutes per view); *AI steps* 4 halves the time.
+* **SHARP 360° with your own ComfyUI:** "ComfyUI is not running at ..." - start ComfyUI and check the
+  address; "saved in ComfyUI's normal format" - export the workflow with *Export (API)*; "ComfyUI rejected
+  the workflow" - a node or model of the workflow is missing in that ComfyUI (the note names it).
 
 ### Starting fresh
 

@@ -138,9 +138,10 @@ class ObjectJob(JobBase):
     hunyuan_texture: bool = False  # Hunyuan3D add-on: also paint a texture (slower, more VRAM)
     # SHARP 360 (method "sharp360"): SHARP's photo front + a predicted back (docs/design/SHARP360.md)
     back_source: str = "auto"  # auto | shell (built-in) | trellis | images (your own back photo) | mvadapter
+    # | qwen (Qwen photo editor add-on, experimental) | comfyui (your own ComfyUI server, expert)
     back_quality: str = "balanced"  # fast | balanced | best
     back_images: str | None = None  # images source: the back photo (side photos next to it by name)
-    back_relief: str = "auto"  # auto | depth | flat: surface detail of a back made from a picture
+    back_relief: str = "auto"  # auto | depth | flat | sharp: surface detail of a back made from a picture
     color_match: bool = True  # match the back's colours / exposure to the photo
     back_tries: int = 0  # AI back sources: attempts, the best fitting is kept (0 = automatic)
     back_steps: int = 0  # AI back sources: generation steps (0 = automatic)
@@ -150,6 +151,8 @@ class ObjectJob(JobBase):
     seam_deg: float = 60.0  # the photo is used where the surface faces the camera within this angle
     size_from: str = "auto"  # auto | height | photo (SHARP's own metric size)
     save_extras: bool = False  # also save front/back parts, PLY and a debug JSON
+    comfyui_url: str = "http://127.0.0.1:8188"  # comfyui source: the address of your own ComfyUI server
+    comfyui_workflow: str | None = None  # comfyui source: an API-format workflow ({{IMAGE}} ... placeholders)
 
 
 @dataclass

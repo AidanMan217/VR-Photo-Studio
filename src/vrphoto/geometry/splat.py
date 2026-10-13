@@ -34,7 +34,7 @@ import math
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 import numpy as np
 
@@ -283,11 +283,18 @@ def _finite_mask(sc: SplatCloud) -> np.ndarray:
 
 
 def _drop_non_finite(sc: SplatCloud, what: str) -> SplatCloud:
+    return _drop_non_finite_rows(sc, what)[0]
+
+
+def _drop_non_finite_rows(sc: SplatCloud, what: str) -> tuple[SplatCloud, np.ndarray | None]:
+    """``(cloud, rows)``: ``sc`` without its non-finite splats and the int64 indices of the
+    rows kept (None when every row is kept)."""
     ok = _finite_mask(sc)
     if ok.all():
-        return sc
+        return sc, None
     log.warning("%s: ignoring %d splats with non-finite position or scale", what, int((~ok).sum()))
-    return _subset(sc, np.nonzero(ok)[0])
+    rows = np.flatnonzero(ok).astype(np.int64)
+    return _subset(sc, rows), rows
 
 
 def _normalized_quats(q: np.ndarray) -> np.ndarray:
@@ -464,7 +471,7 @@ def _cloud_from_fields(data: dict[str, np.ndarray], n: int, name: str) -> SplatC
         opacity=np.clip(np.nan_to_num(opacity), 0.0, 1.0).astype(np.float32),
         sh_rest=sh_rest,
     )
-    return _drop_non_finite(sc, name)
+    return sc  # read_splats drops the non-finite rows (and can report which were kept)
 
 
 def _write_ply(sc: SplatCloud, path: Path) -> None:
@@ -514,7 +521,7 @@ def _read_dot_splat(path: Path) -> SplatCloud:
         colors=rec["rgba"][:, :3].astype(np.float32) / 255.0,
         opacity=rec["rgba"][:, 3].astype(np.float32) / 255.0,
     )
-    return _drop_non_finite(sc, path.name)
+    return sc  # read_splats drops the non-finite rows
 
 
 def _write_dot_splat(sc: SplatCloud, path: Path) -> None:
@@ -536,8 +543,25 @@ def _write_dot_splat(sc: SplatCloud, path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- public I/O
-def read_splats(path: str | Path) -> SplatCloud:
-    """Read a 3DGS ``.ply`` or antimatter15 ``.splat`` file (coordinates verbatim)."""
+@overload
+def read_splats(path: str | Path, *, return_rows: Literal[False] = False) -> SplatCloud: ...
+
+
+@overload
+def read_splats(path: str | Path, *, return_rows: Literal[True]) -> tuple[SplatCloud, np.ndarray, int]: ...
+
+
+def read_splats(
+    path: str | Path, *, return_rows: bool = False
+) -> SplatCloud | tuple[SplatCloud, np.ndarray, int]:
+    """Read a 3DGS ``.ply`` or antimatter15 ``.splat`` file (coordinates verbatim).
+
+    Splats with a non-finite position or scale are dropped (logged).  With ``return_rows``
+    (diagnostics, e.g. SHARP 360's pixel provenance: SHARP writes its Gaussians in grid
+    order) the result is ``(cloud, rows, n_file)``: ``rows[i]`` is the 0-based index in the
+    file's vertex / record order of the cloud's splat ``i`` (int64, increasing) and ``n_file``
+    the number of splats the file holds (dropped rows included - also the last ones, which
+    ``rows`` cannot show)."""
     path = Path(path)
     if not path.is_file():
         raise InputError(f"Splat file not found: {path}")
@@ -549,6 +573,8 @@ def read_splats(path: str | Path) -> SplatCloud:
             sc = _read_dot_splat(path)
         else:
             raise InputError(f"Unsupported splat format {ext or path.name!r}; use .ply or .splat.")
+        n_file = len(sc)
+        sc, rows = _drop_non_finite_rows(sc, path.name)
     except OSError as e:
         raise InputError(f"Cannot read {path.name}: {e}") from e
     except MemoryError as e:
@@ -556,7 +582,9 @@ def read_splats(path: str | Path) -> SplatCloud:
     except (ValueError, KeyError, IndexError) as e:
         raise SplatError(f"{path.name} is not a valid splat file: {e}") from e
     log.info("Read %d splats from %s", len(sc), path.name)
-    return sc
+    if not return_rows:
+        return sc
+    return sc, (np.arange(n_file, dtype=np.int64) if rows is None else rows), int(n_file)
 
 
 def write_splats(sc: SplatCloud, path: str | Path) -> Path:

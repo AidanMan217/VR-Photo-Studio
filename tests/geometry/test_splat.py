@@ -859,3 +859,33 @@ def test_fit_plane_ransac_recovers_a_noisy_plane(monkeypatch):
             S.fit_plane_ransac(*args)
     with pytest.raises(InputError):
         S.fit_plane_ransac(pts, 0.01, iters=0)
+
+
+# --------------------------------------------------------------------------- read_splats(return_rows) (M6)
+@pytest.mark.parametrize("ext", [".ply", ".splat"])
+def test_read_splats_return_rows_maps_kept_splats_to_file_rows(tmp_path, ext, caplog):
+    sc = random_cloud(50, seed=3)
+    sc.means[3] = np.nan
+    sc.means[10, 1] = np.inf
+    sc.scales[20, 2] = np.nan  # (an infinite log-scale in a PLY is clamped when read, so NaN)
+    sc.means[48:] = np.nan  # the last rows too: only the file's own count shows them
+    p = write_splats(sc, tmp_path / f"a{ext}")
+    plain = read_splats(p)
+    out, rows, n_file = read_splats(p, return_rows=True)
+    assert isinstance(plain, SplatCloud) and len(plain) == len(out) == 45 and n_file == 50
+    assert rows.dtype == np.int64 and rows.tolist() == [i for i in range(48) if i not in (3, 10, 20)]
+    np.testing.assert_array_equal(out.means, plain.means)
+    np.testing.assert_allclose(out.means, sc.means[rows], atol=0 if ext == ".ply" else 1e-6)
+    assert "ignoring 5 splats" in caplog.text
+
+
+def test_read_splats_return_rows_when_nothing_is_dropped(tmp_path):
+    sc = random_cloud(30, sh=3, seed=4)
+    out, rows, n_file = read_splats(write_splats(sc, tmp_path / "b.ply"), return_rows=True)
+    assert len(out) == n_file == 30 and rows.tolist() == list(range(30)) and rows.dtype == np.int64
+    np.testing.assert_array_equal(out.means, sc.means)
+    assert out.sh_rest is not None and out.sh_rest.shape == (30, 3, 3)
+    empty, rows0, n0 = read_splats(write_splats(random_cloud(0), tmp_path / "c.ply"), return_rows=True)
+    assert len(empty) == n0 == 0 and rows0.shape == (0,) and rows0.dtype == np.int64
+    with pytest.raises(InputError):
+        read_splats(tmp_path / "missing.ply", return_rows=True)

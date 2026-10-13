@@ -557,7 +557,8 @@ def _import_worker(name: str):
 
 
 @pytest.mark.parametrize(
-    "name", ["trellis_worker", "trellis2_worker", "hunyuan_worker", "sdxl360_worker", "mvadapter_worker"]
+    "name", ["trellis_worker", "trellis2_worker", "hunyuan_worker", "sdxl360_worker", "mvadapter_worker",
+             "qwenedit_worker"]
 )
 def test_worker_check_rejects_unsupported_gpu(common, monkeypatch, tmp_path, name):
     """The install check fails with a readable message instead of a mid-job "no kernel image"."""
@@ -596,3 +597,268 @@ def test_sharp_falls_back_to_cpu_on_unsupported_gpu(common, monkeypatch, tmp_pat
     monkeypatch.setitem(sys.modules, "torch", _fake_torch(archs=WIN_TORCH_280_CU128))
     assert sharp._device("auto") == "cuda"
     assert "warnings" not in sharp.check(require_gpu=True)
+
+
+# ------------------------------------------------------------------ sharp_worker: list input (SHARP 360 M6)
+class _FakeOOM(RuntimeError):
+    pass
+
+
+_FakeOOM.__name__ = "OutOfMemoryError"  # what torch.cuda.OutOfMemoryError looks like to is_oom
+
+
+class _FakePredictor:
+    def __init__(self, rec):
+        self.rec = rec
+
+    def load_state_dict(self, state):
+        self.rec["loaded"] += 1
+
+    def eval(self):
+        return self
+
+    def to(self, device):
+        self.rec["to"].append(device)
+        fail = self.rec["to_fail"]
+        if fail and device == "cuda" and len(self.rec["to"]) in fail:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return self
+
+
+def _sharp_env(common, monkeypatch, tmp_path, *, sizes=None, oom=(), to_fail=(), cuda=True):
+    """The SHARP worker with fake torch / sharp modules.  ``sizes``: picture name -> (w, h);
+    ``oom``: (picture name, device) pairs whose prediction runs out of memory; ``to_fail``:
+    1-based indices of ``predictor.to`` calls (cuda only) that run out of memory."""
+    import types
+
+    ckpt = tmp_path / "sharp.pt"
+    ckpt.write_bytes(b"x")
+    monkeypatch.setenv("SHARP_CHECKPOINT", str(ckpt))
+    sizes = sizes or {"a.png": (64, 48), "b.png": (40, 40), "c.png": (32, 24)}
+    pics = {}
+    for name in sizes:
+        (tmp_path / name).write_bytes(b"png")
+        pics[name] = tmp_path / name
+    rec = {"loaded": 0, "loads": 0, "created": 0, "to": [], "to_fail": set(to_fail), "predict": [], "saved": []}
+    torch = _fake_torch(archs=WIN_TORCH_280_CU128, cuda=cuda)
+
+    def load(path, map_location=None, weights_only=None):
+        rec["loads"] += 1
+        return {}
+
+    torch.load = load
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    models = types.ModuleType("sharp.models")
+    models.PredictorParams = lambda: None
+
+    def create_predictor(_params):
+        rec["created"] += 1
+        return _FakePredictor(rec)
+
+    models.create_predictor = create_predictor
+    sio = types.ModuleType("sharp.utils.io")
+
+    def load_rgb(path):
+        w, h = sizes[Path(path).name]
+        return np.zeros((h, w, 3), np.uint8), None, 100.0 + w  # EXIF focal length per picture
+
+    sio.load_rgb = load_rgb
+    utils = types.ModuleType("sharp.utils")
+    utils.io = sio
+    gauss = types.ModuleType("sharp.utils.gaussians")
+
+    def save_ply(g, f_px, hw, path):
+        rec["saved"].append((Path(path).name, g, round(float(f_px), 4), tuple(hw)))
+        Path(path).write_bytes(b"ply")
+
+    gauss.save_ply = save_ply
+    for name, mod in (("sharp", types.ModuleType("sharp")), ("sharp.models", models), ("sharp.utils", utils),
+                      ("sharp.utils.io", sio), ("sharp.utils.gaussians", gauss)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    sharp = _import_worker("sharp_worker")
+
+    def fake_predict(predictor, image, f_px, device):
+        key = (image.shape[1], device)
+        rec["predict"].append(key)
+        hit = [n for n, d in oom if sizes[n][0] == image.shape[1] and d == device]
+        if hit:
+            raise _FakeOOM("CUDA out of memory. Tried to allocate 1.00 GiB\nmore details")
+        return f"g{image.shape[1]}@{device}"
+
+    monkeypatch.setattr(sharp, "_predict", fake_predict)
+    freed = []
+    monkeypatch.setattr(sharp, "free_cuda", lambda: freed.append(len(rec["predict"])))
+    rec["freed"] = freed
+    return sharp, rec, pics
+
+
+def test_sharp_list_input_loads_the_model_once(common, monkeypatch, tmp_path):
+    import math
+
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    images = [str(pics["a.png"]), str(pics["b.png"]), str(pics["c.png"])]
+    outs = sharp.handle("image_to_splat", {"images": images}, {"hfov_deg": [50.0, None, 70.0], "name": "back"},
+                        out_dir, common.Progress())
+    assert rec["loads"] == 1 and rec["created"] == 1 and rec["loaded"] == 1 and rec["to"] == ["cuda"]
+    assert outs["plys"] == [str(out_dir / f"back_{i}.ply") for i in range(3)]
+    assert all(Path(p).is_file() for p in outs["plys"])
+    f0 = 32.0 / math.tan(math.radians(25.0))
+    f2 = 16.0 / math.tan(math.radians(35.0))
+    assert outs["f_pxs"] == pytest.approx([f0, 140.0, f2])  # None -> the picture's own (EXIF) value
+    assert outs["widths"] == [64, 40, 32] and outs["heights"] == [48, 40, 24]
+    assert outs["devices"] == ["cuda"] * 3 and outs["warnings"] == []
+    # the single-picture keys describe the first picture (SharpCam.from_outputs keeps working)
+    assert outs["ply"] == outs["plys"][0] and outs["f_px"] == pytest.approx(f0)
+    assert (outs["width"], outs["height"], outs["frame"]) == (64, 48, "opencv")
+    assert [s[0] for s in rec["saved"]] == ["back_0.ply", "back_1.ply", "back_2.ply"]
+    assert rec["saved"][1][3] == (40, 40)
+    msgs = [kw["msg"] for t, kw in common.sent if t == "progress"]
+    assert "Predicting the 3D scene (picture 2/3)" in msgs and "Saving the splat (picture 3/3)" in msgs
+    fracs = _fracs(common)
+    assert fracs == sorted(fracs) and fracs[-1] == 1.0
+
+
+def test_sharp_list_input_one_hfov_for_all_and_image_first(common, monkeypatch, tmp_path):
+    import math
+
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path)
+    inputs = {"image": str(pics["c.png"]), "images": [str(pics["a.png"]), str(pics["b.png"])]}
+    outs = sharp.handle("image_to_splat", inputs, {"hfov_deg": 60}, tmp_path, common.Progress())
+    assert outs["widths"] == [32, 64, 40]  # 'image' comes first ...
+    assert outs["f_pxs"] == pytest.approx([w / 2 / math.tan(math.radians(30.0)) for w in (32, 64, 40)])
+    inputs = {"image": str(pics["b.png"]), "images": [str(pics["a.png"]), str(pics["b.png"])]}
+    outs = sharp.handle("image_to_splat", inputs, {}, tmp_path, common.Progress())
+    assert outs["widths"] == [64, 40]  # ... unless the list already holds it
+    assert outs["f_pxs"] == pytest.approx([164.0, 140.0])
+    outs = sharp.handle("image_to_splat", {"images": str(pics["a.png"])}, {}, tmp_path, common.Progress())
+    assert outs["plys"] == [str(tmp_path / "sharp_0.ply")]  # one path instead of a list
+
+
+def test_sharp_single_image_outputs_unchanged(common, monkeypatch, tmp_path):
+    import math
+
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path)
+    for inputs in ({"image": str(pics["a.png"])}, {"image": str(pics["a.png"]), "images": []}):
+        outs = sharp.handle("image_to_splat", inputs, {"hfov_deg": 40.0}, tmp_path, common.Progress())
+        assert set(outs) == {"ply", "frame", "f_px", "width", "height"}
+        assert outs["ply"] == str(tmp_path / "sharp.ply") and Path(outs["ply"]).is_file()
+        assert outs["f_px"] == pytest.approx(32.0 / math.tan(math.radians(20.0)))
+    msgs = [kw["msg"] for t, kw in common.sent if t == "progress"]
+    assert "Predicting the 3D scene" in msgs and "Saving the splat" in msgs and "Model loaded (cuda)" in msgs
+    outs = sharp.handle("image_to_splat", {"image": str(pics["b.png"])}, {"hfov_deg": [90.0]}, tmp_path,
+                        common.Progress())
+    assert outs["f_px"] == pytest.approx(20.0)  # a one-value list is fine too
+
+
+@pytest.mark.parametrize(
+    "inputs, params, match",
+    [
+        ({}, {}, "Missing input 'image'"),
+        ({"images": []}, {}, "Missing input 'image'"),
+        ({"images": None, "image": ""}, {}, "Missing input 'image'"),
+        ({"images": 3}, {}, "must be a list of picture files"),
+        ({"images": ["A", None]}, {}, "item 2 is not a picture file"),
+        ({"images": ["A", "missing.png"]}, {}, "Input file not found"),
+        ({"images": ["A", "B"]}, {"hfov_deg": [50.0]}, "'hfov_deg' has 1 values for 2 pictures"),
+        ({"image": "A"}, {"hfov_deg": [50.0, 60.0]}, "'hfov_deg' has 2 values for 1 picture;"),
+        ({"images": ["A"]}, {"hfov_deg": ["wide"]}, "Invalid value for 'hfov_deg'"),
+    ],
+)
+def test_sharp_list_input_validation(common, monkeypatch, tmp_path, inputs, params, match):
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path)
+    names = {"A": str(pics["a.png"]), "B": str(pics["b.png"]), "missing.png": str(tmp_path / "missing.png")}
+
+    def fix(v):
+        if isinstance(v, list):
+            return [names.get(x, x) if isinstance(x, str) else x for x in v]
+        return names.get(v, v) if isinstance(v, str) else v
+
+    with pytest.raises(sharp.WorkerError, match=match):
+        sharp.handle("image_to_splat", {k: fix(v) for k, v in inputs.items()}, params, tmp_path, common.Progress())
+    assert rec["loads"] == 0  # checked before the model is loaded
+
+
+def test_sharp_hfov_list_helper(common, monkeypatch, tmp_path):
+    sharp, _rec, _pics = _sharp_env(common, monkeypatch, tmp_path)
+    assert sharp.hfov_list(None, 2) == [None, None]
+    assert sharp.hfov_list(55, 3) == [55.0, 55.0, 55.0]
+    assert sharp.hfov_list([5, None, 200, "65"], 4) == [10.0, None, 170.0, 65.0]  # clamped like before
+    assert sharp.hfov_list((30.0,), 1) == [30.0]
+
+
+def test_sharp_out_of_memory_runs_that_picture_on_the_cpu(common, monkeypatch, tmp_path):
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path, oom=[("b.png", "cuda")])
+    images = [str(pics["a.png"]), str(pics["b.png"]), str(pics["c.png"])]
+    outs = sharp.handle("image_to_splat", {"images": images}, {}, tmp_path, common.Progress())
+    assert outs["devices"] == ["cuda", "cpu", "cuda"]
+    assert rec["predict"] == [(64, "cuda"), (40, "cuda"), (40, "cpu"), (32, "cuda")]
+    assert rec["to"] == ["cuda", "cpu", "cuda"]  # off the GPU for picture 2, back for picture 3
+    assert 2 in rec["freed"]  # the cache was freed after the failed attempt, before the CPU run
+    assert [s[1] for s in rec["saved"]] == ["g64@cuda", "g40@cpu", "g32@cuda"]
+    assert len(outs["warnings"]) == 1 and "picture 2 (b.png)" in outs["warnings"][0]
+    assert "CPU" in outs["warnings"][0]
+    assert any(t == "log" and kw["level"] == "warning" and "out of memory" in kw["msg"] for t, kw in common.sent)
+
+
+def test_sharp_out_of_memory_single_image_falls_back_with_a_warning(common, monkeypatch, tmp_path):
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path, oom=[("a.png", "cuda")])
+    outs = sharp.handle("image_to_splat", {"image": str(pics["a.png"])}, {}, tmp_path, common.Progress())
+    assert set(outs) == {"ply", "frame", "f_px", "width", "height", "warnings"}
+    assert "SHARP made it on the CPU" in outs["warnings"][0]
+    assert rec["saved"][0][1] == "g64@cpu"
+
+
+def test_sharp_stays_on_the_cpu_when_the_model_cannot_go_back(common, monkeypatch, tmp_path):
+    # to() calls: 1 = initial cuda, 2 = cpu (fallback), 3 = back to cuda -> out of memory
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path, oom=[("a.png", "cuda")], to_fail={3})
+    images = [str(pics["a.png"]), str(pics["b.png"]), str(pics["c.png"])]
+    outs = sharp.handle("image_to_splat", {"images": images}, {}, tmp_path, common.Progress())
+    assert outs["devices"] == ["cpu", "cpu", "cpu"]
+    assert rec["to"] == ["cuda", "cpu", "cuda", "cpu"]
+    assert rec["predict"] == [(64, "cuda"), (64, "cpu"), (40, "cpu"), (32, "cpu")]
+
+
+def test_sharp_model_too_big_for_the_gpu_uses_the_cpu(common, monkeypatch, tmp_path):
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path, to_fail={1})
+    outs = sharp.handle("image_to_splat", {"images": [str(pics["a.png"])]}, {}, tmp_path, common.Progress())
+    assert outs["devices"] == ["cpu"] and rec["to"] == ["cuda", "cpu"]
+    assert "did not fit on the graphics card" in outs["warnings"][0]
+    assert any(t == "progress" and kw["msg"] == "Model loaded (cpu)" for t, kw in common.sent)
+
+
+def test_sharp_other_errors_and_cpu_out_of_memory_propagate(common, monkeypatch, tmp_path):
+    sharp, rec, pics = _sharp_env(common, monkeypatch, tmp_path, oom=[("a.png", "cpu")])
+    with pytest.raises(_FakeOOM):  # already on the CPU: nothing left to fall back to
+        sharp.handle("image_to_splat", {"image": str(pics["a.png"])}, {"device": "cpu"}, tmp_path,
+                     common.Progress())
+    assert rec["predict"] == [(64, "cpu")]
+
+    def broken(*a, **k):
+        raise ValueError("bad tensor shape")
+
+    monkeypatch.setattr(sharp, "_predict", broken)
+    with pytest.raises(ValueError, match="bad tensor shape"):
+        sharp.handle("image_to_splat", {"images": [str(pics["b.png"])]}, {}, tmp_path, common.Progress())
+
+
+def test_sharp_is_oom(common, monkeypatch, tmp_path):
+    sharp, _rec, _pics = _sharp_env(common, monkeypatch, tmp_path)
+    assert sharp.is_oom(_FakeOOM("x"))
+    assert sharp.is_oom(RuntimeError("CUDA error: out of memory"))
+    assert sharp.is_oom(RuntimeError("CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate"))
+    assert not sharp.is_oom(ValueError("shape mismatch"))
+
+
+def test_sharp_worker_list_validation_without_torch(tmp_path):
+    """The real worker process (no torch in CI) checks the list input before importing torch."""
+    path = workers_dir() / "sharp_worker.py"
+    pic = tmp_path / "a.png"
+    pic.write_bytes(b"png")
+    with pytest.raises(AddonError, match="Input file not found"):
+        run_worker(sys.executable, path, "image_to_splat", {"images": [str(pic), str(tmp_path / "b.png")]}, {},
+                   tmp_path, timeout=60)
+    with pytest.raises(AddonError, match="'hfov_deg' has 3 values for 2 pictures"):
+        run_worker(sys.executable, path, "image_to_splat", {"images": [str(pic), str(pic)]},
+                   {"hfov_deg": [40, 50, 60]}, tmp_path, timeout=60)

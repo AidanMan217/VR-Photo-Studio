@@ -1,0 +1,224 @@
+# Qwen photo editor (experimental): photo-like back and side views of a cut-out person made by
+# Qwen-Image-Edit-2511 (Q4_K_M GGUF) with fal's Multiple-Angles camera LoRA and lightx2v's Lightning
+# LoRA, run by a private, headless ComfyUI that the worker starts on 127.0.0.1 (design
+# docs/design/SHARP360.md 3.5.6 / 4.4; 'SHARP 360' back source "qwen", never chosen by "auto").
+#
+# Sources checked for this manifest (2026-10-13):
+# * comfyanonymous/ComfyUI v0.39.2 = 3c1b7a17fdf239d35ce98cc777756f572d089795 (2026-10-07, the newest
+#   release): comfy_extras/nodes_qwen.py has TextEncodeQwenImageEditPlus; CFGNorm,
+#   ModelSamplingAuraFlow and FluxKontextMultiReferenceLatentMethod ("index_timestep_zero") exist.
+#   GPL-3.0: it runs as a separate program the worker only talks to over HTTP.  requirements.txt
+#   pins comfyui-frontend-package 1.53.10 (needed: main.py exits without it), comfy-kitchen 0.2.37,
+#   comfy-aimdo 0.5.5 and leaves the rest open; the list below is that file (plus ComfyUI-GGUF's
+#   gguf / sentencepiece / protobuf and huggingface-hub for the downloads) resolved with
+#   `uv pip compile --python-version 3.11 --only-binary :all: --exclude-newer 2026-10-07` against
+#   torch 2.8.0 / torchvision 0.23.0 for Windows and Linux (identical apart from colorama, which is
+#   pure Python), every native package checked to have cp311 / abi3 win_amd64 and manylinux wheels
+#   (av 19 needs Python 3.12, so av 18.1.0).  Left out on purpose: torch / torchvision (the CUDA
+#   12.8 step), comfyui-workflow-templates (~510 MB of example media for the browser UI; without it
+#   ComfyUI only logs an error) and comfyui-embedded-docs (UI help pages; an info line).
+# * city96/ComfyUI-GGUF 6ea2651e7df66d7585f6ffee804b20e92fb38b8a (HEAD, 2026-01-12, Apache-2.0):
+#   UnetLoaderGGUF (unet_name), CLIPLoaderGGUF (clip_name, type "qwen_image"); a "qwen2vl" text
+#   encoder loads the "mmproj" vision file from its own folder whose name contains "mmproj" and the
+#   encoder's name without the quant suffix - the ggml-org file names below match without renaming.
+# * Hugging Face (huggingface.co is not reachable from the build sandbox: file names, sizes and
+#   licences come from ComfyUI's own workflow templates (Comfy-Org/workflow_templates on GitHub)
+#   and search-engine copies of the model cards; the revisions are "main" until they are checked on
+#   a machine with access - NOT verified):
+#   - unsloth/Qwen-Image-Edit-2511-GGUF  qwen-image-edit-2511-Q4_K_M.gguf  13.2 GB  Apache-2.0
+#     (Q3_K_M would be ~10 GB; the user's PC has 32 GB of RAM, so one Q4_K_M quant is pinned)
+#   - ggml-org/Qwen2.5-VL-7B-Instruct-GGUF  Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf 4.68 GB (sha256
+#     9258bf05b12686d097ff3b6b18d968ab393649780aa2b3cd67fec43d50554392 per the search snippet) +
+#     mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf 1.35 GB  Apache-2.0
+#   - Comfy-Org/Qwen-Image_ComfyUI  split_files/vae/qwen_image_vae.safetensors  242 MB  Apache-2.0
+#   - fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA  qwen-image-edit-2511-multiple-angles-lora.safetensors
+#     (size not verified)  Apache-2.0 (README metadata); prompts "<sks> <azimuth> <elevation> <distance>"
+#   - lightx2v/Qwen-Image-Edit-2511-Lightning  Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors
+#     810 MB  Apache-2.0 (the only 2511 Lightning release in the lightx2v README; ComfyUI's
+#     templates use exactly this file)
+#   Everything is Apache-2.0 (ComfyUI GPL-3.0 as a separate program), so noncommercial = false.
+id = "qwenedit"
+title = "Qwen photo editor (AI back views, experimental, slow)"
+description = """Makes photo-like back and side views of a cut-out person with Qwen-Image-Edit-2511 and a \
+camera-angle LoRA, run by a private copy of ComfyUI; 'SHARP 360' builds the back of the splat from them. \
+Slow on GTX 10-series GPUs (several minutes per view) and needs at least 16 GB of system memory (32 GB \
+recommended)."""
+version = "1.0.0"
+experimental = true
+license = "Qwen-Image-Edit-2511 (GGUF by Unsloth), Qwen2.5-VL-7B-Instruct (GGUF by ggml-org), Qwen-Image VAE, fal Multiple-Angles LoRA, lightx2v Lightning LoRA: Apache-2.0; ComfyUI: GPL-3.0 (runs as a separate program); ComfyUI-GGUF: Apache-2.0"
+noncommercial = false
+region_restricted = []
+min_vram_gb = 6
+min_ram_gb = 16  # the worker refuses below this; 32 GB recommended (below 24 GB ComfyUI runs with --cache-none)
+disk_gb = 30  # torch 2.8 + ComfyUI venv (~8 GB) + 20.6 GB of models + ComfyUI and its web UI + slack
+kind = "venv"
+python = "3.11"
+hf_gated = false
+homepage = "https://huggingface.co/Qwen/Qwen-Image-Edit-2511"
+tasks = ["views_from_photo"]
+worker = "qwenedit_worker.py"
+platforms = ["win32", "linux"]
+notes = "Experimental and slow: about 5-15 minutes per view on a GTX 1080 (not measured yet). Runs a private, headless ComfyUI v0.39.2 with ComfyUI-GGUF on 127.0.0.1 (the diffusion model computes in fp32 on GTX 10-series cards, which have no bf16). 32 GB of system memory recommended; with 16-24 GB ComfyUI runs without its cache (slower)."
+
+[env]
+COMFYUI_DIR = "{addon_dir}/src/ComfyUI"
+QWENEDIT_MODELS = "{addon_dir}/MODELS"
+TORCHDYNAMO_DISABLE = "1"
+
+[[steps]]
+type = "venv"
+
+[[steps]]
+type = "pip"
+title = "Installing PyTorch 2.8.0 (CUDA 12.8)"
+packages = ["torch==2.8.0", "torchvision==0.23.0"]
+index_url = "https://download.pytorch.org/whl/cu128"  # the Windows build includes sm_61 (GTX 10-series)
+
+[[steps]]
+type = "pip"
+title = "Installing ComfyUI's requirements"
+packages = [
+    # ComfyUI v0.39.2 requirements.txt (exact pins from the file)
+    "comfyui-frontend-package==1.53.10",
+    "comfy-kitchen==0.2.37",
+    "comfy-aimdo==0.5.5",
+    # the rest of requirements.txt and their dependencies, resolved (see the header)
+    "aiohappyeyeballs==2.7.1",
+    "aiohttp==3.14.4",
+    "aiosignal==1.4.0",
+    "alembic==1.20.0",
+    "annotated-doc==0.0.5",
+    "annotated-types==0.8.0",
+    "anyio==4.15.1",
+    "attrs==26.1.0",
+    "av==18.1.0",
+    "blake3==1.0.10",
+    "certifi==2026.7.22",
+    "charset-normalizer==3.5.2",
+    "click==8.5.0",
+    "colorama==0.4.6",
+    "comfy-angle==0.1.1",
+    "einops==0.8.2",
+    "filelock==4.0.12",
+    "frozenlist==1.8.0",
+    "fsspec==2026.9.0",
+    "h11==0.16.0",
+    "hf-xet==1.7.0",
+    "httpcore==1.0.9",
+    "httpx==0.28.1",
+    "idna==3.20",
+    "jinja2==3.1.6",
+    "kornia==0.8.3",
+    "kornia-rs==0.2.0",
+    "mako==1.4.3",
+    "markdown-it-py==4.2.0",
+    "markupsafe==3.0.4",
+    "mdurl==0.1.2",
+    "mpmath==1.3.0",
+    "multidict==6.9.1",
+    "networkx==3.6.1",
+    "numpy==2.4.6",
+    "packaging==26.3",
+    "pillow==12.3.0",
+    "propcache==0.5.4",
+    "psutil==7.2.2",
+    "pydantic==2.13.5",
+    "pydantic-core==2.46.5",
+    "pydantic-settings==2.15.0",
+    "pygments==2.21.0",
+    "pyopengl==3.1.10",
+    "python-dotenv==1.2.4",
+    "pyyaml==6.0.3",
+    "regex==2026.9.29",
+    "requests==2.34.2",
+    "rich==15.0.0",
+    "safetensors==0.8.0",
+    "scipy==1.17.1",
+    "shellingham==1.5.4",
+    "simpleeval==1.0.8",
+    "spandrel==0.4.2",
+    "sqlalchemy==2.1.3",
+    "sympy==1.14.0",
+    "tokenizers==0.23.2",
+    "torchsde==0.2.6",
+    "tqdm==4.70.1",
+    "trampoline==0.1.2",
+    "transformers==5.19.0",
+    "typer==0.27.3",
+    "typing-extensions==4.16.0",
+    "typing-inspection==0.4.4",
+    "urllib3==2.8.0",
+    "yarl==1.25.1",
+    # ComfyUI-GGUF requirements.txt (gguf>=0.13.0; sentencepiece / protobuf for its tokenizers)
+    "gguf==0.19.0",
+    "sentencepiece==0.2.2",
+    "protobuf==7.36.2",
+    # the installer's hf_download steps run huggingface_hub in this venv
+    "huggingface-hub==1.33.0",
+    "setuptools==75.8.0",  # torch.utils.cpp_extension imports it; uv venvs do not include it
+]
+
+[[steps]]
+type = "github_archive"
+title = "Downloading ComfyUI v0.39.2"
+repo = "comfyanonymous/ComfyUI"
+ref = "3c1b7a17fdf239d35ce98cc777756f572d089795"
+dest = "src/ComfyUI"
+pip_install = false
+
+[[steps]]
+type = "github_archive"
+title = "Downloading ComfyUI-GGUF"
+repo = "city96/ComfyUI-GGUF"
+ref = "6ea2651e7df66d7585f6ffee804b20e92fb38b8a"
+dest = "src/ComfyUI/custom_nodes/ComfyUI-GGUF"  # after ComfyUI: extracting ComfyUI replaces its folder
+pip_install = false
+
+[[steps]]
+type = "hf_download"
+title = "Downloading the Qwen-Image VAE"
+repo = "Comfy-Org/Qwen-Image_ComfyUI"
+revision = "main"  # not verified (huggingface.co unreachable when this manifest was written)
+local_dir = "MODELS/vae"
+allow_patterns = ["split_files/vae/qwen_image_vae.safetensors"]
+size_gb = 0.25
+
+[[steps]]
+type = "hf_download"
+title = "Downloading the Qwen2.5-VL text encoder (GGUF)"
+repo = "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF"
+revision = "main"  # not verified
+local_dir = "MODELS/text_encoders"
+allow_patterns = ["Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", "mmproj-Qwen2.5-VL-7B-Instruct-f16.gguf"]
+size_gb = 6.03
+
+[[steps]]
+type = "hf_download"
+title = "Downloading the Multiple-Angles camera LoRA"
+repo = "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
+revision = "main"  # not verified
+local_dir = "MODELS/loras/angles"
+allow_patterns = ["qwen-image-edit-2511-multiple-angles-lora.safetensors"]
+size_gb = 0.5  # not verified
+
+[[steps]]
+type = "hf_download"
+title = "Downloading the Lightning LoRA (faster: 4 instead of 40 steps)"
+repo = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+revision = "main"  # not verified
+local_dir = "MODELS/loras/lightning"
+allow_patterns = ["Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"]
+size_gb = 0.81
+optional = true  # design 4.4; without it the worker warns and uses 40 steps at CFG 4 (~20x slower)
+
+[[steps]]
+type = "hf_download"
+title = "Downloading Qwen-Image-Edit-2511 (Q4_K_M GGUF, 13 GB)"
+repo = "unsloth/Qwen-Image-Edit-2511-GGUF"
+revision = "main"  # not verified
+local_dir = "MODELS/diffusion_models"
+allow_patterns = ["qwen-image-edit-2511-Q4_K_M.gguf"]
+size_gb = 13.2
+
+[[steps]]
+type = "check"

@@ -853,3 +853,23 @@ def test_performance_768_mould_grid():
     # and CI runners are slower still
     assert dt < 45.0, f"{dt:.1f} s"
     assert math.isfinite(part.diag["qc"]["cost"])
+
+
+def test_a_lone_quarter_view_is_kept_as_named_but_a_lone_side_view_can_turn():
+    """A view without its mirror partner: a left / right view whose mirror fits clearly better is
+    turned round, a quarter view never is (from 45 deg off the axis the two candidates' outlines
+    are too alike to overrule the name)."""
+    import numpy as np
+
+    from vrphoto.geometry import views_lift as vl
+
+    def view(name, phi):
+        return vl.GenView(name, phi, np.zeros((4, 4, 3), np.uint8), np.ones((4, 4), np.float32), "nominal")
+
+    def hyp(phi, named, swapped):
+        return [{"phi": phi, "misfit_m": named}, {"phi": 360.0 - phi, "misfit_m": swapped}]
+
+    views = [view("back_right", 135.0), view("right", 90.0)]
+    hyps = [hyp(135.0, 0.064, 0.022), hyp(90.0, 0.064, 0.022)]
+    flip, pairs = vl._flip_decisions(views, hyps)
+    assert flip == [False, True] and pairs == []

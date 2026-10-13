@@ -322,13 +322,21 @@ def _is_relative_to(p: Path, root: Path) -> bool:
     return True
 
 
+#: Modules below ``vrphoto.addons.workers`` that the app itself imports (standard library only):
+#: the ComfyUI client, shared by the qwenedit worker and SHARP 360's 'Your own ComfyUI' source.
+APP_WORKER_MODULES: tuple[str, ...] = ("vrphoto.addons.workers", "vrphoto.addons.workers._comfy")
+
+
 def want_vrphoto_module(name: str) -> bool:
     """Filter for ``collect_submodules('vrphoto')``.
 
     Add-on worker scripts run in the add-on's own virtual environment (with torch etc.)
     and are bundled as source files, so they must not be analysed as app modules (that
-    would drag their imports into the bundle).
+    would drag their imports into the bundle).  The exceptions are :data:`APP_WORKER_MODULES`
+    (the package itself and the stdlib-only ComfyUI client the app imports).
     """
+    if name in APP_WORKER_MODULES:
+        return True
     return not (name == "vrphoto.addons.workers" or name.startswith("vrphoto.addons.workers."))
 
 

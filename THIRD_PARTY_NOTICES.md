@@ -98,12 +98,14 @@ https://bitbucket.org/multicoreware/x265_git .
 | BiRefNet Lite / Portrait | cutting out people and objects | MIT |
 | IS-Net (DIS) | cutting out objects | Apache-2.0 |
 | U2-Net | cutting out objects | Apache-2.0 |
+| YuNet face detector (OpenCV Zoo, 2023mar) | "SHARP 360": rejects AI back views that show a face (run by OpenCV) | MIT |
 
 Model files come from Hugging Face / GitHub and are stored in `%LOCALAPPDATA%\VRPhotoStudio\models`.
 Depth Anything V2: https://github.com/DepthAnything/Depth-Anything-V2 ·
 MoGe: https://github.com/microsoft/MoGe · LaMa: https://github.com/advimman/lama ·
 MI-GAN: https://github.com/Picsart-AI-Research/MI-GAN · BiRefNet: https://github.com/ZhengPeng7/BiRefNet ·
-IS-Net/DIS: https://github.com/xuebinqin/DIS · U2-Net: https://github.com/xuebinqin/U-2-Net
+IS-Net/DIS: https://github.com/xuebinqin/DIS · U2-Net: https://github.com/xuebinqin/U-2-Net ·
+YuNet: https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet
 
 ## 6. Optional add-ons (installed only when you choose to)
 
@@ -122,6 +124,14 @@ model weights from Hugging Face/GitHub). They are not part of the VR Photo Studi
 | | SDXL VAE fp16 fix | MIT - https://huggingface.co/madebyollin/sdxl-vae-fp16-fix |
 | MV-Adapter (experimental; AI back and side views for "SHARP 360") | MV-Adapter code (pinned commit) and the image-to-multiview SD 2.1 weights (`mvadapter_i2mv_sd21.safetensors`) | Apache-2.0 - https://github.com/huanngzh/MV-Adapter , https://huggingface.co/huanngzh/mv-adapter |
 | | Stable Diffusion 2.1 base (Stability AI), downloaded from the copy `Manojb/stable-diffusion-2-1-base` because the original repository was removed | CreativeML Open RAIL++-M (use-based restrictions) - https://huggingface.co/Manojb/stable-diffusion-2-1-base |
+| Qwen photo editor (experimental; AI back views for "SHARP 360") | ComfyUI v0.39.2 (pinned commit), installed as a **separate program** inside the add-on folder and run headless on 127.0.0.1; VR Photo Studio only talks to it over its HTTP API and does not include or link its code. Its source code is the pinned GitHub commit | GPL-3.0 - https://github.com/comfyanonymous/ComfyUI |
+| | ComfyUI-GGUF custom nodes (pinned commit) | Apache-2.0 - https://github.com/city96/ComfyUI-GGUF |
+| | ComfyUI's Python packages: comfyui-frontend-package (ComfyUI's web interface, part of the same separate program), comfy-kitchen, comfy-aimdo, gguf, aiohttp, SQLAlchemy, PyAV, ... | GPL-3.0 (frontend - https://github.com/Comfy-Org/ComfyUI_frontend) / Apache-2.0 (comfy-kitchen) / MIT / BSD and others - see each package |
+| | Qwen-Image-Edit-2511 (Alibaba Qwen team), as the Q4_K_M GGUF quantisation by Unsloth | Apache-2.0 - https://huggingface.co/Qwen/Qwen-Image-Edit-2511 , https://huggingface.co/unsloth/Qwen-Image-Edit-2511-GGUF |
+| | Qwen2.5-VL-7B-Instruct text encoder, as GGUF files by ggml-org (Q4_K_M + the f16 vision projector) | Apache-2.0 - https://huggingface.co/ggml-org/Qwen2.5-VL-7B-Instruct-GGUF |
+| | Qwen-Image VAE (repackaged by Comfy-Org) | Apache-2.0 - https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI |
+| | Multiple-Angles camera LoRA for Qwen-Image-Edit-2511 (fal) | Apache-2.0 - https://huggingface.co/fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA |
+| | Qwen-Image-Edit-2511-Lightning 4-step LoRA (lightx2v / ModelTC) | Apache-2.0 - https://huggingface.co/lightx2v/Qwen-Image-Edit-2511-Lightning , https://github.com/ModelTC/LightX2V-Qwen-Image-Lightning |
 | SHARP (experimental; single photo → 3D Gaussian splat) | Apple ml-sharp code | Apple Sample Code License - https://github.com/apple/ml-sharp |
 | | SHARP model weights | ⚠ NC - Apple Machine Learning Research Model License (non-commercial research only) |
 | TRELLIS.2 (experimental) | Microsoft TRELLIS.2 code + weights | MIT - https://github.com/microsoft/TRELLIS.2 |

@@ -49,7 +49,10 @@ _DEFAULT_WEIGHTS = {
 }
 
 # Executed in the add-on venv for hf_download steps.  Reads its arguments (including the
-# token) from stdin so the token never appears in a command line or log.
+# token) from stdin so the token never appears in a command line or log.  snapshot_download
+# downloads nothing (and succeeds) when no file matches allow_patterns, so the snippet checks the
+# repository's file list first: no match at all, or a file name without wildcards that the
+# repository does not have, is a "MissingFiles" error naming it and repo@revision.
 HF_SNIPPET = r"""
 import json, os, sys, threading, time
 args = json.loads(sys.stdin.readline())
@@ -60,6 +63,7 @@ try:
     token = args.get("token") or None
     total = 0
     watch = args.get("local_dir")
+    missing = ""
     try:
         api = HfApi()
         info = api.repo_info(args["repo"], repo_type=args.get("repo_type") or "model",
@@ -72,6 +76,12 @@ try:
         except Exception:
             keep = set(files)
         total = sum((s.size or 0) for s in (info.siblings or []) if s.rfilename in keep)
+        pats = list(args.get("allow_patterns") or [])
+        exact = [p for p in pats if not any(c in p for c in "*?[") and not p.endswith("/")]
+        gone = [p for p in exact if p not in set(files)]
+        if pats and (not keep or gone):
+            where = "%s@%s" % (args["repo"], args.get("revision") or "main")
+            missing = "%s has no file %s" % (where, ", ".join(gone or pats))
         out("total", {"bytes": total, "files": len(keep)})
         if not watch:
             from huggingface_hub.constants import HF_HUB_CACHE
@@ -79,6 +89,9 @@ try:
             watch = os.path.join(HF_HUB_CACHE, kind + "--" + args["repo"].replace("/", "--"))
     except Exception as e:
         out("warn", {"message": "no size information: %s" % (e,)})
+    if missing:  # nothing would be downloaded, and the step would still look done
+        out("error", {"type": "MissingFiles", "message": missing})
+        sys.exit(1)
     stop = threading.Event()
     def poll():
         while not stop.wait(1.0):
@@ -676,6 +689,12 @@ def step_hf_download(ctx: InstallContext, step: dict, progress: ProgressReporter
         return
     err = state["error"] or {}
     etype, message = str(err.get("type", "")), str(err.get("message", "")) or _uv_error_line(res.tail)
+    if etype == "MissingFiles":
+        raise AddonError(
+            f"Model files of {repo} were not found on Hugging Face ({message[:300]}).",
+            hint="They were renamed or moved there. Update VR Photo Studio (it names the files to download), "
+            "or report this on the project's GitHub page.",
+        )
     if etype in ("GatedRepoError", "RepositoryNotFoundError") or re.search(r"\b(401|403)\b", message):
         raise AddonError(
             f"Access to the Hugging Face model {repo} was denied.",

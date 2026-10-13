@@ -177,8 +177,11 @@ def test_package_datas_real_tree():
         ("vrphoto.gui.app", True),
         ("vrphoto.addons.manager", True),
         ("vrphoto.addons.workersx", True),
-        ("vrphoto.addons.workers", False),
+        ("vrphoto.addons.workers", True),  # the package (empty) and the app's ComfyUI client
+        ("vrphoto.addons.workers._comfy", True),
         ("vrphoto.addons.workers.trellis_worker", False),
+        ("vrphoto.addons.workers._common", False),
+        ("vrphoto.addons.workers.qwenedit_worker", False),
     ],
 )
 def test_want_vrphoto_module(name, wanted):

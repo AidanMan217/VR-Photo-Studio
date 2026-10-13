@@ -216,7 +216,9 @@ def billboard(img: RGB, alpha: FloatMap, depth: DepthResult, K: Intrinsics, *, h
               thickness=0.17, back: str = "diffuse") -> list[Mesh]   # feet at y=0, faces +z
 
 # geometry/splat.py
-def read_splats(path) -> SplatCloud            # .ply (3DGS), .splat
+def read_splats(path, *, return_rows=False) -> SplatCloud | (SplatCloud, rows, n_file)   # .ply (3DGS), .splat;
+    # M6: rows = increasing int64 indices of the kept Gaussians in the file's vertex order (diagnostics),
+    # n_file = the file's own splat count (dropped trailing rows included)
 def write_splats(sc: SplatCloud, path) -> Path # by extension .ply | .splat
 def decimate_splats(sc, max_n=750_000) -> SplatCloud
 def crop_splats(sc, *, radius_pct=98.0, aabb=None) -> SplatCloud
@@ -331,6 +333,7 @@ Only the block matching `mode` is required.
 @dataclass
 class AddonManifest: id, title, description, experimental: bool, license: str, noncommercial: bool,
     region_restricted: list[str], min_vram_gb: float, disk_gb: float, python: str, kind: "venv"|"binary",
+    min_ram_gb: float = 0.0,   # M7: optional, >= 0, advisory system RAM (notices(), to_dict(), Add-ons dialog)
     steps: list[dict], worker: str | None, tasks: list[str], hf_gated: bool, homepage: str
 def list_addons(include_experimental=False) -> list[AddonManifest]
 def get_manifest(addon_id) -> AddonManifest
@@ -485,8 +488,9 @@ left = right = 0x40000000). JPEG gets GPano XMP. Filenames carry Quest tokens (`
     `size_from="auto"`, `save_extras=False`; from 0.2.0 also `back_images=None`,
     `back_relief="auto"`, `color_match=True`, `back_tries=0`, `back_steps=0`; M4 / M5 add
     `back_prompt=""`, `polish="auto"` (`run.POLISH_MODES`), `polish_steps=5000` and
-    `back_source="mvadapter"`; `thickness`, `back` and (from 0.2.0) `seed` also apply to
-    `sharp360`.
+    `back_source="mvadapter"`; M6 / M7 add `back_relief="sharp"`, `back_source` "qwen" /
+    "comfyui", `comfyui_url="http://127.0.0.1:8188"` and `comfyui_workflow=None`; `thickness`,
+    `back` and (from 0.2.0) `seed` also apply to `sharp360`.
   * GUI (0.2.0): `FieldMeta.enabled_if_all`, `addon_optional`, `file_filter`;
     `options_meta.field_applies(kind, name, values, *, meta=None)` (transitive: a field under
     a greyed-out sibling is greyed out) and `required_addon_groups(kind, values) -> ((ids,
@@ -522,10 +526,12 @@ left = right = 0x40000000). JPEG gets GPano XMP. Filenames carry Quest tokens (`
 Design and rationale: `docs/design/SHARP360.md`. 0.2.0-beta shipped the fusion core and the
 built-in `shell` back; 0.2.0 adds the `trellis` and `images` back sources, the registration
 library, view lifting, the CPU splat renderer, the previews and the seed ('Variation')
-option. M4 / M5 (unreleased) add the `mvadapter` add-on and back source (orthographic AI views,
-`GenView.kind="ortho"`), the view cache and the Brush polish. SHARP multi-image relief
-(`back_relief="sharp"`), YuNet and Qwen/ComfyUI arrive in later milestones behind the same
-interfaces.
+option. M4 / M5 (0.3.0b1) add the `mvadapter` add-on and back source (orthographic AI views,
+`GenView.kind="ortho"`), the view cache and the Brush polish. M6 / M7 (unreleased) add the SHARP
+relief (`back_relief="sharp"`, the SHARP worker's list input), the YuNet face check, `read_splats`
+row provenance, the experimental `qwen` back source (the `qwenedit` add-on: Qwen-Image-Edit-2511
+in a pinned headless ComfyUI) and the expert `comfyui` source (the user's own ComfyUI server and
+workflow), all behind the same interfaces (`pipeline/sharp360_ai.py`).
 
 **Frames and grids.**
 
@@ -664,6 +670,10 @@ def save_views_folder(views, folder, *, ortho) -> Path   # M4: editable "images"
 def qc_cost(diag | BackPart | None) -> float             # V11 cost of a view-based back; inf when unusable
 def choose_view_set(results) -> int | None               # index of the lowest qc_cost (first on a tie)
 def contact_sheet(ortho, views, *, tile=256, labels=True) -> uint8 RGB   # the _views.png preview
+def lock_back_view(ortho, canon, view, *, cancel=None) -> (GenView, diag)   # M7: V2 + V3 of ONE nominal
+    # back view without building a back (similarity + perspective fit, IoU 0.75 and pose gates, TPS lock):
+    # the view in the levelled back frame (meta used / reason) and the JSON-ready lock diag (ok, reason,
+    # iou, iou_similarity, iou_locked, pose_frac, ...) - choosing between AI back candidates
 # geometry/splat_render.py (CPU EWA splatting, numpy only; off the critical path)
 @dataclass class SplatCamera: R, center, width, height, kind="persp"|"ortho", fx, fy, m, cx=None, cy=None
     pinhole(f, width, height, *, R=None, center=None); forward; to_camera(P); project(P) -> (u, v, z)
@@ -680,19 +690,31 @@ QUALITY: dict[str, Quality(mould_long, stride, auto, tries=1, trellis_steps=(12,
                            mv_guidance=3.0, relief="depth", fill_holes=True, preview_px=384)]
     # fast: 512, 2, (shell,), relief "flat", no hole fill, 256 px, mv 20 steps | balanced: 768, 1,
     # (mvadapter, trellis, shell) | best: 1024, 1, (mvadapter, trellis, shell), tries 2, steps 25/25,
-    # mv 50 steps, 512 px
+    # mv 50 steps, 512 px, relief "sharp" (M6)
 Opts(..., seed, tries=1, steps=0, color_match=True, relief="auto", back_images=None, back_prompt="",
-     polish="auto", polish_steps=5000)
-SOURCES = {"shell": _src_shell, "trellis": _src_trellis, "images": _src_images,
-           "mvadapter": _src_mvadapter}                                          # fn(ctx, rep) -> BackPart
-SOURCE_NAMES / SOURCE_LABELS / SOURCE_ADDONS = {"trellis": "trellis", "mvadapter": "mvadapter"};
-GENERATED_VIEW_SOURCES = {"mvadapter"}; MAX_TRIES = 4; MAX_STEPS = 100; MAX_SEED = 2**31 - 1;
-PREVIEW_VIEWS = 8; MAX_PROMPT_CHARS = 300; PROMPT_SOURCES = ("auto", "mvadapter");
+     polish="auto", polish_steps=5000, comfyui_url="", comfyui_workflow=None)   # comfyui_*: M7, set
+                                                                                # only for "comfyui"
+SOURCES = {"shell": _src_shell, "trellis": _src_trellis, "images": _src_images, "mvadapter": _src_mvadapter,
+           "qwen": _src_qwen, "comfyui": _src_comfyui}     # fn(ctx, rep) -> BackPart; the last two are thin
+                                                          # wrappers that import pipeline/sharp360_ai.py lazily
+SOURCE_NAMES / SOURCE_LABELS / SOURCE_ADDONS = {"trellis": "trellis", "mvadapter": "mvadapter",
+    "qwen": "qwenedit"};  # "comfyui" needs no add-on (the user's own server)
+GENERATED_VIEW_SOURCES = {"mvadapter", "qwen", "comfyui"}; NEVER_AUTO = {"images", "qwen", "comfyui"};
+MAX_TRIES = 4; MAX_STEPS = 100; MAX_SEED = 2**31 - 1;
+PREVIEW_VIEWS = 8; MAX_PROMPT_CHARS = 300; PROMPT_SOURCES = ("auto", "mvadapter", "qwen", "comfyui");
 POLISH_STEPS_RANGE = (1000, 30000); MV_DEFAULT_PROMPT = "a person, full body, high quality, realistic
 photo"; MV_STEPS_RANGE = (5, 100)
-Ctx(run, item, photo, alpha, sc_full, front, canon, opts, previews={}, levelled=None, polish=None)
+Ctx(run, item, photo, alpha, sc_full, front, canon, opts, previews={}, levelled=None, polish=None, relief={})
     # previews["views"] = (OrthoInput, [GenView]), previews["views_source"]; levelled: the shared
-    # OrthoInput; polish: (runs, note) of the Brush polish
+    # OrthoInput; polish: (runs, note) of the Brush polish; relief: {"runs": [...]} of the SHARP
+    # relief (debug.json "relief")
+def _relief_fn(ctx, rep=None, *, ortho=None) -> (mode for view_based_back, depth_fn | None, used)
+    # auto -> Quality.relief (fast flat, balanced depth, best sharp); "sharp" -> sharp360_ai.sharp_depth_fn
+    # with the depth model as fallback (also when SHARP is not installed); returned mode "auto" stays
+    # quiet, "depth" warns about a missing depth model
+def _relief_notice(run, item, diag, used) -> None   # depth model's notice, or diag["relief"]["model"]="sharp"
+def _comfy_url(value) -> str; def _comfy_workflow(value) -> str   # M7 option checks (Qt-free; the GUI
+    # calls them at 'Create' too): InputError with hints
 def mv_settings(opts) -> (steps, guidance, prompt)   # 'AI steps' (clamped to 5-100) else Quality.mv_steps
 def resolve_options(spec, *, installed: Callable[[str], bool]) -> Opts   # InputError before any work;
     # thickness clamped to THICKNESS_RANGE = (0.06, 0.18) (Opts.thickness_asked; the job warns)
@@ -727,6 +749,35 @@ def front_copies(trained, front_rows, back_rows, *, search_m=COPY_SEARCH_M, canc
     # exact front row within 2 cm rather than an unpolished back row: Brush's copies of the front
 def telephoto_camera(canon, phi_deg, m, size, offset_m, y0, *, distance=40.0) -> (K, R, t)
 def levelled_center(front, canon) -> (x0, y0)
+# pipeline/sharp360_ai.py (M6 / M7; design 3.5.6, 4.4)
+QWEN_ADDON = "qwenedit"; CUTOUT_GREY = (200, 200, 200); VIEW_LONG_SIDE = 768; QWEN_STEPS_RANGE = (4, 40)
+SIDE_VIEWS = (("right", 90), ("left", 270)); QUARTER_VIEWS = (("back_right", 135), ("back_left", 225))
+FACE_PHIS = (135, 180, 225); CHI2_WEIGHT = 0.5; SLOW_VIEW_S = 120; COMFY_VIEW_TIMEOUT_S = 3600
+RELIEF_HFOV_DEG = 30.0; SHARP_RELIEF = "addon:sharp"
+def _src_qwen(ctx, rep) -> BackPart; def _src_comfyui(ctx, rep) -> BackPart
+def face_score(view, run=None) -> float                 # YuNet frontal score in the head region, 0.0 if none
+def face_scores(views, run=None) -> {name: score}       # the views at 135 / 180 / 225 deg
+def with_face_check(part, scores, *, reject, what="the back view") -> BackPart
+    # diag["face"] + the V11 "face" term (score >= faces.MIN_SCORE); > faces.REJECT_SCORE: ok=False
+    # ("a face was found on the back view (score 0.93)") when reject, else a warning
+def rim_chi2(rgb, alpha, ref_rgb, ref_alpha) -> float | None   # HSV (16x4x4) rim-band chi-square, [0, 1]
+def sharp_depth_fn(ctx, rep=None, *, ortho=None, explicit=False, fallback=None, used=None) -> depth_fn
+def view_prompt(phi_deg, extra="") -> str               # {{PROMPT}} of the comfyui source
+# segment/faces.py (M6; OpenCV cv2.FaceDetectorYN, model registry id "yunet", optional)
+MODEL_ID = "yunet"; REJECT_SCORE = 0.8; MIN_SCORE = 0.5; FIXED_SIZE = 640
+def find_faces(rgb, *, score_threshold=0.8, max_long=640, detector=None, download=True, cancel=None)
+    -> [(x, y, w, h, score)]
+def detect_faces(...) -> (N, 5 | 15) float32           # box, 5 landmarks, score (last column)
+def frontal_face_score(rgb, alpha=None, *, head_frac=0.3, min_score=0.5, frontal_only=True, max_long=640,
+                       detector=None, download=True, cancel=None) -> float   # 0.0: none / unavailable
+def head_region(alpha, head_frac=0.3, *, threshold=0.5) -> (x0, y0, x1, y1) | None; is_frontal(row)
+def get_detector(*, download=True, cancel=None) -> Detector | None; available(); supported(); reset()
+# geometry/sharp_relief.py (M6)
+def sharp_relief(ply_path | SplatCloud, *, f_px, width, height, out_size: int | (H, W), alpha=None,
+                 min_opacity=0.2, diag=None, cancel=None) -> float32 (Ho, Wo) in [0, 1]   # 1 = nearest
+    # the view's camera; nearest opaque centre per pixel (point z-buffer), gaps (> max(6 cm, 4 % z) behind
+    # the 5 x 5 median) and misses push-pull filled; disparity normalised by its 0.5 / 99.5 percentiles
+    # inside alpha (extrapolated outside); InputError for unusable input
 ```
 
 **Options (`resolve_options`, all before any work).** `back_source` in `run.BACK_SOURCES`,
@@ -736,12 +787,16 @@ whole floats from job files are accepted); `back_tries=0` = the quality's `tries
 `back_steps=0` = each source's own default (TRELLIS: the quality's `trellis_steps`). With
 `back_source="images"`, `back_images` must name an existing picture (or a folder of views)
 whose views include one from behind, with a readable header; it is ignored for the other
-sources. `auto` = the quality's `Quality.auto` sources whose add-on is installed (`balanced` / `best`:
-MV-Adapter, then TRELLIS; `fast`: only the shell), never `images`; an explicit source is tried
+sources. With `back_source="comfyui"`, `comfyui_url` must be an http(s) address and
+`comfyui_workflow` an existing API-format workflow with `{{IMAGE}}` (see `comfyui` below); both are
+ignored for the other sources. `auto` = the quality's `Quality.auto` sources whose add-on is installed (`balanced` / `best`:
+MV-Adapter, then TRELLIS; `fast`: only the shell), never `images`, `qwen` or `comfyui`
+(`NEVER_AUTO`); an explicit source is tried
 even when its add-on is missing (warning, then the shell). `back_prompt` ('Describe the hidden
 side') is tidied (white space collapsed) and at most 300 characters when `back_source` is
-`auto` or `mvadapter` (`PROMPT_SOURCES`; the GUI greys it out for the others and the job
-ignores it there); `polish` is one of `run.POLISH_MODES` (auto | off | on) and `polish_steps`
+`auto`, `mvadapter`, `qwen` or `comfyui` (`PROMPT_SOURCES`; the GUI greys it out for the others
+and the job ignores it there); `back_relief` "sharp" (M6) is accepted for every source (only the
+view-based ones read it); `polish` is one of `run.POLISH_MODES` (auto | off | on) and `polish_steps`
 a whole number 1000-30000. `seed` ('Variation') is the AI sources' seed (attempt `i` uses
 `seed + i`) and the seam dither's; the photographed front never depends on it.
 
@@ -959,6 +1014,139 @@ export's box crop never removes front rows.
   `Manojb/stable-diffusion-2-1-base` clone (the stabilityai repo was removed), adapter file
   0.71 GB, no peft (LoRA loading only); `disk_gb = 14` (the torch 2.8 + diffusers venv of about
   9.5 GB, as `sharp` / `sdxl360`, plus 3.5 GB of weights).
+* **Face check** (M6; design 3.5.6 / V11; authoritative where it differs). `segment/faces.py` runs
+  YuNet (registry `yunet`, MIT, 0.23 MB, downloaded on first use; no OpenCV support, offline or a
+  bad file: the check is skipped, never the job). `frontal_face_score` reports faces from 0.5 in
+  the top 30 % of the matte's bounding box, at least half on the matte and frontal by their
+  landmarks. Uses: an MV-Adapter set whose 180 deg view scores above 0.8 is unusable ("a face was
+  found on the back view (score ...)"; else the score from 0.5 is the QC `face` term); Qwen /
+  ComfyUI back candidates above 0.8 are rejected and their 135 / 225 views dropped; a face on the
+  user's own back photo is only a warning (`diag["face"]`), never a rejection.
+* **SHARP relief** (M6; `back_relief="sharp"`; authoritative where it differs). 'Back detail'
+  Automatic is "sharp" with `best` (design 1.3), "depth" with `balanced`, "flat" with `fast`.
+  `view_based_back` gets `sharp_depth_fn`: the locked back view it hands to `depth_fn` (`S x S` on
+  0.5 grey, so the relief lines up with the lock by construction) is saved as
+  `sharp_relief_<k>.png` and SHARP runs on it - `_run_addon("sharp", "image_to_splat", {"images":
+  [png]}, {"hfov_deg": RELIEF_HFOV_DEG (30, a long lens for an orthographic picture), "name":
+  "relief<k>"})` (app models freed first) - then `sharp_relief(plys[0], f_pxs[0], widths[0],
+  heights[0], out_size=S, alpha=mirrored front silhouette)`. A SHARP failure or an unusable cloud
+  falls back to the depth model (a warning only when "sharp" was chosen explicitly; quietly for
+  Automatic); `diag["relief"]["model"] = "sharp"` when SHARP shaped it; `debug.json` `relief.runs`
+  records every SHARP run (ok, seconds, stats / error). One SHARP run per lifted set (MV-Adapter
+  with two attempts: two runs). Only the back view (not the sides) is run through SHARP.
+* `qwen` / `comfyui` (M7; design 3.5.6; `pipeline/sharp360_ai.py`; authoritative where it
+  differs). Never chosen by "auto" (`NEVER_AUTO`); an explicit choice without the add-on / server
+  is one warning and the shell. Shared flow (`_nominal_back`):
+  1. Input: `run._cutout_rgba` (at most 1024 px) - `qwen_input.png` (RGBA; the worker composites it
+     on #c8c8c8) / for comfyui composited on #c8c8c8 by the app and resized to `VIEW_LONG_SIDE`
+     (multiples of 16), uploaded as `comfyui_input.png`. The levelled frame (`_levelled_input`) is
+     the frame the views are lined up in.
+  2. Phase 1: `Opts.tries` back candidates, seeds `seed + k` (qwen: one worker call `views=[{"name":
+     "back", "phi_deg": 180}], candidates=n`; comfyui: one prompt per candidate, `{{AZIMUTH}}` 180).
+  3. Choice: each candidate `load_views` -> `segment_views` -> `face_score` -> `lock_back_view`;
+     rejected when the face score > 0.8 ("a face was found on the back view") or a lock gate fails;
+     cost `(1 - IoU) + 0.5 rim_chi2(locked, levelled photo) + face (from 0.5)`, lowest wins (first on
+     a tie). None usable: `ok=False` ("a face was found on all 2 back views" / "none of its N back
+     views could be used: ..."), so the chain warns and falls back; the rejected candidates are on
+     the contact sheet. A candidate not chosen for a reason is a note ("The Qwen photo editor's back
+     view 1 of 2 was not used (...)").
+  4. Phase 2 (deviation: by quality - `fast` none, `balanced` 90 / 270, `best` also 135 / 225):
+     qwen one worker call with `references=[chosen back]` (picture 2; design "[input, chosen back]"
+     - the input is picture 1), `candidates=1`, `seed`; comfyui one prompt per view without a
+     reference (the placeholders carry one picture). A failure keeps the back alone (note "... could
+     not make the side views (...); the back was built from the back view alone.").
+  5. `view_based_back(source="qwen" | "comfyui")` on `[chosen back, *sides]` (nominal path; the
+     left / right naming check tests both sign hypotheses) with the job's relief (`_relief_fn`,
+     `ortho`), colour match, stride, seed and the quality's hole filling; then the chosen back's
+     face score as the QC face term. `BackPart.diag`: the view-based diag plus `candidates`
+     (`candidate`, `seed`, `file`, `cached`, `ok`, `face`, `iou`, `iou_locked`, `pose_frac`,
+     `chi2`, `cost`, `reason`), `chosen`, `seed`, `tries`, `sides`, `input` ("cutout"), `prompt`,
+     `generator` (`made`, `seconds`, `cache_hits`; qwen: `worker` {comfyui_version, steps, cfg,
+     lightning, ram_tier, vram_mode, precision, worker_version}, `steps_asked`; comfyui: `url`,
+     `comfyui_version`, `workflow`). Contact sheet and (save_extras) views folder as for
+     MV-Adapter; the add-on notice (qwen) and the segmenter / depth-model notices when used.
+  * qwen specifics: 'AI steps' 0 = the worker's default (4 with the Lightning LoRA), else clamped to
+    4-40; `prompt_extra` = 'Describe the hidden side'; `long_side` 768. Every picture is a view-cache
+    entry (`make_key(content_hash(cut-out RGBA), source="qwen", params={view, phi, seed, steps,
+    prompt, long_side[, back: sha256[:32] of the chosen back file]}, worker=worker_version(manifest))`),
+    looked up before generating (only the missing seeds / views are requested; missing back seeds as
+    one contiguous `seed`, `candidates` range). After a worker failure or cancel the finished views
+    of `views.partial.jsonl` are stored; after a failure with at least one back candidate they are
+    used with a note ("The Qwen photo editor could not make every back view (...); the ones made
+    before were used."). A note when generation averaged more than `SLOW_VIEW_S` per view ("... took
+    N minutes for M views; on a GTX 10-series card every view takes several minutes ..."). Worker
+    warnings reach the job as "<manifest title>: <warning>".
+  * comfyui specifics: `ComfyClient(comfyui_url, timeout=30)`; `system_stats()` first (before the
+    levelling: "Your ComfyUI server could not make the back (ComfyUI is not running at <url>); the
+    built-in back was used instead."), `_free_app_gpu()`, upload, then per view
+    `substitute(workflow, {IMAGE: uploaded name, PROMPT: view_prompt(phi, back_prompt), SEED, AZIMUTH:
+    int degrees, WIDTH, HEIGHT}, strict=True)` -> `queue` -> `wait(cancel=run.cancel, timeout_s=3600)`
+    (a cancel interrupts the prompt and raises `Cancelled`) -> the last output picture is downloaded.
+    Every `ComfyError` becomes `AddonError` with ComfyUI's own message as a clause (a rejected
+    workflow names the failing nodes). No view cache (the user's workflow and models may change).
+    Options (`resolve_options`, before any work, only for `back_source="comfyui"`): `comfyui_url`
+    via `_comfy.normalize_url` (http / https; empty = the default), `comfyui_workflow` must exist,
+    be API format (`load_workflow`; ComfyUI's UI format is refused with the 'Export (API)' hint),
+    use `{{IMAGE}}` and no placeholder outside `_comfy.PLACEHOLDERS`.
+* **Worker `views_from_photo`** (`addons/workers/qwenedit_worker.py`, manifest `qwenedit`,
+  `experimental = true`, `noncommercial = false`, `min_ram_gb = 16`, `disk_gb = 30`, `min_vram_gb =
+  6`): inputs `image` (the cut-out; RGBA composited on #c8c8c8, RGB used as it is with a warning),
+  `references` (at most 2 pictures, wired in as picture 2 / 3); params `views` (`[{"name",
+  "phi_deg"}]`, at most 8; default back, right, left, back_right, back_left), `candidates` (1-4; only
+  views within 22.5 deg of 180 get them, seeds `seed + k`), `seed`, `steps` (4-40; default 4 with the
+  Lightning LoRA, else 40), `cfg` (1-10; 1 / 4), `prompt_extra` (300 characters), `long_side`
+  (512-1024, multiples of 16; 768: the output AND every reference latent - the graph makes them
+  with `ImageScale` -> `VAEEncode` -> chained `ReferenceLatent` and gives `TextEncodeQwenImageEditPlus`
+  no `vae`, which would encode each picture at a fixed ~1 megapixel), `ram_tier` (auto | low |
+  normal), `lightning` (auto | true | false; the LoRA's install step is optional: missing -> a
+  warning, 40 steps at CFG 4), `az_sign` (+1 / -1: phi 90 = the LoRA's "right side view" with +1,
+  unverified), `view_timeout_s` (60-14400; default 3600 up to 8 model passes, proportionally more
+  above: 14400 for 40 steps at CFG 4), `name`; outputs `{"views": [{"name", "phi_deg", "file",
+  "candidate", "seed"}], "frame": "nominal", "warnings", "comfyui_version", "input", "width",
+  "height", "steps", "cfg", "lightning", "ram_tier", "ram_gb", "vram_mode", "precision", "scale",
+  "skipped", "az_sign", "view_timeout_s", "worker_version"}`; files `<name>_<view>_c<k>.png`, one JSON line per finished view in
+  `views.partial.jsonl`. Runtime: below 16 GB of RAM (1.5 GB slack) refused ("use 'Your own back
+  photo' or the built-in back"), below 24 GB `--cache-none`; a private ComfyUI v0.39.2 (+ ComfyUI-GGUF)
+  child process on a free 127.0.0.1 port (`--lowvram --reserve-vram 1.0 --fp32-vae --offline
+  --disable-metadata ...`, `HF_HUB_OFFLINE=1`, folders in the job's work folder, in-memory database;
+  ComfyUI's log lines lose their colour codes; a port taken before ComfyUI bound it - its "Port N is
+  already in use" line - is retried on another port, 3 tries),
+  `/object_info` must list every node and model file; no torch import in the worker during a job (GPU
+  presence from `/system_stats`); ladder: out of memory / crash -> `--novram` restart -> 0.8 x size ->
+  skip the view; a black / NaN picture -> one `--force-fp32` restart; the first view failing for
+  another reason stops the run; ComfyUI is always stopped in `finally` (kill-on-close Job object on
+  Windows). The models are pinned `hf_download` steps (Hugging Face revisions `"main"` for now).
+* **ComfyUI client** (`addons/workers/_comfy.py`, standard library only, imported by the qwenedit
+  worker and by the app - the frozen build keeps it via `packaging/spec_helpers.APP_WORKER_MODULES`):
+  `ComfyError(message, hint=None, *, kind, details)` (`kind`: connection, http, rejected, execution,
+  oom, interrupted, cancelled, timeout, protocol; `.oom`), `ComfyCancelled`, `ComfyTimeout`;
+  `ComfyClient(base_url="http://127.0.0.1:8188", *, timeout=30, client_id=None)`: `system_stats()`,
+  `version()`, `object_info(node_class=None)`, `missing_nodes(names)`, `choices(node_class,
+  input_name)`, `upload_image(path, *, subfolder="", overwrite=True, name=None) -> str`,
+  `queue(graph, *, prompt_id=None, extra_data=None) -> prompt_id`, `queue_state()`,
+  `position(prompt_id)`, `history(prompt_id)`, `wait(prompt_id, *, cancel=None, poll_s=0.5,
+  timeout_s=None, on_progress=None) -> history entry` (cancel / timeout first interrupt the
+  prompt), `wait_ready(timeout_s=120, *, cancel=None, alive=None, poll_s=0.5)`, `outputs(entry, *,
+  keys=("images",)) -> [(filename, subfolder, type)]`, `download(file_ref, dest) -> Path`,
+  `interrupt(prompt_id=None)`, `delete_queued(ids)`, `cancel_prompt(prompt_id)`, `free()`; `cancel`
+  is a callable, a `threading.Event` or an object with `.cancelled`. Graph helpers:
+  `PLACEHOLDERS = ("IMAGE", "PROMPT", "SEED", "AZIMUTH", "WIDTH", "HEIGHT")`, `substitute(graph,
+  mapping, *, strict=False)` (a value that is exactly one placeholder keeps the mapped type),
+  `placeholders(graph) -> set`, `load_workflow(path) -> dict` (unwraps `{"prompt": graph}`, refuses
+  the UI format), `is_api_graph`, `check_entry`, `describe_rejection`, `is_oom_text`, `free_port`,
+  `normalize_url`.
+* **SHARP worker list input** (M6; `sharp_worker.py`, task `image_to_splat`, manifest unchanged):
+  `image` and/or `images: [paths]` (both: `image` first unless the list holds it; neither:
+  "Missing input 'image'"); `hfov_deg` a number or one value (or null) per picture (10-170; a list
+  of the wrong length is an error). Single-picture outputs are unchanged (`ply, frame, f_px, width,
+  height`, `warnings` only after a CPU fallback); list outputs add `plys, f_pxs, widths, heights,
+  devices, warnings` (`<name>_<i>.ply`). The model loads once; a picture that runs out of GPU
+  memory is made on the CPU and the next one tries the GPU again.
+* **Row provenance** (M6): `mode_sharp360` reads SHARP's PLY with `read_splats(ply,
+  return_rows=True)`; SHARP writes its Gaussians in grid order, so `SharpCam.n_raw` (the grid
+  detection) is the file's row count `max(kept, last kept row + 1)` (a lower bound when the last rows
+  were dropped) rather than the number of finite Gaussians; `debug.json` `sharp`: `gaussians`,
+  `file_rows`, `dropped_rows` (logged when > 0).
 * **Brush polish** (M5; design 3.11; authoritative where it differs). `_polish_plan` (after the
   back source) asks `polish_allowed`: `off` never; `auto` only with `best`, a back with
   registered views (MV-Adapter, your back photo) and a passed self-test (`Settings.brush_test`);
@@ -1005,8 +1193,9 @@ plain-SHARP fallback.
   size=Quality.preview_px, cols=4)` - views at 0, 45, ..., 315 deg (0 = the photo's side, 90 =
   from the subject's left), 256 / 384 / 512 px each for fast / balanced / best.
 * `<base>_sharp360_views.png`: `contact_sheet(ortho, views, tile=256)` whenever the `images`
-  source made its levelled frame or MV-Adapter made views - also when the back was rejected (the
-  pictures are outlined as not used). Output label "SHARP 360° back photos as lined up (PNG)" /
+  source made its levelled frame or MV-Adapter, the Qwen photo editor or your ComfyUI made views -
+  also when the back was rejected (the pictures are outlined as not used; for `qwen` / `comfyui`
+  the back candidates that were not chosen follow the views, named "back <k>"). Output label "SHARP 360° back photos as lined up (PNG)" /
   "SHARP 360° AI views as lined up (PNG)".
 * Progress ranges: SHARP 0.10-0.25, front 0.25-0.30, back 0.30-0.72, stitch 0.72-0.88,
   export 0.88-0.92, previews 0.92-0.97 ("Rendering a turntable preview"), scene 0.97-1.0.
@@ -1031,10 +1220,10 @@ box crop of the generated rows (front rows are kept even outside the box) ->
 
 **Outputs.** `<base>_cutout.png`, `<base>_sharp360.splat` (feet at y = 0, front facing +z,
 life-size), `<base>_sharp360_preview.jpg`, `<base>_sharp360_views.png` (only after a view-based
-source: `images`, `mvadapter`); with `save_extras` also `<base>_sharp360.ply`,
+source: `images`, `mvadapter`, `qwen`, `comfyui`); with `save_extras` also `<base>_sharp360.ply`,
 `_sharp360_front.splat` (the cleaned SHARP front alone), `_sharp360_back.splat` (the generated
 part alone; both in the main splat's frame and size), `_sharp360_debug.json` and, after
-MV-Adapter, the views folder `_sharp360_views/`; `_sharp360_polish.log` when a Brush polish
+MV-Adapter, the Qwen photo editor or your ComfyUI, the views folder `_sharp360_views/`; `_sharp360_polish.log` when a Brush polish
 failed. The debug data (options, camera, front stats,
 frame, source attempts, merge / floater counts, sizes, previews, timings, warnings) is always written to
 the job's work folder and summarised in one log line. None of these names ends in a Quest

@@ -19,6 +19,7 @@ millimetres with ``scale=1000``).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,8 +50,15 @@ class FieldMeta:
         zero_label: text shown instead of the minimum value (e.g. "Off" for 0 seconds).
         placeholder: grey hint text for text/path fields.
         enabled_if: ``(sibling field, allowed values)`` - widget is greyed out otherwise.
+        enabled_if_all: more ``(sibling field, allowed values)`` conditions that must ALL hold
+            as well (e.g. "method is SHARP 360 and the back source is a photo").  Use
+            :func:`field_applies` to evaluate them, never the tuples directly.
         only_modes: Common fields only - job kinds where the field is shown (None = all).
         addon_choices: ``value -> add-on id candidates`` for choices that need an add-on.
+        addon_optional: the add-ons of ``addon_choices`` are nice to have: the job warns and
+            falls back without them, so the GUI offers to continue instead of refusing.
+        file_filter: ``kind="file"`` only - name of the file-dialog filter ("images" for
+            photos; empty = all files), resolved by ``panels.options.PathEditor``.
     """
 
     label: str
@@ -70,14 +78,21 @@ class FieldMeta:
     zero_label: str | None = None
     placeholder: str = ""
     enabled_if: tuple[str, tuple[Any, ...]] | None = None
+    enabled_if_all: tuple[tuple[str, tuple[Any, ...]], ...] = ()
     only_modes: frozenset | None = None
     addon_choices: dict[Any, tuple[str, ...]] = field(default_factory=dict)
+    addon_optional: bool = False
+    file_filter: str = ""
 
     def __hash__(self) -> int:  # dict field is unhashable; labels are unique enough
         return hash((self.label, self.kind))
 
     def choice_values(self) -> list[Any]:
         return [v for v, _ in self.choices]
+
+    def conditions(self) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+        """Every ``(sibling field, allowed values)`` condition: ``enabled_if`` + ``enabled_if_all``."""
+        return ((self.enabled_if,) if self.enabled_if else ()) + tuple(self.enabled_if_all)
 
 
 # --------------------------------------------------------------------------- shared rows
@@ -613,9 +628,9 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             "great from the front and sides. TRELLIS builds a full 3D model including the back "
             "(add-on, NVIDIA GPU). SHARP, SHARP 360°, TRELLIS.2 and Hunyuan3D are experimental "
             "add-ons (shown when experimental features are on in Settings). SHARP 360° keeps "
-            "SHARP's photo-real front and adds a back, so you can walk all the way round; in this "
-            "version the back is a smooth built-in shape (it uses the SHARP add-on, nothing else "
-            "to download).",
+            "SHARP's photo-real front and adds a back made by the built-in shape, TRELLIS or your "
+            "own back photo (see 'Back made by'), so you can walk all the way round. It needs only "
+            "the SHARP add-on; TRELLIS is used when you have it.",
             "combo",
             choices=(
                 ("billboard", "Billboard (instant, no add-on)"),
@@ -682,15 +697,18 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
         ),
         "seed": FieldMeta(
             "Variation",
-            "TRELLIS, TRELLIS.2 and Hunyuan3D only: change this number to get a different version "
-            "of the 3D model. (SHARP and SHARP 360° always give the same result for the same photo.)",
+            "TRELLIS, TRELLIS.2, Hunyuan3D and SHARP 360°: change this number to get a different "
+            "version of the 3D model. With SHARP 360° it changes the AI-made back (TRELLIS) and "
+            "the pattern where the photo front blends into the back; the photographed front stays "
+            "exactly the same. (Plain SHARP always gives the same result for the same photo.)",
             "spin",
             minimum=0,
             maximum=999999,
             step=1,
             advanced=True,
-            # SHARP is deterministic and takes no seed
-            enabled_if=("method", ("trellis", "trellis2", "hunyuan")),
+            # plain SHARP is deterministic and takes no seed; SHARP 360 uses it for its AI back
+            # sources and the seam dither
+            enabled_if=("method", ("trellis", "trellis2", "hunyuan", "sharp360")),
         ),
         "hunyuan_texture": FieldMeta(
             "Paint texture",
@@ -704,27 +722,114 @@ JOB_META: dict[str, dict[str, FieldMeta]] = {
             advanced=True,
             enabled_if=("method", ("hunyuan",)),
         ),
-        # ---- SHARP 360 (docs/design/SHARP360.md §1.2; this version ships the built-in back only)
+        # ---- SHARP 360 (docs/design/SHARP360.md §1.2): built-in, TRELLIS and back-photo backs
         "back_source": FieldMeta(
             "Back made by",
             "SHARP 360° only: what makes the side of the person or object the photo could not "
-            "see. 'Built-in shape' needs no download and takes seconds: a smooth, rounded back in "
-            "the colours around the outline - it looks like the person from behind in soft focus, "
-            "with no clothing or hair detail, and is always closed and life-size. 'Automatic' "
-            "picks the best back that is installed; in this version that is always the built-in "
-            "shape (AI-made backs follow in later versions).",
+            "see. 'Automatic' uses the best back that is installed: TRELLIS if you have its add-on, "
+            "else the built-in shape (with 'Fast' back quality always the built-in shape). "
+            "'Built-in shape' needs no download (about 1-2 minutes in all): a smooth, rounded back "
+            "in the colours around the outline - like the person from behind in soft focus, with "
+            "no clothing or hair detail, but always closed and life-size. 'TRELLIS' (add-on, "
+            "about 20 GB; about 4-8 minutes in all on a GTX 1080) lets an AI build the whole "
+            "person in 3D and uses only its back half: real volume (hair, shoulders, a bag) but a "
+            "soft, flat-lit texture. 'Your own back photo' (no download, about 1-3 minutes) fits a "
+            "photo of the person from behind - or a back view made with any AI tool - to the "
+            "outline; this can look the most real (choose the picture under 'Back photo'). If the "
+            "chosen back cannot be made, the built-in shape is used and the job says why.",
             "combo",
-            choices=(("auto", "Automatic"), ("shell", "Built-in shape (no download)")),
+            choices=(
+                ("auto", "Automatic (best installed)"),
+                ("shell", "Built-in shape (no download)"),
+                ("trellis", "TRELLIS (add-on)"),
+                ("images", "Your own back photo"),
+            ),
             enabled_if=("method", ("sharp360",)),
+            # optional: a missing TRELLIS is a warning and the built-in back, never a failure
+            addon_choices={"trellis": ("trellis",)},
+            addon_optional=True,
         ),
         "back_quality": FieldMeta(
             "Back quality",
             "SHARP 360° only: how much care goes into the back. 'Fast' builds a coarser back and "
-            "finishes quickest; 'Balanced' is recommended; 'Best' builds the finest back surface "
-            "and takes longer. The photographed front looks the same with all three.",
+            "finishes quickest ('Automatic' then always uses the built-in shape); 'Balanced' is "
+            "recommended; 'Best' builds the finest back surface and gives TRELLIS more steps and "
+            "two attempts (the best fitting is kept), so it takes longer. The photographed front "
+            "looks the same with all three.",
             "combo",
             choices=(("fast", "Fast"), ("balanced", "Balanced"), ("best", "Best (slower)")),
             enabled_if=("method", ("sharp360",)),
+        ),
+        "back_images": FieldMeta(
+            "Back photo",
+            "SHARP 360° with 'Your own back photo': a picture of the same person or object from "
+            "behind, ideally in the same pose and from a similar distance and height. Any photo "
+            "of them from behind works, and so does a back view made with an AI tool (for "
+            "example a photo editor that can turn the person round). The app bends it onto the "
+            "outline of your front photo; a back in a clearly different pose is not used (the "
+            "built-in shape is, with a warning). Optional side photos make the sides more "
+            "accurate: put them in the same folder, named right, left, back_right, back_left, "
+            "front_right or front_left (e.g. right.jpg). 'right' means you walked to your right "
+            "around the person to take it (you then see their left side); back_right is half way "
+            "between right and the back, front_right half way between the front and right.",
+            "file",
+            placeholder="Choose the photo of the back",
+            file_filter="images",
+            enabled_if=("method", ("sharp360",)),
+            enabled_if_all=(("back_source", ("images",)),),
+        ),
+        "back_relief": FieldMeta(
+            "Back detail",
+            "SHARP 360° with a back made from a picture (your own back photo): how the surface "
+            "of the back gets its shape detail. 'From the picture' lets the depth model add folds, "
+            "hair and clothing relief seen in the back picture (a few seconds more); 'Smooth' keeps "
+            "the rounded shape and only takes the colours from the picture - use it if the back "
+            "looks bumpy or dented. 'Automatic' uses the picture, except with 'Fast' back quality "
+            "(smooth). The built-in shape and TRELLIS do not use this.",
+            "combo",
+            choices=(("auto", "Automatic"), ("depth", "From the picture (depth model)"), ("flat", "Smooth")),
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+        ),
+        "color_match": FieldMeta(
+            "Match colours to the photo",
+            "SHARP 360° only: adjusts the brightness and colours of the back (TRELLIS or your own "
+            "back photo) to match your front photo, so the join does not show as a change of "
+            "light. Turn it off if your back photo already has the right colours and matching "
+            "makes them worse. The built-in back takes its colours from the photo anyway.",
+            "check",
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+        ),
+        "back_tries": FieldMeta(
+            "AI attempts",
+            "SHARP 360° with an AI-made back (TRELLIS, also under 'Automatic'): how many backs "
+            "the AI makes; the one that fits your photo best is kept. 'Automatic' makes 1 attempt "
+            "(2 with 'Best' back quality). Each attempt takes roughly 2-5 minutes on a GTX 1080. "
+            "Change 'Variation' to get different attempts.",
+            "spin",
+            minimum=0,
+            maximum=4,
+            step=1,
+            zero_label="Automatic",
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+            enabled_if_all=(("back_source", ("auto", "trellis")),),
+        ),
+        "back_steps": FieldMeta(
+            "AI steps",
+            "SHARP 360° with an AI-made back (TRELLIS, also under 'Automatic'): how many "
+            "refining steps the AI takes per attempt. More steps can give a cleaner, more detailed "
+            "shape but take longer. 'Automatic' uses 12 (25 with 'Best' back quality); on a GTX "
+            "1080 the AI part of an attempt takes roughly twice as long with 25 steps as with 12.",
+            "spin",
+            minimum=0,
+            maximum=100,
+            step=1,
+            zero_label="Automatic",
+            advanced=True,
+            enabled_if=("method", ("sharp360",)),
+            enabled_if_all=(("back_source", ("auto", "trellis")),),
         ),
         "seam_deg": FieldMeta(
             "Keep the photo up to",
@@ -1068,14 +1173,84 @@ def field_meta(kind: str, name: str) -> FieldMeta:
     return JOB_META[kind][name]
 
 
-def required_addon_candidates(kind: str, values: dict[str, Any]) -> tuple[str, ...]:
-    """Add-on id candidates a job with these option ``values`` needs (empty if none)."""
+def _meta_table(kind: str | None) -> Mapping[str, FieldMeta]:
+    """The metadata table of a job ``kind`` (``"common"`` for :data:`COMMON_META`)."""
+    if kind == "common":
+        return COMMON_META
+    return JOB_META.get(kind or "", {})
+
+
+def field_applies(
+    kind: str | None,
+    name: str,
+    values: Mapping[str, Any],
+    *,
+    meta: Mapping[str, FieldMeta] | None = None,
+) -> bool:
+    """False if field ``name`` of job ``kind`` is greyed out for these option ``values``.
+
+    The single rule behind the option panel's greyed-out rows and the GUI's add-on check (so
+    the two cannot disagree): a field applies when its ``enabled_if`` and every
+    ``enabled_if_all`` condition hold AND every sibling field it depends on applies itself - a
+    row under a greyed-out switch is greyed out too, even if its own metadata forgot a
+    condition.  The value of a sibling missing from ``values`` (unknown, or an invalid entry in
+    the panel) restricts nothing; its own conditions still count.  ``kind`` ``"common"`` means
+    :data:`COMMON_META`; ``meta`` replaces the table looked up from ``kind`` (for forms built
+    from another table).  Pure, no Qt.
+    """
+    table = meta if meta is not None else _meta_table(kind)
+    seen: set[str] = set()
+
+    def applies(n: str) -> bool:
+        m = table.get(n)
+        if m is None or n in seen:  # unknown field, or already checked (also breaks cycles)
+            return True
+        seen.add(n)
+        for other, allowed in m.conditions():
+            if other in values and values[other] not in allowed:
+                return False
+            if not applies(other):
+                return False
+        return True
+
+    return applies(name)
+
+
+def required_addon_groups(kind: str, values: Mapping[str, Any]) -> tuple[tuple[tuple[str, ...], bool], ...]:
+    """Add-ons a job with these option ``values`` uses, as ``((any-of add-on ids, optional), ...)``.
+
+    One group per need, in form order: the mode's own add-on (required), then one per option
+    whose chosen value names add-ons (``addon_choices``) - optional when that option has
+    ``addon_optional`` (the job then warns and falls back, e.g. SHARP 360's back sources).
+    Options greyed out by :func:`field_applies` are skipped, so a remembered
+    ``back_source="trellis"`` on a Billboard job asks for nothing.  A group needed both ways
+    is required; any one installed id of a group satisfies it.
+    """
+    groups: dict[tuple[str, ...], bool] = {}
+
+    def add(ids: tuple[str, ...], optional: bool) -> None:
+        ids = tuple(dict.fromkeys(ids))
+        if ids:
+            groups[ids] = groups.get(ids, True) and optional
+
     mode = MODE_BY_KIND.get(kind)
-    cands: list[str] = list(mode.needs_addon) if mode else []
-    for name, meta in JOB_META.get(kind, {}).items():
-        if meta.addon_choices and values.get(name) in meta.addon_choices:
-            cands.extend(meta.addon_choices[values[name]])
-    return tuple(dict.fromkeys(cands))
+    if mode is not None and mode.needs_addon:
+        add(tuple(mode.needs_addon), False)
+    for name, m in JOB_META.get(kind, {}).items():
+        if not m.addon_choices or name not in values:
+            continue
+        try:
+            ids = m.addon_choices.get(values[name])
+        except TypeError:  # an unhashable (broken remembered) value names no add-on
+            continue
+        if ids and field_applies(kind, name, values):
+            add(tuple(ids), m.addon_optional)
+    return tuple(groups.items())
+
+
+def required_addon_candidates(kind: str, values: Mapping[str, Any]) -> tuple[str, ...]:
+    """Every add-on id of :func:`required_addon_groups` (required and optional), flattened."""
+    return tuple(dict.fromkeys(aid for ids, _optional in required_addon_groups(kind, values) for aid in ids))
 
 
 __all__ = [
@@ -1090,5 +1265,7 @@ __all__ = [
     "PRESETS",
     "PRESET_NAMES",
     "field_meta",
+    "field_applies",
+    "required_addon_groups",
     "required_addon_candidates",
 ]

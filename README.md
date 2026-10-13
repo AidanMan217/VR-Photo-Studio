@@ -32,7 +32,9 @@ experimental SHARP, TRELLIS.2 and Hunyuan3D), photo-capture-to-3D (COLMAP + Brus
 rest of a 360°/180° sphere (SDXL).
 
 **New (experimental): SHARP 360°** keeps SHARP's photo-real front of a person, adds a back and makes
-them life-size, so you can walk all the way round them in passthrough AR (beta: a smooth built-in back).
+them life-size, so you can walk all the way round them in passthrough AR. The back is a smooth built-in
+shape, made by TRELLIS (if you have that add-on), or taken from your own photo of the person from behind;
+a turntable preview picture shows the result from all sides.
 
 ---
 

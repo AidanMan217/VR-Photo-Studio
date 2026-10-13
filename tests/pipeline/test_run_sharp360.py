@@ -1,9 +1,12 @@
-"""SHARP 360 jobs end to end (docs/design/SHARP360.md section 5.3, the 0.2.0-beta subset).
+"""SHARP 360 jobs end to end (docs/design/SHARP360.md section 5.3; the TRELLIS back has its
+own file, test_sharp360_trellis.py).
 
 A fake SHARP add-on returns a SHARP-like cloud of the analytic synthetic person
 (tests/geometry/synth_person.py); the photo is that person's render and the segmenter
-returns its matte, so the front clean-up, the built-in back, the stitching and the
-life-size export all run for real on consistent data.
+returns its matte, so the front clean-up, the built-in back, the stitching, the life-size
+export and the previews all run for real on consistent data.  The "your own back photo"
+tests write orthographic renders of the same person from behind / the side as the user's
+photos (on a grey background, which the fake segmenter keys out).
 """
 
 from __future__ import annotations
@@ -126,8 +129,9 @@ def person(tmp_path, monkeypatch, events):
             id = "birefnet-lite"
 
             def segment(self, img, *, rect=None, progress=None, cancel=None):
-                assert img.shape[:2] == scene.alpha.shape
                 events.append("segment")
+                if img.shape[:2] != scene.alpha.shape:  # a back / side photo on its grey background
+                    return (np.abs(img.astype(np.int16) - 128).max(axis=2) > 15).astype(np.float32)
                 return scene.alpha.copy()
 
         seg = Seg()
@@ -173,12 +177,13 @@ def test_sharp360_writes_a_life_size_splat(make_job, person, check_scene):
     assert not [w for w in res.warnings if "non-commercial" not in w], res.warnings
 
 
-def test_sharp360_says_that_variation_has_no_effect(make_job, person):
+def test_sharp360_uses_variation(make_job, person):
+    """'Variation' drives the AI backs and the seam dither (0.2.0): no "not used" warning."""
     photo, _ = person()
     res = run_job(
         make_job("object", [photo], method="sharp360", seed=5, common_extra={"export_scene": False})
     )
-    assert any("Variation" in w for w in res.warnings)
+    assert not any("Variation" in w for w in res.warnings), res.warnings
 
 
 def test_sharp360_save_extras(make_job, person):
@@ -314,6 +319,21 @@ def test_sharp360_auto_size_of_a_cut_off_subject(make_job, person, check_scene):
     res = run_job(make_job("object", [photo], method="sharp360", height_m=1.9, size_from="height"))
     assert check_scene(res, "object")["object"]["height_m"] == pytest.approx(1.9, rel=1e-3)
     assert not any("cut off" in w for w in res.warnings)
+
+
+def test_sharp360_front_is_untouched_with_the_built_in_back(make_job, person, monkeypatch):
+    """Design 5.2 "front untouched": seen from the photo's camera, the fused result (front +
+    built-in back, stitched, colours feathered, floaters removed) is SHARP's cleaned front."""
+    from pipeline_helpers import capture_stitch, front_render_difference, generated_on_the_front
+
+    seen = capture_stitch(monkeypatch)
+    photo, _ = person()
+    run_job(make_job("object", [photo], method="sharp360", common_extra={"export_scene": False}))
+    assert seen["part"].source == "shell" and int((~seen["is_front"]).sum()) > 1000
+    diff, n = front_render_difference(seen)
+    assert n > 5000 and diff < 2.0, diff
+    share, n_gen = generated_on_the_front(seen)  # nothing generated lies on the photographed side
+    assert n_gen > 1000 and share < 0.02, share
 
 
 def test_plain_sharp_is_unchanged(make_job, person, check_scene):
@@ -469,7 +489,7 @@ def test_releasing_app_models_never_fails_the_job(make_job, person, monkeypatch)
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [
-        ("back_source", "trellis", "back source"),
+        ("back_source", "magic", "back source"),
         ("back_quality", "ultra", "back quality"),
         ("seam_deg", 20, "Keep the photo up to"),
         ("seam_deg", 85, "Keep the photo up to"),
@@ -477,6 +497,7 @@ def test_releasing_app_models_never_fails_the_job(make_job, person, monkeypatch)
         ("size_from", "tape", "Size from"),
         ("back", "shiny", "back texture"),
         ("thickness", -0.1, "Thickness"),
+        ("back_relief", "bumpy", "Back detail"),
     ],
 )
 def test_bad_sharp360_options_fail_before_any_work(make_job, person, events, field, value, match):
@@ -500,8 +521,7 @@ def test_resolve_options():
     fast = S.resolve_options(_spec(back_quality="FAST", back_source="shell"), installed=lambda a: True)
     assert fast.sources == ("shell",) and (fast.mould_long, fast.stride) == (512, 2)
     best = S.resolve_options(_spec(back_quality="best", seam_deg=35, save_extras=1, seed=7), installed=bool)
-    # no 'Variation' option yet: the same photo always gives the same result
-    assert (best.mould_long, best.seam, best.save_extras, best.seed) == (1024, 35.0, True, 0)
+    assert (best.mould_long, best.seam, best.save_extras, best.seed) == (1024, 35.0, True, 7)
     assert S.resolve_options(_spec(seam_deg="80"), installed=bool).seam == 80.0
 
 
@@ -711,3 +731,345 @@ def test_sharp360_survives_a_cloud_that_misses_the_subject(make_job, person, che
     assert _splat_output(res)[1].is_file()
     check_scene(res, "object")
     assert any("could not be separated from the background" in w for w in res.warnings), res.warnings
+
+
+def test_sharp360_resolves_the_back_photo_and_relief(tmp_path):
+    back = _views_folder(tmp_path, names=("back",))
+    o = S.resolve_options(_spec(back_source="images", back_images=str(back)), installed=lambda a: True)
+    assert o.sources == ("images", "shell") and o.back_images == str(back) and o.relief == "auto"
+    # a path pasted with Windows Explorer's 'Copy as path' keeps its quotes; a folder is fine too
+    for value, want in ((f'"{back}"', back), (f"  '{back}' ", back), (str(back.parent), back.parent)):
+        o = S.resolve_options(_spec(back_source="images", back_images=value), installed=bool)
+        assert o.back_images == str(want), value
+    # "auto" never picks the back photo (it needs the user's picture), whatever is installed
+    for quality in R.BACK_QUALITIES:
+        o = S.resolve_options(_spec(back_quality=quality, back_images=str(back)), installed=lambda a: True)
+        assert "images" not in o.sources and o.back_images is None
+    # a remembered (even missing) back photo is ignored by the other sources
+    o = S.resolve_options(_spec(back_source="shell", back_images=str(tmp_path / "gone.jpg")), installed=bool)
+    assert o.back_images is None
+    assert S.resolve_options(_spec(back_relief=" FLAT "), installed=bool).relief == "flat"
+    # 'Back detail' Automatic: the depth model, except with "fast" (smooth, design 1.3)
+    for quality, relief, mode in (
+        ("balanced", "auto", "auto"),
+        ("best", "depth", "depth"),
+        ("fast", "auto", "flat"),
+        ("fast", "depth", "depth"),
+        ("balanced", "flat", "flat"),
+    ):
+        o = S.resolve_options(_spec(back_quality=quality, back_relief=relief), installed=bool)
+        got, fn, used = S._relief_fn(SimpleNamespace(opts=o, run=None))
+        assert got == mode and (fn is None) == (mode == "flat") and used == []
+    assert S.QUALITY["fast"].fill_holes is False and S.QUALITY["balanced"].fill_holes is True
+
+
+# --------------------------------------------------------------------------- previews (design 1.5 / 3.13)
+def _outputs(res) -> dict[str, tuple[str, Path]]:
+    """``file name -> (label, path)`` of a job's outputs."""
+    return {Path(p).name: (k, Path(p)) for k, p in res.outputs.items()}
+
+
+def _image(path: Path) -> np.ndarray:
+    from PIL import Image
+
+    with Image.open(path) as im:
+        return np.asarray(im.convert("RGB"))
+
+
+def _tile_colours(sheet: np.ndarray, size: int, k: int) -> dict[str, float]:
+    """Share of each side colour among the subject's pixels of turntable view ``k``."""
+    r, c = divmod(k, 4)
+    tile = sheet[r * size : (r + 1) * size, c * size : (c + 1) * size].reshape(-1, 3)
+    subject = np.abs(tile.astype(np.int16) - 32).max(axis=1) > 40  # not the dark grey background
+    names = sp.classify_rgb(tile[subject], sp.SIDES)
+    return {n: float((names == n).mean()) for n in sp.SIDES}
+
+
+def test_sharp360_writes_a_turntable_preview(make_job, person):
+    photo, _ = person()
+    res = run_job(
+        make_job("object", [photo], method="sharp360", save_extras=True, common_extra={"export_scene": False})
+    )
+    out = _outputs(res)
+    label, prev = out["photo_sharp360_preview.jpg"]
+    assert label == "SHARP 360° turntable preview (JPEG)"
+    sheet = _image(prev)
+    assert sheet.shape == (2 * 384, 4 * 384, 3)  # 8 views of "balanced"'s 384 px, 4 per row
+    assert "photo_sharp360_views.png" not in out  # no view-based source ran
+    # the 0 deg view is the photographed (red) front; every view shows the subject
+    assert _tile_colours(sheet, 384, 0)["front"] > 0.6
+    for k in range(8):
+        r, c = divmod(k, 4)
+        tile = sheet[r * 384 : (r + 1) * 384, c * 384 : (c + 1) * 384]
+        assert (np.abs(tile.astype(np.int16) - 32).max(axis=2) > 40).mean() > 0.02, k
+    dbg = json.loads(out["photo_sharp360_debug.json"][1].read_text(encoding="utf-8"))
+    assert dbg["previews"]["turntable"] == dict(dbg["previews"]["turntable"], views=8, px=384)
+    assert dbg["seconds"]["previews"] > 0
+    # "fast" makes smaller views
+    res = run_job(
+        make_job(
+            "object", [photo], method="sharp360", back_quality="fast", common_extra={"export_scene": False}
+        )
+    )
+    assert _image(Path(res.outputs["SHARP 360° turntable preview (JPEG)"])).shape == (2 * 256, 4 * 256, 3)
+
+
+def test_a_failed_preview_is_only_a_warning(make_job, person, monkeypatch):
+    from vrphoto.geometry import splat_render
+
+    def broken(*a, **k):
+        raise RuntimeError("renderer bug (test)")
+
+    monkeypatch.setattr(splat_render, "turntable_sheet", broken)
+    photo, _ = person()
+    res = run_job(make_job("object", [photo], method="sharp360", common_extra={"export_scene": False}))
+    assert (
+        "The turntable preview could not be made (RuntimeError); the 3D result is not affected."
+        in res.warnings
+    )
+    assert _splat_output(res)[1].is_file() and "photo_sharp360_preview.jpg" not in _outputs(res)
+    # ... but a cancel while it renders stops the job
+    token = CancelToken()
+
+    def cancelled(*a, **k):
+        token.cancel()
+        raise Cancelled("Operation cancelled")
+
+    monkeypatch.setattr(splat_render, "turntable_sheet", cancelled)
+    with pytest.raises(Cancelled):
+        run_job(
+            make_job("object", [photo], method="sharp360", common_extra={"export_scene": False}), cancel=token
+        )
+
+
+# --------------------------------------------------------------------------- your own back photo (design 3.5.4)
+#: Azimuth, metres per pixel and size of the synthetic "user photos" (each framed differently).
+VIEW_SHOTS = {"back": (180.0, 0.006, 360), "right": (90.0, 0.005, 420), "left": (270.0, 0.007, 300)}
+
+
+def _views_folder(folder: Path, names=("back", "right"), body=None) -> Path:
+    """Synthetic photos of the person from behind / the side next to each other: orthographic
+    renders on a grey studio background, each framed differently from the photo (the app
+    lines them up).  ``body`` poses the person differently.  Returns the back photo's path."""
+    from PIL import Image
+
+    canon = sp.synth_canon(sp.make_body(), sp.make_cam(W, H, HFOV, grid=G))
+    body = body or sp.make_body()
+    folder = Path(folder) / "back_photos"
+    folder.mkdir(exist_ok=True)
+    for name in names:
+        phi, m, n = VIEW_SHOTS[name]
+        rgb, _, _ = sp.ortho_view(body, canon, phi, m=m, N=n)
+        Image.fromarray(rgb).save(folder / f"{name}.png")
+    return folder / "back.png"
+
+
+def _far_sides(path: Path) -> dict[str, float]:
+    """Share of each side colour among the opaque Gaussians of the far quarter of an exported
+    splat (lowest z: the subject faces +z).  The true body there is mostly its blue back;
+    the built-in back takes its colours from the photo's outline band (the red front)."""
+    from vrphoto.geometry.splat import read_splats
+
+    sc = read_splats(path)
+    z = sc.means[:, 2]
+    names = sp.classify_rgb(sc.colors[(z < np.percentile(z, 25)) & (sc.opacity > 0.5)], sp.SIDES)
+    return {n: float((names == n).mean()) for n in sp.SIDES}
+
+
+def test_sharp360_back_from_your_photos(make_job, person, check_scene, monkeypatch):
+    from pipeline_helpers import capture_stitch, front_render_difference, generated_on_the_front
+
+    seen = capture_stitch(monkeypatch)
+    photo, fm = person()
+    back = _views_folder(photo.parent)  # back.png + right.png
+    res = run_job(
+        make_job(
+            "object",
+            [photo],
+            method="sharp360",
+            back_source="images",
+            back_images=str(back),
+            back_quality="fast",  # the quickest mould: what is tested here is the source itself
+            height_m=1.6,
+            save_extras=True,
+        )
+    )
+    assert [c["addon_id"] for c in fm.calls] == ["sharp"]  # no AI add-on
+    assert not [w for w in res.warnings if not w.startswith("Note:")], res.warnings
+    key, splat = _splat_output(res)
+    assert key == "3D object (Gaussian splat, SHARP 360°, back from your photo)"
+    block = check_scene(res, "object")["object"]
+    assert block["scale"] == 1.0 and block["height_m"] == pytest.approx(1.6, rel=1e-3)
+    assert _robust(splat)[1] == pytest.approx(1.6, rel=0.01)
+
+    out = _outputs(res)
+    dbg = json.loads(out["photo_sharp360_debug.json"][1].read_text(encoding="utf-8"))
+    assert dbg["options"]["sources"] == ["images", "shell"] and dbg["options"]["back_images"] == str(back)
+    assert dbg["sources"] == [dict(dbg["sources"][0], source="images", ok=True)]
+    assert dbg["back"]["source"] == "images" and dbg["back"]["kind"] == "mould"
+    d = dbg["back"]["diag"]
+    assert d["files"] == {"90": "right.png", "180": "back.png"}
+    assert d["back"]["iou_locked"] >= 0.95 and d["back"]["pose_frac"] < 0.06, d["back"]
+    assert [v["name"] for v in d["views"] if v.get("used")] == ["right"], d["views"]
+    assert d["relief"]["source"] == "flat"  # "fast": a smooth back
+    assert d["holes"] == {} and d["qc"]["cost"] >= 0  # "fast" fills no side holes
+    # the back is the photo's (blue), not the built-in one's (red, from the outline band)
+    sides = _far_sides(out["photo_sharp360_back.splat"][1])
+    assert sides["back"] > 0.6 and sides["front"] < 0.05, sides
+    # the turntable shows it from behind (180 deg: bottom-left view; 256 px tiles with "fast")
+    assert _tile_colours(_image(out["photo_sharp360_preview.jpg"][1]), 256, 4)["back"] > 0.6
+    # the contact sheet: the levelled photo, the back and the right photo
+    label, views_png = out["photo_sharp360_views.png"]
+    assert label == "SHARP 360° back photos as lined up (PNG)"
+    assert _image(views_png).shape == (256, 3 * 256, 3)
+    assert dbg["previews"]["views"] == dict(dbg["previews"]["views"], views=2)
+    # the photographed front is untouched: seen from the photo's camera the fused result is
+    # SHARP's cleaned front (design 5.2), and nothing generated lies on the photographed side
+    diff, n = front_render_difference(seen)
+    assert n > 5000 and diff < 2.0, diff
+    share, n_gen = generated_on_the_front(seen)
+    assert n_gen > 1000 and share < 0.02, share
+
+
+def test_sharp360_back_relief_from_the_depth_model(make_job, person, monkeypatch):
+    """A real depth model shapes the back from the back photo; its licence notice is added."""
+    from vrphoto.core.types import DepthResult
+
+    calls = []
+
+    def depth(self, img, **kw):
+        calls.append(img.shape)
+        h, w = img.shape[:2]
+        yy, xx = np.mgrid[0:h, 0:w]
+        bulge = 1.0 - np.hypot((xx - w / 2) / w, (yy - h / 2) / h)  # the middle is nearest
+        return DepthResult(disparity=bulge.astype(np.float32), model_id="da2-base")
+
+    monkeypatch.setattr(context.RunContext, "depth", depth)
+    photo, _ = person()
+    back = _views_folder(photo.parent, names=("back",))
+    res = run_job(
+        make_job(
+            "object",
+            [photo],
+            method="sharp360",
+            back_source="images",
+            back_images=str(back),
+            back_quality="fast",  # 'Back detail' asked for explicitly: the depth model runs even so
+            back_relief="depth",
+            save_extras=True,
+            common_extra={"export_scene": False},
+        )
+    )
+    assert calls == [(512, 512, 3)]  # the back photo, lined up in the levelled frame
+    dbg = json.loads(_outputs(res)["photo_sharp360_debug.json"][1].read_text(encoding="utf-8"))
+    assert dbg["back"]["source"] == "images"
+    assert dbg["back"]["diag"]["relief"] == dict(dbg["back"]["diag"]["relief"], source="depth", mode="detail")
+    notes = [w for w in res.warnings if w.startswith("Note:") and "non-commercial model" in w]
+    assert len(notes) == 1 and "Depth Anything" in notes[0], res.warnings
+    # ('Smooth' and "fast" never run it: test_sharp360_resolves_the_back_photo_and_relief)
+
+
+def test_sharp360_back_photo_in_another_pose_falls_back(make_job, person):
+    photo, fm = person()
+    back = _views_folder(photo.parent, names=("back",), body=sp.make_body_pose(left_arm_deg=60.0))
+    res = run_job(
+        make_job(
+            "object",
+            [photo],
+            method="sharp360",
+            back_source="images",
+            back_images=str(back),
+            save_extras=True,
+            common_extra={"export_scene": False},
+        )
+    )
+    fb = [w for w in res.warnings if not w.startswith("Note:")]
+    assert len(fb) == 1, res.warnings
+    assert fb[0].startswith("Your back photo could not make a usable back (") and "different pose" in fb[0]
+    assert fb[0].endswith("; the built-in back was used instead."), fb
+    assert "built-in back" in _splat_output(res)[0]
+    out = _outputs(res)
+    dbg = json.loads(out["photo_sharp360_debug.json"][1].read_text(encoding="utf-8"))
+    att = dbg["sources"]
+    assert [(a["source"], a["ok"]) for a in att] == [("images", False), ("shell", True)]
+    assert att[0]["diag"]["back"]["pose_frac"] > 0.06
+    # the contact sheet still shows the back photo (outlined as not used): it says why
+    assert _image(out["photo_sharp360_views.png"][1]).shape == (256, 2 * 256, 3)
+
+
+def _half_copied(path: Path) -> Path:
+    """The picture as a half-finished copy leaves it: a JPEG whose header is fine (the job
+    accepts it before any work) but whose data ends half way (decoding fails)."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        im.convert("RGB").save(path.with_suffix(".jpg"), quality=95)
+    data = path.with_suffix(".jpg").read_bytes()
+    path.unlink()
+    out = path.with_suffix(".jpg")
+    out.write_bytes(data[: len(data) // 2])
+    return out
+
+
+@pytest.mark.parametrize("case", ["back_unreadable", "side_unreadable", "nothing_in_either"])
+def test_sharp360_back_photos_that_cannot_be_used_are_named(make_job, person, case):
+    """An unreadable or empty back / side photo is named in the warning (not "there is no
+    picture of the back", nor the side photo's problem in place of the back photo's)."""
+    photo, _ = person()
+    back = _views_folder(photo.parent)  # back.png + right.png
+    if case == "back_unreadable":
+        back = _half_copied(back)
+    elif case == "side_unreadable":
+        _half_copied(back.parent / "right.png")
+    else:  # both pictures show only the grey studio background
+        from PIL import Image
+
+        for name in ("back.png", "right.png"):
+            Image.fromarray(np.full((300, 300, 3), 128, np.uint8)).save(back.parent / name)
+    res = run_job(
+        make_job(
+            "object",
+            [photo],
+            method="sharp360",
+            back_source="images",
+            back_images=str(back),
+            back_quality="fast",
+            save_extras=True,
+            common_extra={"export_scene": False},
+        )
+    )
+    fb = [w for w in res.warnings if not w.startswith("Note:")]
+    dbg = json.loads(_outputs(res)["photo_sharp360_debug.json"][1].read_text(encoding="utf-8"))
+    if case == "side_unreadable":  # the back photo is used; the side photo is named
+        assert dbg["back"]["source"] == "images"
+        assert len(fb) == 1 and "The right picture (right.jpg) could not be read" in fb[0], fb
+        d = dbg["back"]["diag"]
+        assert d["files"] == {"180": "back.png"} and "right.jpg" in d["dropped"][0]
+        return
+    assert len(fb) == 1 and fb[0].startswith("Your back photo could not make a usable back ("), fb
+    assert "built-in back" in _splat_output(res)[0]
+    if case == "back_unreadable":
+        assert "the back picture (back.jpg) could not be read (" in fb[0], fb
+    else:
+        assert "the back picture (back.png) was not used: no subject was found" in fb[0], fb
+    assert "right" not in fb[0] and "there is no picture of the back" not in fb[0]
+
+
+@pytest.mark.parametrize("case", ["none", "empty", "missing", "not_a_picture", "no_back", "corrupt"])
+def test_sharp360_back_photo_problems_fail_before_any_work(make_job, person, events, tmp_path, case):
+    folder = tmp_path / "pics"
+    folder.mkdir()
+    (folder / "notes.txt").write_text("not a picture", encoding="utf-8")
+    (folder / "broken.png").write_bytes(b"this is not a PNG")
+    value, match = {
+        "none": (None, "needs a picture of the back"),
+        "empty": ("  ", "needs a picture of the back"),
+        "missing": (str(folder / "gone.jpg"), "was not found"),
+        "not_a_picture": (str(folder / "notes.txt"), "is not a picture"),
+        "no_back": (str(_views_folder(tmp_path, names=("right",)).parent), "No picture of the back"),
+        "corrupt": (str(folder / "broken.png"), "cannot be used"),
+    }[case]
+    photo, fm = person()
+    with pytest.raises(InputError, match=match):
+        run_job(make_job("object", [photo], method="sharp360", back_source="images", back_images=value))
+    assert not fm.calls and not events  # before SHARP and before finding the subject

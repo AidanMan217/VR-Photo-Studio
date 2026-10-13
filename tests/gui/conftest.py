@@ -37,7 +37,9 @@ def prompts(monkeypatch) -> Prompts:
     from vrphoto.gui.dialogs import common as dc
 
     p = Prompts()
+    p.real_ask_choice = util.ask_choice  # for the tests of the dialog itself
     monkeypatch.setattr(util, "ask_yes_no", p.ask)
+    monkeypatch.setattr(util, "ask_choice", p.choose)
     monkeypatch.setattr(util, "show_error", p.error)
     monkeypatch.setattr(util, "show_info", p.info)
     monkeypatch.setattr(util, "open_path", lambda path: True)

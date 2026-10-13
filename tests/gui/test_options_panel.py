@@ -182,7 +182,7 @@ def test_seed_and_texture_follow_the_method(panel_factory):
     for method, seed_on, texture_on in (
         ("billboard", False, False),
         ("sharp", False, False),
-        ("sharp360", False, False),  # the built-in back is deterministic (no seed this release)
+        ("sharp360", True, False),  # TRELLIS's result and the seam pattern
         ("trellis", True, False),
         ("trellis2", True, False),
         ("hunyuan", True, True),
@@ -194,7 +194,18 @@ def test_seed_and_texture_follow_the_method(panel_factory):
     assert p.build_spec(["x.jpg"]).hunyuan_texture is True
 
 
-SHARP360_FIELDS = ("back_source", "back_quality", "seam_deg", "size_from", "save_extras")
+#: SHARP 360 fields enabled for method sharp360 with the default back source ("auto")
+SHARP360_FIELDS = (
+    "back_source",
+    "back_quality",
+    "back_relief",
+    "color_match",
+    "back_tries",
+    "back_steps",
+    "seam_deg",
+    "size_from",
+    "save_extras",
+)
 
 
 @pytest.mark.parametrize("method", ["billboard", "trellis", "sharp", "trellis2", "hunyuan", "sharp360"])
@@ -209,6 +220,165 @@ def test_sharp360_fields_follow_the_method(panel_factory, method):
         assert p.form.labels[name].isEnabled() is on, (method, name)
     for name in ("thickness", "back"):
         assert p.form.editors[name].isEnabled() is (method in ("billboard", "sharp360")), (method, name)
+    # the back photo also needs back_source "images"
+    assert not p.form.editors["back_images"].isEnabled()
+    p.form.set_values({"back_source": "images"})
+    assert p.form.editors["back_images"].isEnabled() is on and p.form.labels["back_images"].isEnabled() is on
+
+
+#: (back source, back photo on, AI knobs on) for method sharp360
+SOURCES = (("auto", False, True), ("shell", False, False), ("trellis", False, True), ("images", True, False))
+
+
+@pytest.mark.parametrize("source,photo_on,ai_on", SOURCES)
+def test_sharp360_source_fields_follow_the_back_source(panel_factory, source, photo_on, ai_on):
+    """design §5.5: 'Back photo' only for images; 'AI attempts' / 'AI steps' for auto and
+    TRELLIS; the other back options for every source."""
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values({"method": "sharp360", "back_source": source})
+    form = p.form
+    assert form.editors["back_images"].isEnabled() is photo_on
+    for name in ("back_tries", "back_steps"):
+        assert form.editors[name].isEnabled() is ai_on, name
+        assert form.labels[name].isEnabled() is ai_on, name
+    for name in ("back_relief", "color_match", "back_quality", "seam_deg", "seed", "thickness"):
+        assert form.editors[name].isEnabled(), name
+    # switching the method away greys them all out, whatever the remembered source
+    form.set_values({"method": "billboard"})
+    for name in ("back_images", "back_tries", "back_steps", "back_relief", "color_match"):
+        assert not form.editors[name].isEnabled(), name
+
+
+def test_greyed_out_rows_match_options_meta(panel_factory):
+    """The panel and the add-on check use the same rule (options_meta.field_applies)."""
+    p = panel_factory("object", show_experimental=True)
+    methods = p.form.editors["method"].values()
+    for method in methods:
+        for source in om.JOB_META["object"]["back_source"].choice_values():
+            p.form.set_values({"method": method, "back_source": source})
+            vals = p.form.values()
+            for name, ed in p.form.editors.items():
+                expected = om.field_applies("object", name, vals)
+                assert ed.isEnabled() is expected, (method, source, name)
+                assert p.form._applies(name) is expected, (method, source, name)
+
+
+def _picture(path):
+    """A small real picture (the panel checks the back photo's header like the job does)."""
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (32, 48), (40, 70, 220)).save(path)
+    return path
+
+
+def test_sharp360_back_photo_options_round_trip(panel_factory, tmp_path):
+    back = _picture(tmp_path / "pics" / "back.jpg")
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values(
+        {
+            "method": "sharp360",
+            "back_source": "images",
+            "back_images": str(back),
+            "back_relief": "flat",
+            "color_match": False,
+            "seed": 7,
+        }
+    )
+    spec = p.build_spec(["x.jpg"])
+    assert (spec.back_source, spec.back_images, spec.back_relief) == ("images", str(back), "flat")
+    assert spec.color_match is False and spec.seed == 7
+    assert job_from_dict(json.loads(json.dumps(job_to_dict(spec)))) == spec
+    q = panel_factory("object", show_experimental=True)
+    q.load_options(p.options_dict())
+    assert q.build_spec(["x.jpg"]) == spec
+
+
+def test_sharp360_back_photo_is_checked_before_the_job(panel_factory, tmp_path):
+    """'Your own back photo' without a picture (or a missing one) is a friendly InputError at
+    'Create'; a remembered path is ignored when the back photo is not used."""
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values({"method": "sharp360", "back_source": "images"})
+    with pytest.raises(InputError, match="needs a picture of the back") as e:
+        p.build_spec(["x.jpg"])
+    assert "Back photo" in e.value.hint
+    p.form.editors["back_images"].edit.setText("   ")  # blank is "no back photo"
+    assert p.form.values()["back_images"] is None
+    with pytest.raises(InputError, match="needs a picture"):
+        p.build_spec(["x.jpg"])
+    p.form.set_values({"back_images": str(tmp_path / "gone.jpg")})
+    with pytest.raises(InputError, match="not found"):
+        p.build_spec(["x.jpg"])
+    # not used -> not checked (greyed out), and the remembered path is kept in the spec
+    for values in ({"back_source": "shell"}, {"back_source": "images", "method": "billboard"}):
+        p.form.set_values(values)
+        assert p.build_spec(["x.jpg"]).back_images == str(tmp_path / "gone.jpg")
+
+
+def test_back_photo_check_is_the_jobs_own(panel_factory, tmp_path):
+    """The panel checks the back photo as the job will: a folder of views is fine (the tooltip
+    asks for side photos next to the back photo), a path pasted with Windows Explorer's 'Copy
+    as path' (quotes) is fine, and a file that is not a picture is caught at 'Create', not in
+    the queue."""
+    back = _picture(tmp_path / "pics" / "back.jpg")
+    _picture(tmp_path / "pics" / "right.jpg")
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values({"method": "sharp360", "back_source": "images"})
+    for value in (str(back.parent), f'"{back}"', f"  {back}  "):
+        p.form.set_values({"back_images": value})
+        assert p.build_spec(["x.jpg"]).back_source == "images", value
+    notes = tmp_path / "pics" / "notes.txt"
+    notes.write_text("not a picture", encoding="utf-8")
+    for value, match in (
+        (str(notes), "not a picture"),
+        (str(_picture(tmp_path / "sides" / "right.jpg").parent), "No picture of the back"),
+    ):
+        p.form.set_values({"back_images": value})
+        with pytest.raises(InputError, match=match):
+            p.build_spec(["x.jpg"])
+    broken = tmp_path / "pics" / "broken.jpg"
+    broken.write_bytes(b"not a JPEG")
+    p.form.set_values({"back_images": str(broken)})
+    with pytest.raises(InputError, match="cannot be used"):
+        p.build_spec(["x.jpg"])
+
+
+def test_sharp360_ai_knobs_show_automatic(panel_factory):
+    p = panel_factory("object", show_experimental=True)
+    p.form.set_values({"method": "sharp360", "back_source": "trellis"})
+    for name, value in (("back_tries", 2), ("back_steps", 25)):
+        ed = p.form.editors[name]
+        assert ed.spin.text() == "Automatic" and ed.value() == 0
+        ed.spin.setValue(ed.spin.maximum())
+        assert ed.value() == om.JOB_META["object"][name].maximum
+        p.form.set_values({name: value})
+    spec = p.build_spec(["x.jpg"])
+    assert (spec.back_tries, spec.back_steps) == (2, 25)
+    assert isinstance(spec.back_tries, int) and isinstance(spec.back_steps, int)
+
+
+def test_back_photo_browse_offers_photos(qtbot, monkeypatch, tmp_path):
+    """The 'Back photo' Browse dialog lists photos (plus 'All files'); folders are unchanged."""
+    meta = om.JOB_META["object"]["back_images"]
+    pe = opt.make_editor("back_images", meta, opt.FieldType(str, True))
+    qtbot.addWidget(pe)
+    assert isinstance(pe, opt.PathEditor)
+    seen = []
+    pick = tmp_path / "back.jpg"
+
+    def fake_open(parent, caption, start, flt=""):
+        seen.append((caption, flt))
+        return str(pick), flt
+
+    monkeypatch.setattr(opt.QFileDialog, "getOpenFileName", staticmethod(fake_open))
+    pe.browse()
+    caption, flt = seen[-1]
+    assert caption == "Back photo"
+    assert "*.jpg" in flt and "*.png" in flt and "All files (*)" in flt and "*.mp4" not in flt
+    assert pe.value() == str(pick)
+    folder = opt.make_editor("output_dir", om.COMMON_META["output_dir"], opt.FieldType(str, True))
+    qtbot.addWidget(folder)
+    assert folder.name_filter() == ""
 
 
 def test_sharp360_hidden_unless_experimental(panel_factory):

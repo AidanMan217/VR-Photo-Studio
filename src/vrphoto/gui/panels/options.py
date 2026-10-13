@@ -477,7 +477,11 @@ class TextEditor(FieldEditor):
 
 
 class PathEditor(TextEditor):
-    """Line edit + "Browse..." button (``kind`` "file" or "folder")."""
+    """Line edit + "Browse..." button (``kind`` "file" or "folder").
+
+    A file field's dialog lists the files named by ``FieldMeta.file_filter`` ("images" =
+    the photo formats the app reads, plus "All files" for odd extensions).
+    """
 
     def __init__(self, name, meta, ftype, parent=None):
         super().__init__(name, meta, ftype, parent)
@@ -486,12 +490,22 @@ class PathEditor(TextEditor):
         self._layout.addWidget(self.button)
         self.button.clicked.connect(self.browse)
 
+    def name_filter(self) -> str:
+        """QFileDialog name filter of a file field ("" = all files)."""
+        if self.meta.file_filter == "images":
+            from ..util import image_dialog_filter
+
+            return image_dialog_filter()
+        if self.meta.file_filter:
+            log.debug("Unknown file filter %r for %s", self.meta.file_filter, self.name)
+        return ""
+
     def browse(self) -> None:
         start = self.edit.text().strip() or str(Path.home())
         if self.meta.kind == "folder":
             path = QFileDialog.getExistingDirectory(self, self.meta.label, start)
         else:
-            path, _ = QFileDialog.getOpenFileName(self, self.meta.label, start)
+            path, _ = QFileDialog.getOpenFileName(self, self.meta.label, start, self.name_filter())
         if path:
             self.edit.setText(str(Path(path)))
 
@@ -619,11 +633,13 @@ class OptionsForm(QWidget):
         show_experimental: bool = False,
         choice_provider: Callable[[str], list[tuple[Any, str]]] = dynamic_choices,
         advanced_title: str = "Advanced",
+        kind: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.cls = cls
         self.meta = meta
+        self.kind = kind  # job kind ("common" for CommonOptions): for options_meta.field_applies
         self.types = field_types(cls)
         self.defaults = default_values(cls)
         self.editors: dict[str, FieldEditor] = {}
@@ -678,10 +694,11 @@ class OptionsForm(QWidget):
         self.changed.emit()
 
     def _update_enabled(self) -> None:
+        vals = self._lenient_values()
         for n, ed in self.editors.items():
-            if not self.meta[n].enabled_if:
+            if not self.meta[n].conditions():
                 continue
-            on = self._applies(n)
+            on = self._applies(n, vals)
             ed.setEnabled(on)
             self.labels[n].setEnabled(on)
 
@@ -705,17 +722,23 @@ class OptionsForm(QWidget):
                     out[n] = self.defaults.get(n)
         return out
 
-    def _applies(self, name: str) -> bool:
-        """False if field ``name`` is greyed out by its ``enabled_if`` condition."""
-        cond = self.meta[name].enabled_if
-        if not cond:
+    def _lenient_values(self) -> dict[str, Any]:
+        """Current values, leaving out invalid entries (which then grey nothing out)."""
+        out: dict[str, Any] = {}
+        for n, ed in self.editors.items():
+            try:
+                out[n] = ed.value()
+            except InputError:
+                continue
+        return out
+
+    def _applies(self, name: str, values: dict[str, Any] | None = None) -> bool:
+        """False if field ``name`` is greyed out (``options_meta.field_applies``, the same rule
+        the add-on check uses)."""
+        if not self.meta[name].conditions():
             return True
-        other, allowed = cond
-        src = self.editors.get(other)
-        try:
-            return True if src is None else (src.value() in allowed)
-        except InputError:
-            return True
+        vals = self._lenient_values() if values is None else values
+        return om.field_applies(self.kind, name, vals, meta=self.meta)
 
     def set_values(self, values: dict[str, Any]) -> None:
         for n, v in values.items():
@@ -796,6 +819,7 @@ class JobOptionsPanel(QWidget):
             om.JOB_META.get(kind, {}),
             show_experimental=show_experimental,
             choice_provider=choice_provider,
+            kind=kind,
         )
         self.form.changed.connect(self._on_user_change)
         lay.addWidget(self.form)
@@ -816,6 +840,7 @@ class JobOptionsPanel(QWidget):
             show_experimental=show_experimental,
             choice_provider=choice_provider,
             advanced_title="More",
+            kind="common",
         )
         self.common.set_values(self.common_defaults)
         self.common.changed.connect(self._on_user_change)
@@ -924,6 +949,18 @@ class JobOptionsPanel(QWidget):
                 "The 'Custom' camera movement needs key frames.",
                 hint="Open 'Advanced' and enter key frames, or pick another camera movement.",
             )
+        # SHARP 360 'Your own back photo': the job would stop on a missing picture anyway
+        # (before any work); saying so here keeps it out of the queue
+        if self.kind == "object" and "back_images" in d and om.field_applies(self.kind, "back_images", d):
+            back = d.get("back_images")
+            if not back:
+                raise InputError(
+                    "'Your own back photo' needs a picture of the back.",
+                    hint="Choose it with 'Browse…' next to 'Back photo', or pick another 'Back made by'.",
+                )
+            from ...pipeline.sharp360 import _back_photo  # the job's own check (Qt-free, header only)
+
+            _back_photo(back)  # missing, not a picture, no view from behind, unreadable; folders are fine
 
     def set_common_defaults(self, defaults: dict[str, Any], apply: dict[str, Any] | None = None) -> None:
         """Change the Common defaults (used by Reset/presets) and set ``apply`` values now."""

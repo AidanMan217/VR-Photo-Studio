@@ -1,8 +1,9 @@
 """Small Qt + non-Qt helpers shared by the GUI: image conversion, media discovery,
 thumbnails, friendly error text, message boxes and opening files/folders.
 
-Message-box helpers (:func:`ask_yes_no`, :func:`show_error`, :func:`show_info`) are the
-single place where the GUI blocks on user input, so tests can monkeypatch them.
+Message-box helpers (:func:`ask_yes_no`, :func:`ask_choice`, :func:`show_error`,
+:func:`show_info`) are the single place where the GUI blocks on user input, so tests can
+monkeypatch them.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import html
 import os
 import traceback
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,12 @@ def file_dialog_filter() -> str:
     img = " ".join(f"*{e}" for e in sorted(images))
     vid = " ".join(f"*{e}" for e in sorted(videos))
     return f"Photos and videos ({img} {vid});;Photos ({img});;Videos ({vid});;All files (*)"
+
+
+def image_dialog_filter() -> str:
+    """Name filter string for QFileDialog when one photo is wanted (e.g. a back photo)."""
+    img = " ".join(f"*{e}" for e in sorted(media_exts()[0]))
+    return f"Photos ({img});;All files (*)"
 
 
 # --------------------------------------------------------------------------- image loading (worker threads)
@@ -348,6 +355,40 @@ def ask_yes_no(
     box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
     box.setDefaultButton(QMessageBox.StandardButton.Yes if default_yes else QMessageBox.StandardButton.No)
     return box.exec() == QMessageBox.StandardButton.Yes
+
+
+def ask_choice(
+    parent: QWidget | None,
+    title: str,
+    text: str,
+    buttons: Sequence[str],
+    *,
+    default: int = 0,
+    escape: int | None = None,
+    informative: str | None = None,
+) -> int | None:
+    """Ask a question with custom ``buttons`` (shown in the given order); returns the index of
+    the clicked button, or None if the box was closed without one.  ``escape`` is the button
+    that Esc / the window's close button press.  (Tests monkeypatch this.)"""
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle(title)
+    box.setText(text)
+    if informative:
+        box.setInformativeText(informative)
+    # one role for all buttons: QMessageBox orders buttons by role (platform style), and a
+    # single role keeps them in the order the caller gave
+    added = [box.addButton(label, QMessageBox.ButtonRole.ActionRole) for label in buttons]
+    if added:
+        box.setDefaultButton(added[min(max(default, 0), len(added) - 1)])
+        if escape is not None and 0 <= escape < len(added):
+            box.setEscapeButton(added[escape])
+    box.exec()
+    clicked = box.clickedButton()
+    for i, b in enumerate(added):
+        if clicked is b:
+            return i
+    return None
 
 
 def show_error(

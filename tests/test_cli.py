@@ -664,6 +664,7 @@ def test_choices_follow_the_runner():
     assert ns.job__output == "half_tb"
     assert t[("object", "back_source")] == R.BACK_SOURCES
     assert t[("object", "back_quality")] == R.BACK_QUALITIES
+    assert t[("object", "back_relief")] == R.BACK_RELIEFS
     assert t[("object", "size_from")] == R.SIZE_FROM
     assert "sharp360" in t[("object", "method")]
 
@@ -705,15 +706,97 @@ def test_sharp360_dry_run_prints_the_job(tmp_path):
     assert d["method"] == "sharp360" and d["back_quality"] == "fast" and d["back_source"] == "auto"
 
 
+def test_sharp360_back_photo_options_parse():
+    """design §1.6: the back-photo example parses; the path is kept as given."""
+    args = ["object", "front.jpg", "--method", "sharp360", "--back-source", "images"]
+    args += ["--back-images", "D:/pics/back.jpg", "--back-relief", "flat", "--no-color-match"]
+    spec = cli.spec_from_namespace("object", cli.build_parser().parse_args(args))
+    assert (spec.method, spec.back_source, spec.back_images) == ("sharp360", "images", "D:/pics/back.jpg")
+    assert spec.back_relief == "flat" and spec.color_match is False
+    # a Windows path with backslashes is not touched either
+    args[args.index("D:/pics/back.jpg")] = "D:\\pics\\back.jpg"
+    spec = cli.spec_from_namespace("object", cli.build_parser().parse_args(args))
+    assert spec.back_images == "D:\\pics\\back.jpg"
+    # unset: no back photo, colour matching on
+    spec = cli.spec_from_namespace("object", cli.build_parser().parse_args(["object", "f.jpg"]))
+    assert spec.back_images is None and spec.color_match is True and spec.back_relief == "auto"
+
+
+def test_sharp360_back_photo_home_folder_is_expanded(monkeypatch, tmp_path):
+    """PowerShell / cmd pass '~' on unexpanded."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    ns = cli.build_parser().parse_args(["object", "f.jpg", "--back-images", "~/back.jpg"])
+    assert Path(cli.spec_from_namespace("object", ns).back_images) == tmp_path / "back.jpg"
+
+
+def test_run_spec_finds_the_back_photo_next_to_the_job_file(photo, tmp_path, monkeypatch):
+    """A job file kept with its pictures works from any folder - the back photo like the inputs."""
+    shoot, elsewhere = tmp_path / "shoot", tmp_path / "elsewhere"
+    shoot.mkdir()
+    elsewhere.mkdir()
+    shutil.copy(photo, shoot / "front.jpg")
+    shutil.copy(photo, shoot / "back.jpg")
+    d = {
+        "kind": "object",
+        "inputs": ["front.jpg"],
+        "method": "sharp360",
+        "back_source": "images",
+        "back_images": "back.jpg",
+    }
+    (shoot / "job.json").write_text(json.dumps(d), encoding="utf-8")
+    monkeypatch.chdir(elsewhere)
+    code, out, err = run_cli(["run", "--spec", Path("..") / "shoot" / "job.json", "--dry-run"])
+    assert code == 0, err
+    got = json.loads(out)
+    assert Path(got["inputs"][0]).resolve() == (shoot / "front.jpg").resolve()
+    assert Path(got["back_images"]).resolve() == (shoot / "back.jpg").resolve()
+    # a back photo found from the current folder, or an absolute one, is left alone
+    (elsewhere / "back.jpg").write_bytes(b"x")
+    code, out, err = run_cli(["run", "--spec", shoot / "job.json", "--dry-run"])
+    assert code == 0, err
+    assert json.loads(out)["back_images"] == "back.jpg"
+
+
+def test_sharp360_trellis_options_parse():
+    args = ["object", "me.jpg", "--method", "sharp360", "--back-source", "trellis"]
+    args += ["--back-tries", "2", "--back-steps", "25", "--seed", "7"]
+    spec = cli.spec_from_namespace("object", cli.build_parser().parse_args(args))
+    assert (spec.back_source, spec.back_tries, spec.back_steps, spec.seed) == ("trellis", 2, 25, 7)
+    assert all(isinstance(v, int) for v in (spec.back_tries, spec.back_steps, spec.seed))
+
+
+def test_sharp360_m2_help_texts():
+    helps = {a.dest: a.help for a in _subparser("object")._actions}
+    assert "Choices: auto, shell, trellis, images." in helps["job__back_source"]
+    assert "Choices: auto, depth, flat." in helps["job__back_relief"]
+    assert (
+        "Default: none." in helps["job__back_images"] and "walked to your right" in helps["job__back_images"]
+    )
+    assert "Default: 0 (Automatic)." in helps["job__back_tries"]
+    assert "Default: 0 (Automatic)." in helps["job__back_steps"]
+    assert "Default: on." in helps["job__color_match"]
+    assert "Default: auto." in helps["common__output_dir"]  # other unset options are still "auto"
+    text = _subparser("object").format_help()
+    assert "--back-images FILE" in text and "--no-color-match" in text
+
+
 @pytest.mark.parametrize(
     "flag,value",
-    [("--back-source", "mvadapter"), ("--back-quality", "ultra"), ("--size-from", "guess")],
+    [
+        ("--back-source", "mvadapter"),
+        ("--back-quality", "ultra"),
+        ("--size-from", "guess"),
+        ("--back-relief", "bumpy"),
+    ],
 )
 def test_sharp360_bad_choices_are_rejected(flag, value):
     code, _, err = run_cli(["object", "x.jpg", "--method", "sharp360", flag, value])
     assert code == 2 and "invalid choice" in err and value in err
     code, _, err = run_cli(["object", "x.jpg", "--seam-deg", "steep"])
     assert code == 2
+    code, _, err = run_cli(["object", "x.jpg", "--back-tries", "two"])
+    assert code == 2 and "integer" in err
 
 
 def test_main_without_stdout_does_not_crash(monkeypatch, isolated_home):

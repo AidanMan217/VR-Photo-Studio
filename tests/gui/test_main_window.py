@@ -551,3 +551,244 @@ def test_typed_number_is_used_by_ctrl_enter(make_window, media, monkeypatch):
     monkeypatch.setattr(main_window.QApplication, "focusWidget", staticmethod(lambda: spin))
     ids = w.create_jobs()
     assert ids and q.submitted[-1].strength == pytest.approx(1.7)
+
+
+# --------------------------------------------------------------------------- SHARP 360 add-on check
+class _FakeAddons:
+    """``addons.manager`` stand-in: SHARP / TRELLIS manifests, a configurable installed set."""
+
+    TITLES = {"sharp": "SHARP (photo to splat)", "trellis": "TRELLIS (photo to 3D object)"}
+
+    def __init__(self) -> None:
+        self.installed: set[str] = set()
+        self.checked: list[str] = []
+        self.broken = False
+
+    def get_manifest(self, aid: str):
+        from types import SimpleNamespace
+
+        if aid not in self.TITLES:
+            raise KeyError(aid)
+        return SimpleNamespace(id=aid, title=self.TITLES[aid])
+
+    def is_installed(self, aid: str) -> bool:
+        self.checked.append(aid)
+        if self.broken:
+            raise OSError("cannot read the add-on folder")
+        return aid in self.installed
+
+
+@pytest.fixture
+def addons(monkeypatch) -> _FakeAddons:
+    from vrphoto.gui.dialogs import common as dc
+
+    real = dc.try_backend
+    mgr = _FakeAddons()
+    monkeypatch.setattr(
+        dc, "try_backend", lambda name: (mgr, None) if name == "addons.manager" else real(name)
+    )
+    return mgr
+
+
+@pytest.fixture
+def choices(monkeypatch):
+    """Records ``util.ask_choice`` (Open Add-ons / Continue / Cancel) and answers ``.answer``."""
+    from types import SimpleNamespace
+
+    from vrphoto.gui import util
+
+    rec = SimpleNamespace(calls=[], answer=1)
+
+    def ask(parent, title, text, buttons, **kw):  # noqa: ANN001
+        rec.calls.append((title, text, tuple(buttons), kw))
+        return rec.answer
+
+    monkeypatch.setattr(util, "ask_choice", ask)
+    return rec
+
+
+def _object_window(make_window, media, monkeypatch, **values):
+    """Main window in Person / Object mode with ``values`` set; open_addons is recorded."""
+    w, q = make_window()
+    w.add_inputs([media["a"]])
+    w.modes.set_mode("object")
+    w.modes.current_panel().form.set_values(values)
+    opened: list[bool] = []
+    monkeypatch.setattr(w, "open_addons", lambda: opened.append(True))
+    return w, q, opened
+
+
+def test_missing_optional_back_source_can_continue(make_window, media, monkeypatch, prompts, addons, choices):
+    """design §1.7: TRELLIS missing -> "Open Add-ons / Continue / Cancel"; Continue starts the
+    job as asked (the job itself warns and uses the built-in back)."""
+    from vrphoto.gui.main_window import OPTIONAL_ADDON_BUTTONS
+
+    addons.installed = {"sharp"}
+    w, q, opened = _object_window(make_window, media, monkeypatch, method="sharp360", back_source="trellis")
+    choices.answer = 1
+    ids = w.create_jobs()
+    assert len(ids) == 1 and q.submitted[-1].back_source == "trellis"
+    assert len(choices.calls) == 1 and not prompts.questions and not opened
+    title, text, buttons, kw = choices.calls[0]
+    assert buttons == OPTIONAL_ADDON_BUTTONS
+    assert buttons == ("Open Add-ons", "Continue (the built-in back is used)", "Cancel")
+    assert "TRELLIS" in text and "not installed" in text
+    assert kw.get("escape") == 2  # Esc / closing the box cancels
+
+
+def test_missing_optional_back_source_open_addons(make_window, media, monkeypatch, prompts, addons, choices):
+    addons.installed = {"sharp"}
+    w, q, opened = _object_window(make_window, media, monkeypatch, method="sharp360", back_source="trellis")
+    choices.answer = 0
+    assert w.create_jobs() == []
+    assert opened == [True] and q.submitted == [] and not prompts.questions
+
+
+@pytest.mark.parametrize("answer", [2, None])
+def test_missing_optional_back_source_cancel(
+    make_window, media, monkeypatch, prompts, addons, choices, answer
+):
+    addons.installed = {"sharp"}
+    w, q, opened = _object_window(make_window, media, monkeypatch, method="sharp360", back_source="trellis")
+    choices.answer = answer
+    assert w.create_jobs() == []
+    assert not opened and q.submitted == [] and len(choices.calls) == 1
+
+
+def test_missing_sharp_still_shows_the_required_dialog(
+    make_window, media, monkeypatch, prompts, addons, choices
+):
+    """SHARP is required: today's Yes/No dialog, and no optional question for a job that
+    cannot run anyway."""
+    w, q, opened = _object_window(make_window, media, monkeypatch, method="sharp360", back_source="trellis")
+    prompts.answer = False
+    assert w.create_jobs() == []
+    assert any("Add-on needed" in t and "SHARP" in t for t in prompts.questions)
+    assert choices.calls == [] and not opened and q.submitted == []
+    prompts.answer = True
+    assert w.create_jobs() == []
+    assert opened == [True] and choices.calls == []
+
+
+def test_installed_or_unneeded_back_sources_ask_nothing(
+    make_window, media, monkeypatch, prompts, addons, choices
+):
+    addons.installed = {"sharp", "trellis"}
+    w, q, opened = _object_window(make_window, media, monkeypatch, method="sharp360", back_source="trellis")
+    assert len(w.create_jobs()) == 1
+    addons.installed = {"sharp"}
+    for source in ("auto", "shell", "images"):
+        extra = {"back_images": str(media["b"])} if source == "images" else {}
+        w.modes.current_panel().form.set_values({"back_source": source, **extra})
+        assert len(w.create_jobs()) == 1, source
+    assert choices.calls == [] and not prompts.questions and not opened
+    assert [s.back_source for s in q.submitted] == ["trellis", "auto", "shell", "images"]
+
+
+def test_remembered_back_source_is_ignored_for_other_methods(
+    make_window, media, monkeypatch, prompts, addons, choices
+):
+    """design §5.5: Billboard + a remembered back_source=trellis asks for nothing."""
+    w, q, opened = _object_window(make_window, media, monkeypatch, method="billboard", back_source="trellis")
+    assert len(w.create_jobs()) == 1
+    assert addons.checked == [] and choices.calls == [] and not prompts.questions
+    # the TRELLIS method needs TRELLIS for real: the required dialog, not the optional one
+    w.modes.current_panel().form.set_values({"method": "trellis"})
+    prompts.answer = False
+    assert w.create_jobs() == []
+    assert any("TRELLIS" in t for t in prompts.questions) and choices.calls == []
+
+
+def test_addon_check_that_fails_lets_the_job_report(
+    make_window, media, monkeypatch, prompts, addons, choices
+):
+    """A manager that cannot check (or unknown ids) never blocks: the pipeline reports."""
+    addons.broken = True
+    w, q, opened = _object_window(make_window, media, monkeypatch, method="sharp360", back_source="trellis")
+    assert len(w.create_jobs()) == 1
+    assert choices.calls == [] and not prompts.questions
+
+
+def _answer_box(action, *, max_polls: int = 300):
+    """Run ``action(box)`` on the message box once it is shown (it is modal) and make sure the
+    box closes whatever happens.  Returns a record: ``done`` (the box was seen), ``texts``
+    (its button labels) and ``errors``.
+
+    The checks belong in the test body, after the dialog returns: this callback runs inside
+    ``box.exec()``, where a failing assertion would leave the box open and ``exec()`` blocked
+    for ever - Python's signal handlers, and so pytest-timeout, cannot run inside Qt's C++
+    event loop.  So an exception in ``action`` is recorded and the box closed (``done(0)``),
+    and when no message box shows up within ``max_polls`` polls (10 ms apart) whatever modal
+    widget is open is closed and a failure recorded."""
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
+
+    rec = SimpleNamespace(done=False, texts=[], errors=[], polls=0)
+
+    def poll() -> None:
+        box = QApplication.activeModalWidget()
+        if isinstance(box, QMessageBox) and box.isVisible():
+            rec.done = True
+            rec.texts = [b.text() for b in box.buttons()]
+            try:
+                action(box)
+            except BaseException as e:  # noqa: BLE001 - reported by the test body
+                rec.errors.append(e)
+            finally:
+                if box.isVisible():  # the action failed or did not answer: never leave it open
+                    box.done(0)
+            return
+        rec.polls += 1
+        if rec.polls >= max_polls:
+            rec.errors.append(AssertionError(f"no message box was shown (modal widget: {box!r})"))
+            if isinstance(box, QDialog):
+                box.done(0)
+            elif box is not None:
+                box.close()
+            return
+        QTimer.singleShot(10, poll)
+
+    QTimer.singleShot(0, poll)
+    return rec
+
+
+@pytest.mark.parametrize("label,expected", [("Open", 0), ("Continue", 1), ("Cancel", 2)])
+def test_ask_choice_returns_the_clicked_button(qtbot, prompts, label, expected):
+    ask_choice = prompts.real_ask_choice  # the real dialog (the prompts fixture stubs util.ask_choice)
+    buttons = ("Open Add-ons", "Continue (the built-in back is used)", "Cancel")
+
+    def click(box) -> None:
+        next(b for b in box.buttons() if b.text().startswith(label)).click()
+
+    box = _answer_box(click)
+    got = ask_choice(None, "Question", "Pick one", buttons, escape=2, informative="More")
+    assert not box.errors, box.errors
+    assert box.done and set(box.texts) == set(buttons), box.texts
+    assert got == expected
+
+
+def test_ask_choice_escape_and_close(qtbot, prompts):
+    from PySide6.QtCore import Qt as QtNs
+    from PySide6.QtTest import QTest
+
+    ask_choice = prompts.real_ask_choice
+    box = _answer_box(lambda b: QTest.keyClick(b, QtNs.Key.Key_Escape))
+    got = ask_choice(None, "Q", "Pick", ("A", "B", "Cancel"), escape=2)
+    assert not box.errors and box.done and got == 2, box.errors
+    box = _answer_box(lambda b: b.done(0))  # closed without a button
+    got = ask_choice(None, "Q", "Pick", ("A", "B"))
+    assert not box.errors and box.done and got is None, box.errors
+
+
+def test_answer_box_never_leaves_a_failing_dialog_open(qtbot, prompts):
+    """A check that fails inside the dialog closes it (no hang) and is reported afterwards."""
+    ask_choice = prompts.real_ask_choice
+
+    def wrong(b) -> None:
+        raise AssertionError("labels changed")
+
+    box = _answer_box(wrong)
+    assert ask_choice(None, "Q", "Pick", ("A", "B")) is None
+    assert box.done and [str(e) for e in box.errors] == ["labels changed"]

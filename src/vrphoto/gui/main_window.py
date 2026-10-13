@@ -50,6 +50,8 @@ MODEL_ALIASES = {
 #: On exit: how long to wait for cancelled jobs to stop (so add-on worker processes and
 #: ffmpeg are terminated by the job instead of being left running without the app).
 JOB_STOP_WAIT_S = 8.0
+#: Buttons of the "optional add-on not installed" question (indices used by _check_addons).
+OPTIONAL_ADDON_BUTTONS = ("Open Add-ons", "Continue (the built-in back is used)", "Cancel")
 
 
 def app_icon() -> QIcon:
@@ -436,15 +438,13 @@ class MainWindow(QMainWindow):
                 return False
         return True
 
-    def _check_addons(self, kind: str, values: dict[str, Any]) -> bool:
-        """True if the add-ons this job needs are installed (or cannot be checked)."""
-        cands = om.required_addon_candidates(kind, values)
-        if not cands:
-            return True
-        mgr, _err = dc.try_backend("addons.manager")
-        if mgr is None:
-            return True
-        for aid in cands:
+    @staticmethod
+    def _missing_addon_title(mgr: Any, ids: tuple[str, ...]) -> str | None:
+        """Title of the first known add-on of an any-of group ``ids`` when none of them is
+        installed; None when one is installed, or it cannot be checked (unknown ids, a broken
+        manager: the pipeline then reports what is missing)."""
+        title: str | None = None
+        for aid in ids:
             try:
                 m = mgr.get_manifest(aid)
             except Exception:
@@ -459,16 +459,58 @@ class MainWindow(QMainWindow):
             except Exception:
                 installed = True  # cannot check: let the pipeline report a missing add-on
             if installed:
-                return True
-            if util.ask_yes_no(
+                return None
+            if title is None:
+                title = str(getattr(m, "title", "") or aid)
+        return title
+
+    def _check_addons(self, kind: str, values: dict[str, Any]) -> bool:
+        """True if the job may start: every required add-on is installed (or cannot be
+        checked) and, when an optional one is missing, the user chose to continue without it.
+
+        A missing required add-on (e.g. SHARP) offers the Add-ons window and stops.  A missing
+        optional one (a SHARP 360 back source such as TRELLIS) asks "Open Add-ons / Continue
+        / Cancel": the job itself warns and uses the built-in back, so continuing is safe.
+        """
+        groups = om.required_addon_groups(kind, values)
+        if not groups:
+            return True
+        mgr, _err = dc.try_backend("addons.manager")
+        if mgr is None:
+            return True
+        # required groups first: no point asking about an optional extra for a job that
+        # cannot run anyway
+        for ids, optional in sorted(groups, key=lambda g: g[1]):
+            title = self._missing_addon_title(mgr, ids)
+            if title is None:
+                continue
+            if not optional:
+                if util.ask_yes_no(
+                    self,
+                    "Add-on needed",
+                    f"This needs the '{title}' add-on, which is not installed yet.",
+                    informative="Open the Add-ons window to install it? (It is a large download.)",
+                    default_yes=True,
+                ):
+                    self.open_addons()
+                return False
+            choice = util.ask_choice(
                 self,
-                "Add-on needed",
-                f"This needs the '{m.title}' add-on, which is not installed yet.",
-                informative="Open the Add-ons window to install it? (It is a large download.)",
-                default_yes=True,
-            ):
+                "Optional add-on not installed",
+                f"The back is set to be made by the '{title}' add-on, which is not installed.",
+                OPTIONAL_ADDON_BUTTONS,
+                default=0,
+                escape=2,
+                informative=(
+                    "You can install it in the Add-ons window (a large download), or continue "
+                    "now: the job then uses the built-in back and says so in its warnings."
+                ),
+            )
+            if choice == 0:
                 self.open_addons()
-            return False
+                return False
+            if choice != 1:  # Cancel, or the box was closed
+                return False
         return True
 
     def create_jobs(self) -> list[str]:

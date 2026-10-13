@@ -471,17 +471,28 @@ left = right = 0x40000000). JPEG gets GPano XMP. Filenames carry Quest tokens (`
   only describes it). `sphere` accepts `depth_near_m` / `depth_far_m`. The thumbnail is
   `thumb.jpg` and may be absent (`thumbnail: null` in `/api/scenes`). Asset names must be plain
   file names (no separators, no `..`).
-* **SHARP 360 (0.2.0-beta)** - details in section 13:
+* **SHARP 360 (0.2.0-beta, 0.2.0)** - details in section 13:
   * `pipeline.run`: object method `sharp360` (`ADDON_METHODS["sharp360"] = ("sharp",
     "image_to_splat")`, so a missing SHARP fails fast exactly like `sharp`); constants
-    `BACK_SOURCES = ("auto", "shell")`, `BACK_QUALITIES = ("fast", "balanced", "best")`,
+    `BACK_SOURCES = ("auto", "shell", "trellis", "images")`, `BACK_RELIEFS = ("auto", "depth",
+    "flat")`, `BACK_QUALITIES = ("fast", "balanced", "best")`,
     `SIZE_FROM = ("auto", "height", "photo")`, `OBJECT_ENV`; helpers `_free_app_gpu()` (closes
     the app's ONNX Runtime sessions before **every** add-on: at the start of each
     `_run_addon` and of `_mode_capture` (COLMAP / Brush, which do not go through
     `_run_addon`); later in-process Brush runs must call it too; failures only logged), `_sharp_inputs(run, item, photo) -> (image_path, params)` (shared by `sharp`
     and `sharp360`; plain `sharp` is unchanged byte for byte) and `_save_cutout(...)`.
   * `ObjectJob` fields `back_source="auto"`, `back_quality="balanced"`, `seam_deg=60.0`,
-    `size_from="auto"`, `save_extras=False`; `thickness` and `back` also apply to `sharp360`.
+    `size_from="auto"`, `save_extras=False`; from 0.2.0 also `back_images=None`,
+    `back_relief="auto"`, `color_match=True`, `back_tries=0`, `back_steps=0`; `thickness`,
+    `back` and (from 0.2.0) `seed` also apply to `sharp360`.
+  * GUI (0.2.0): `FieldMeta.enabled_if_all`, `addon_optional`, `file_filter`;
+    `options_meta.field_applies(kind, name, values, *, meta=None)` (transitive: a field under
+    a greyed-out sibling is greyed out) and `required_addon_groups(kind, values) -> ((ids,
+    optional), ...)` (greyed-out fields ask for nothing; `required_addon_candidates` is the
+    flattened wrapper); `util.ask_choice(parent, title, text, buttons, *, default=0,
+    escape=None, informative=None) -> int | None`. `main_window._check_addons`: a missing
+    required group shows the Yes/No dialog; a missing optional group (TRELLIS as the back
+    source) offers "Open Add-ons" / "Continue (the built-in back is used)" / "Cancel".
   * `geometry.splat`: `transform_splats(sc, R, t, s=1.0)` (proper rotations only; rotates
     quaternions and SH), `scale_splats(sc, k)`, `concat_splats(clouds)`, `subset_splats(sc, idx)`,
     `fit_plane_ransac(pts, tol, *, seed=0, iters=256) -> (normal, offset, inlier_frac)` (plane
@@ -498,11 +509,13 @@ left = right = 0x40000000). JPEG gets GPano XMP. Filenames carry Quest tokens (`
     (an SH-0 run failed and SH 1 worked with the same masks setting) / None (only the
     defaults run worked); `sh_option` says whether Brush accepted `--sh-degree`.
 
-## 13. SHARP 360 (object method `sharp360`, 0.2.0-beta)
+## 13. SHARP 360 (object method `sharp360`, 0.2.0)
 
-Design and rationale: `docs/design/SHARP360.md`. This version ships the fusion core and the
-built-in `shell` back; TRELLIS, back photos, MV-Adapter, Qwen/ComfyUI, the CPU renderer,
-previews, Brush polish and the seed option arrive in later milestones behind the same
+Design and rationale: `docs/design/SHARP360.md`. 0.2.0-beta shipped the fusion core and the
+built-in `shell` back; 0.2.0 adds the `trellis` and `images` back sources, the registration
+library, view lifting, the CPU splat renderer, the previews and the seed ('Variation')
+option. MV-Adapter (`GenView.kind="ortho"`), Brush polish, SHARP multi-image relief
+(`back_relief="sharp"`), YuNet and Qwen/ComfyUI arrive in later milestones behind the same
 interfaces.
 
 **Frames and grids.**
@@ -526,6 +539,24 @@ interfaces.
   `right(phi) = cos(phi) x^ + sin(phi) z^`, `down = y^`; orthographic view with `m` metres per
   pixel and size `N`: `u = (P_S - a).right/m + N/2`, `v = (P_S - a).y^/m + N/2`, `a` = orbit axis.
 * Depth tolerance `tau(z) = max(2 cm, 1 % z)` (`splat_fusion.depth_tol`).
+* **Levelled frame** (`views_lift`): the photo's visible front forward-splatted with SHARP's
+  front depth into an upright orthographic `S x S` picture (`S = 512`, reference 1024) with
+  `m_in` metres per pixel, no camera pitch and no perspective. A point `P = (x, y, z)` in S
+  lands in a view at azimuth `phi` at `u = (P . w(phi) - o) / m + S/2`, `v = (y - y0) / m + S/2`
+  with `w(phi) = (cos phi, 0, sin phi)`, `o` the view's horizontal offset (`-x0` for the back).
+  Every registered view (`GenView.meta["registered"]`) is in this frame. Pixel `(i, j)` spans
+  `u in [j, j+1)`; OpenCV samplers get `u - 0.5`.
+* **Renderer pixels** (`splat_render`): pixel `(row i, col j)` is sampled at its centre
+  `(j + 0.5, i + 0.5)`, so `cx = W/2` is the middle (as frame C; `geometry.camera` differs).
+  `orbit_camera` follows the azimuth contract above; perspective `fov_deg` is horizontal.
+* **Back / side photo names** (`images` source, `views_lift.views_from_folder`): the chosen
+  'Back photo' is phi 180 unless its own name says otherwise; pictures in the same folder are
+  used when their whole stem (any case; `_`, `-`, a space or nothing between words) is
+  `back` / `behind` / `rear` (180), `right` (90 - "you walked to your right", you see the
+  subject's left side), `left` (270), `back_right` (135), `back_left` (225), `front_right`
+  (45), `front_left` (315) or `azNNN` (NNN degrees). Other names are ignored. One picture per
+  azimuth (the chosen file first, then sorted names). A `views.json` (`{"views": [{"file",
+  "phi_deg" or "azimuth_deg"}]}`) in the folder overrides the azimuths of the files it lists.
 
 **Interfaces (all numpy / OpenCV, CPU, `progress=`/`cancel=` on the long ones).**
 
@@ -567,13 +598,93 @@ def voxel_components(P, voxel, *, cancel=None) -> labels   # 26-connected, -1 fo
 def remove_floaters(sc, is_front, front, canon, *, hull=None, seam_deg=60, spacing_m=None, cancel=None,
                     progress=None) -> (sc, is_front, diag)   # voxel = max(1.5 cm, 1.5 spacing_m)
 def to_life_size(sc, *, mode, height_m, cut=False) -> (sc, height, box, used_mode)   # glTF frame
+# geometry/register.py (numpy Nelder-Mead / Umeyama / TPS; no scipy)
+def nelder_mead(f, x0, step, *, max_iter=400, tol=1e-7, cancel=None) -> (x, fx)   # non-finite = +inf
+def umeyama(src, dst, *, with_scale=True, weights=None) -> (s, R, t)    # dst ~ s R src + t, det R = +1
+def point_zbuffer(u, v, z, shape, *, radius=None) -> (zbuf, idx)         # nearest z per pixel, ties -> lowest idx
+def silhouette_iou(a, b) -> float                                        # two empty masks -> 0.0
+def contour_points(mask, n=64) -> (n, 2)          # by arc length from the topmost point, clockwise on screen
+def chamfer_similarity_fit(src_mask, dst_mask, *, init=None, allow_roll=False, max_roll_deg=5.0, cancel=None)
+    -> (params {s, tx, ty, roll_deg, cx, cy}, cost)                      # symmetric chamfer, (cx, cy) = pivot
+def chamfer_perspective_fit(src_mask, dst_mask, *, max_keystone=0.5, trunc_fracs=(0.10, 0.04), cancel=None)
+    -> (H 3x3, cost, cost_identity)   # masks in ONE frame; camera-turn homography (similarity, aspect,
+                                      # keystone; no shear); truncated chamfer stages; never worse than I
+def outline_gap(a, b, pct=98.0) -> float   # px: pct percentile of boundary-to-boundary distance, worse side
+def warp_similarity(img, params, out_shape, *, interpolation=cv2.INTER_LINEAR, border_value=0) -> img
+@dataclass class TPS: ctrl, w, a, center, scale; __call__(pts); max_displacement(shape, *, mask=None)
+def tps_fit(src_pts, dst_pts, *, lam=1e-3) -> TPS                        # K = r^2 log r
+def tps_warp(img, tps, out_shape, *, interpolation=cv2.INTER_LINEAR, border_value=0) -> img
+def projective_icp(P, front, *, iters=8, trim=0.3, max_rot_deg=10.0, metric="plane", cancel=None)
+    -> (s, R, t, diag)
+UP_AXES: dict[str, tuple]; up_rotation(axis) -> R; yaw_rotation(yaw_deg) -> R
+    # a cloud's rotation into C is canon.R @ yaw_rotation(yaw) @ up_rotation(up)
+def register_cloud_to_front(sc, front, canon, *, progress=None, cancel=None) -> (sc_C | None, diag)
+    # diag (JSON-ready): ok, reason, iou, resid_m, scale (cloud units -> m), s0, up, yaw_deg,
+    # tilt_deg, transform {s, R, t}, candidates, icp, n_in, n_opaque, seconds;
+    # gates IoU >= 0.70, median residual <= 5 cm, s in [0.5, 2] s0
+def color_affine_fit(src, dst, *, lam=0.1, iters=5) -> (A, b, ok)        # sRGB pairs, fit in linear RGB, clamped
+def apply_color_affine(rgb, A, b) -> rgb
+def reinhard_lab(img, mask, ref, ref_mask, *, strength=0.5) -> img       # statistics from the masks only
+# geometry/views_lift.py (view-based backs; nominal views now, exact "ortho" views in M4)
+VIEW_KINDS = ("ortho", "nominal"); RELIEFS = ("auto", "depth", "flat"); VIEW_NAMES; PHI_NAMES; VIEWS_JSON
+@dataclass class GenView: name, phi_deg, rgb (uint8 HxWx3), alpha (float32 HxW), kind="nominal", m=None,
+    depth=None, meta={}                                   # phi wrapped into [0, 360); InputError if malformed
+@dataclass class OrthoInput: rgba (S), rgba_ref (ref), alpha0 (bool S x S), m_in, size, ref, center_S, meta;
+    m_ref (property)
+def levelled_ortho_input(rgb, alpha, front, canon, *, size=512, ref=1024, progress=None, cancel=None)
+    -> OrthoInput                                          # design 3.4; also TRELLIS's input (rgba_ref)
+def views_from_folder(back_path) -> [(phi_deg, Path)]      # the naming rule above; InputError if missing
+def load_views(entries, *, max_long=1024, dropped=None) -> [GenView]   # a cut-out PNG keeps its alpha;
+    # an unreadable picture is skipped with a plain sentence in `dropped` (InputError when none can be read)
+def segment_views(views, segmenter, *, cancel=None, dropped=None) -> [GenView]
+    # segmenter (None: skipped) else a flat-background key; dropped (a sentence in `dropped`) when the
+    # matte is empty ("no subject"), too small ("ortho": < 2 % cover; "nominal": < 64 px across or
+    # < 400 px area - "take it from closer or crop it") or covers > 97 %
+def hull_intervals(front, canon, ortho, views, *, rule="vote", samples=96, cancel=None) -> HullIntervals
+def view_based_back(front, canon, ortho, views, *, depth_fn=None, relief="auto", color_match=True,
+                    stride=1, seed=0, fill_holes=True, source="images", progress=None, cancel=None)
+    -> BackPart   # kind "mould"; views = the registered (and rejected) views; ok=False + plain reason
+                  # when there is no back view, its outline does not match (IoU < 0.75 after the
+                  # similarity + perspective fit) or it shows a different pose (outline_gap, 98th
+                  # percentile, > 6 % of the subject's size after that fit)
+def contact_sheet(ortho, views, *, tile=256, labels=True) -> uint8 RGB   # the _views.png preview
+# geometry/splat_render.py (CPU EWA splatting, numpy only; off the critical path)
+@dataclass class SplatCamera: R, center, width, height, kind="persp"|"ortho", fx, fy, m, cx=None, cy=None
+    pinhole(f, width, height, *, R=None, center=None); forward; to_camera(P); project(P) -> (u, v, z)
+def orbit_camera(target, phi_deg, *, up=(0,1,0), front=(0,0,1), distance, width, height, kind="ortho",
+                 m=None, fov_deg=None, elevation_deg=0.0) -> SplatCamera
+@dataclass class SplatRender: rgb (uint8), alpha, depth, depth_median (float32), diag
+def prepare_splats(sc, *, cancel=None) -> PreparedSplats   # camera-independent part, shared by views
+def render_splats(sc | prepared, cam, *, background=(0,0,0), max_radius_px=64, band_rows=None,
+                  progress=None, cancel=None) -> SplatRender   # identical images for any band size
+def turntable_sheet(sc, *, n=8, size=384, cols=4, background=(32,32,32), labels=True, progress=None,
+                    cancel=None) -> uint8 RGB   # upright glTF-frame cloud, phi = 0, 360/n, ...
 # pipeline/sharp360.py
-QUALITY: dict[str, Quality(mould_long, stride, auto)]; Opts; SOURCES: dict[str, fn(ctx, rep) -> BackPart]
+QUALITY: dict[str, Quality(mould_long, stride, auto, tries=1, trellis_steps=(12, 12), relief="depth",
+                           fill_holes=True, preview_px=384)]
+    # fast: 512, 2, (shell,), relief "flat", no hole fill, 256 px | balanced: 768, 1, (trellis, shell)
+    # | best: 1024, 1, (trellis, shell), tries 2, steps 25/25, 512 px
+Opts(..., seed, tries=1, steps=0, color_match=True, relief="auto", back_images=None)
+SOURCES = {"shell": _src_shell, "trellis": _src_trellis, "images": _src_images}   # fn(ctx, rep) -> BackPart
+SOURCE_NAMES / SOURCE_LABELS / SOURCE_ADDONS = {"trellis": "trellis"}; MAX_TRIES = 4; MAX_STEPS = 100;
+MAX_SEED = 2**31 - 1; PREVIEW_VIEWS = 8
 def resolve_options(spec, *, installed: Callable[[str], bool]) -> Opts   # InputError before any work;
     # thickness clamped to THICKNESS_RANGE = (0.06, 0.18) (Opts.thickness_asked; the job warns)
 def run_sources(ctx, rep, attempts) -> BackPart | None                   # the fallback chain
 def mode_sharp360(run, item, photo, alpha, spec, *, placement, height, rep, opts=None) -> None
 ```
+
+**Options (`resolve_options`, all before any work).** `back_source` in `run.BACK_SOURCES`,
+`back_quality`, `size_from`, `back` and `back_relief` in their `run.*` tuples; `seam_deg`
+35-80; `seed` 0..2^31-1, `back_tries` 0..4, `back_steps` 0..100 (whole numbers; strings and
+whole floats from job files are accepted); `back_tries=0` = the quality's `tries`,
+`back_steps=0` = each source's own default (TRELLIS: the quality's `trellis_steps`). With
+`back_source="images"`, `back_images` must name an existing picture (or a folder of views)
+whose views include one from behind, with a readable header; it is ignored for the other
+sources. `auto` = the quality's `Quality.auto` sources whose add-on is installed (`fast`:
+only the shell), never `images`; an explicit source is tried even when its add-on is missing
+(warning, then the shell). `seed` ('Variation') is the AI sources' seed (attempt `i` uses
+`seed + i`) and the seam dither's; the photographed front never depends on it.
 
 **Front guarantee.** A SHARP Gaussian that faces the photo camera at less than `seam_deg - 10`
 or lies in the protected outline band (`FrontModel.rim`) is output bit-identical (before the
@@ -604,6 +715,105 @@ export's box crop never removes front rows.
   strided ("fast") back of a subject several metres away is not removed as isolated Gaussians;
   "near the largest component" is `max(5 cm, 1 voxel)`.
 
+**Back sources (0.2.0; authoritative where they differ from the design).**
+
+* `trellis` (design 3.5.5). Input: `levelled_ortho_input(...).rgba_ref` (1024 px) saved as
+  `trellis_input.png` (the plain cut-out, at most 1024 px, when it cannot be made; logged).
+  `Opts.tries` attempts, each one `_run_addon("trellis", "image_to_3d", {"image"},
+  {"seed": seed + i, "ss_steps", "slat_steps", "glb": False, "ply": True, "name": "back<i>"})`
+  -> `read_splats` -> `register_cloud_to_front`; the attempt with the best score
+  `IoU - 0.5 min(1, resid / 10 cm)` among those passing the gates is kept. An `AddonError`
+  ends the attempts (an earlier good attempt is kept, with a warning); when no attempt
+  produced a cloud the first error is re-raised; when shapes were made but none lined up, the
+  reason counts the shapes made and names each attempt that failed ("...; attempt 2 failed
+  (CUDA out of memory)"). Registration: orientation search on 6k
+  opaque centres, refinement on 10k (three candidates at least 20 deg apart), projective ICP
+  with point-to-plane steps and a shrinking pairing window, kept only when it does not raise
+  the refinement cost by more than 0.05; the gates use all 20k. Colour: a per-channel gain in
+  linear RGB first, then `color_affine_fit` on the gain-corrected pairs (ridge
+  `lam * n * 0.02^2`, Huber scale `median|r| / 1.538`), pairs only on reliable mould cells (on
+  the photographed surface, facing the camera within `seam - 10`, at least max(3 cells, 1 %)
+  inside the outline, the smoothest 30 % of the photo; at least 64), kept only when it lowers
+  the median colour error. `back_z` = the largest z of opaque (>= 0.3) Gaussians behind the
+  photographed surface per mould cell, push-pull filled across the matte. TRELLIS's
+  non-commercial notice is added only when its back is used. `BackPart.diag`: the
+  registration diag plus `tries`, `chosen`, `seed`, `steps`, `input`, `color`, `back_cells`;
+  `run_sources` records an unusable part's diag in debug.json.
+* `images` (design 3.5.4, V1-V11): `views_from_folder(back_images)` -> `load_views` (long side
+  <= 1024) -> `segment_views(run.ctx.segmenter(common.segment_model, common.device))` ->
+  `levelled_ortho_input(size=512, ref=1024)` -> `view_based_back(depth_fn, relief,
+  color_match, stride, seed, fill_holes=Quality.fill_holes, source="images")`. Relief: `flat`
+  -> none; `auto` -> none with `fast` (design 1.3), else like `depth`: the app's depth model
+  (`common.depth_model`) on the locked back view, larger disparity = nearer the back camera;
+  the heuristic estimator counts as no model (a smooth back; with `depth` a note says so).
+  The depth model's non-commercial notice is added when its relief shapes the result, the
+  segmenter's when it cut out a view. Never chosen by `auto`; a back photo that does not fit
+  (outline IoU < 0.75, or a different pose) is one warning and the shell; so is one that
+  cannot be read or shows no subject, and the warning names the back photo's own problem.
+  A side photo that cannot be read or shows no subject is named in the warning next to the
+  back's notes. `BackPart.diag`: `back` (similarity, `perspective` matrix, `iou_similarity`,
+  `iou` after the perspective stage, `iou_locked`, `pose_frac`, `tps_max_frac`), `views`,
+  `orbit` (with `pairs`), `hull`, `relief`, `colours`, `holes`, `qc`, `files` (azimuth ->
+  file name of the pictures in use), `dropped`. Details that differ from the design:
+  * Back registration (V2/V3): after the chamfer similarity a **perspective stage**
+    (`chamfer_perspective_fit`: a camera-turn homography - similarity, aspect and the two
+    keystone terms, no shear - on a chamfer truncated at 10 % then 4 % of the size) takes
+    out the keystone of a phone held above the subject's middle (camera 1.6 m high, 2 m away:
+    "a different pose, 9 %" before); the similarity, perspective and TPS are one resampling.
+    The **pose gate** is not the TPS displacement: the lock pairs each of the 64 outline
+    points with the nearest point of the other outline within +-4 % of its length (both
+    outlines first turned to their best common start - a raised hand level with the head
+    made the two start on different features), and such a pairing barely moves for an arm in
+    another place. The gate is the outline gap after the global fit (`outline_gap`, 98th
+    percentile, both directions) > 6 % of the subject's long side. Measured on the synthetic
+    person: the same pose up to 30 deg camera tilt 0.4-4.0 %, an arm 15 deg or more off
+    6.3-20 %, 10 deg off 4-6 % (accepted: the lock bends it).
+  * Side / quarter views (V2): the top / bottom row extent gives the scale only when both
+    rows are the subject's own; a view whose matte touches its picture's top / bottom border,
+    or a photo with `Canon.cut_top` / `cut_bottom`, keeps the other row as anchor and takes the
+    scale that minimises the V5 front-edge row spread (a 321-step search; the row extent is
+    an upper bound when only the view is cut, a lower bound when only the photo is; measured
+    within 2 % for 0-40 % cut). No reliable row: not used.
+  * Left / right naming (V5): judged on the 90th percentile of the row misfit; two views
+    named as each other's mirror (90 / 270, 135 / 225, 45 / 315) are turned round both or
+    neither (summed misfits, ratio 0.5); when only one alone would turn, neither does and a
+    note says the naming "could not be confirmed". At most one view per azimuth (the better
+    fitting one), and views named for both sides but placed on one are not used. Outlines
+    cannot tell the sides of a near-symmetric subject apart (no colour cue yet).
+  * Colours are Reinhard LAB on the rim bands with lightness fully transferred and the colour
+    channels only shifted (at most 6 LAB units), so a back of another colour keeps it; a side
+    view's offset comes from its silhouette edge facing the photo camera; the orbit axis for
+    nominal views is the per-row median of (photo front edge + side back edge) / 2; hull
+    voting leaves out the back view; with left / right views and no depth model the back
+    silhouette's inflation profile shapes each row; the 40 % carving limit also applies
+    without side views (against the shell prior).
+  * The visual hull of nominal side views cannot reach the design's "volume within 10 % of
+    the truth": four views (90 / 270 / 135 / 315) keep the hull's corners between them, about
+    1.3 x the body's depth along the photo's rays (median 3 cm beyond the true back); the
+    tests bound that (median < 4 cm, < 1.45 x) and that the hull contains the body.
+* **Front untouched** (design 5.2), tested for the shell, TRELLIS and back-photo backs: seen
+  from the photo's camera with `render_splats`, the fused cloud equals the cleaned front with
+  the generated part showing only through it (`front + (1 - front alpha) * generated`; SHARP's
+  front is not fully opaque) within a mean of 2/255 inside the matte eroded by 2 px. The
+  reference is a copy of the cleaned front taken when `sharp_front` returns (before any back
+  source runs), and the front model's own cloud must still equal it bit for bit; fewer than
+  2 % of the opaque generated Gaussians may lie on the photographed surface (inside the
+  matte, > 3 cells from its outline, nearer than the front depth + 1 cm) - a sparse
+  TRELLIS front half coloured like the photo hardly shows in a render.
+
+**Previews (design 1.5 / 3.13).** Written after the splat; a failure is one warning ("... could
+not be made (...); the 3D result is not affected."), a cancel propagates; not written by the
+plain-SHARP fallback.
+
+* `<base>_sharp360_preview.jpg`: `turntable_sheet(final splat, n=PREVIEW_VIEWS=8,
+  size=Quality.preview_px, cols=4)` - views at 0, 45, ..., 315 deg (0 = the photo's side, 90 =
+  from the subject's left), 256 / 384 / 512 px each for fast / balanced / best.
+* `<base>_sharp360_views.png`: `contact_sheet(ortho, views, tile=256)` whenever the `images`
+  source made its levelled frame - also when its back was rejected (the photos are outlined
+  as not used).
+* Progress ranges: SHARP 0.10-0.25, front 0.25-0.30, back 0.30-0.72, stitch 0.72-0.88,
+  export 0.88-0.92, previews 0.92-0.97 ("Rendering a turntable preview"), scene 0.97-1.0.
+
 **Fallbacks.** SHARP is the only required add-on (a SHARP failure fails the job as for `sharp`).
 Back sources are tried in `Opts.sources` order (`auto` -> the quality's installed sources, then
 `shell`; an explicit source -> it, then `shell`); a missing, failing or unusable source is one
@@ -621,10 +831,11 @@ box crop of the generated rows (front rows are kept even outside the box) ->
 `decimate_splats(750k)` -> `write_splats`.
 
 **Outputs.** `<base>_cutout.png`, `<base>_sharp360.splat` (feet at y = 0, front facing +z,
-life-size); with `save_extras` also `<base>_sharp360.ply`, `_sharp360_front.splat` (the cleaned
+life-size), `<base>_sharp360_preview.jpg`, `<base>_sharp360_views.png` (only after the `images`
+source); with `save_extras` also `<base>_sharp360.ply`, `_sharp360_front.splat` (the cleaned
 SHARP front alone), `_sharp360_back.splat` (the generated part alone; both in the main splat's
 frame and size) and `_sharp360_debug.json`. The debug data (options, camera, front stats,
-frame, source attempts, merge / floater counts, sizes, timings, warnings) is always written to
+frame, source attempts, merge / floater counts, sizes, previews, timings, warnings) is always written to
 the job's work folder and summarised in one log line. None of these names ends in a Quest
 player token. Scene block (always `scale: 1.0`):
 `{"asset": "object.splat", "format": "splat", "height_m": h, "scale": 1.0, "pivot": "base",

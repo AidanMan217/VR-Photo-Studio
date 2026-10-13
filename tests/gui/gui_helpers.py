@@ -217,6 +217,9 @@ class Prompts:
     def __init__(self) -> None:
         self.answer = True
         self.license_answer = True
+        self.choice_answer: int | None = None  # ask_choice: the button index, None = closed
+        self.choices: list[str] = []
+        self.real_ask_choice = None
         self.questions: list[str] = []
         self.errors: list[str] = []
         self.infos: list[str] = []
@@ -225,6 +228,10 @@ class Prompts:
     def ask(self, parent, title, text, **kw) -> bool:  # noqa: ANN001
         self.questions.append(f"{title}: {text}")
         return self.answer
+
+    def choose(self, parent, title, text, buttons, **kw) -> int | None:  # noqa: ANN001
+        self.choices.append(f"{title}: {text}")
+        return self.choice_answer
 
     def error(self, parent, title, exc, **kw) -> None:  # noqa: ANN001
         self.errors.append(f"{title}: {exc}")

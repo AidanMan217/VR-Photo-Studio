@@ -328,6 +328,7 @@ def _choices_table() -> dict[tuple[str, str], tuple[str, ...]]:
         ("object", "placement"): R.PLACEMENTS,
         ("object", "back_source"): R.BACK_SOURCES,
         ("object", "back_quality"): R.BACK_QUALITIES,
+        ("object", "back_relief"): R.BACK_RELIEFS,
         ("object", "size_from"): R.SIZE_FROM,
         ("video", "output"): R.VIDEO_OUTPUTS,
         ("video", "encoder_preset"): presets,
@@ -353,23 +354,22 @@ def _known_values() -> dict[str, list[str]]:
     return out
 
 
-def _meta_tooltip(kind: str, name: str) -> str:
+def _meta(kind: str, name: str) -> Any:
+    """The GUI's FieldMeta of an option (help texts), or None."""
     try:
         from .gui.options_meta import COMMON_META, JOB_META  # Qt-free metadata
     except Exception:  # noqa: BLE001 - optional (GUI metadata)
-        return ""
-    meta = COMMON_META.get(name) if kind == "common" else JOB_META.get(kind, {}).get(name)
-    return str(getattr(meta, "tooltip", "") or "")
+        return None
+    return COMMON_META.get(name) if kind == "common" else JOB_META.get(kind, {}).get(name)
+
+
+def _meta_tooltip(kind: str, name: str) -> str:
+    return str(getattr(_meta(kind, name), "tooltip", "") or "")
 
 
 def _meta_zero_label(kind: str, name: str) -> str:
     """The GUI's label for the value 0 of a numeric option (e.g. 'Automatic'), or ''."""
-    try:
-        from .gui.options_meta import COMMON_META, JOB_META  # Qt-free metadata
-    except Exception:  # noqa: BLE001 - optional (GUI metadata)
-        return ""
-    meta = COMMON_META.get(name) if kind == "common" else JOB_META.get(kind, {}).get(name)
-    return str(getattr(meta, "zero_label", "") or "")
+    return str(getattr(_meta(kind, name), "zero_label", "") or "")
 
 
 #: Units of numeric fields by name suffix (the CLI uses the stored units, e.g. metres not mm).
@@ -380,7 +380,7 @@ _UNITS = {
     "_pct": "percent of the image width",
     "_px": "pixels",
 }
-_METAVARS = {"output_dir": "FOLDER", "name": "NAME", "keyframes": "JSON"}
+_METAVARS = {"output_dir": "FOLDER", "name": "NAME", "keyframes": "JSON", "back_images": "FILE"}
 
 
 def _help_for(
@@ -396,7 +396,8 @@ def _help_for(
     elif known:
         text += f" Known values: {', '.join(known)}."
     if default is None:
-        text += " Default: auto."
+        # an unset file option (e.g. the SHARP 360 back photo) is "none", not "auto"
+        text += " Default: none." if getattr(_meta(kind, f.name), "kind", "") == "file" else " Default: auto."
     elif isinstance(default, bool):
         text += f" Default: {'on' if default else 'off'}."
     elif default != "":
@@ -520,6 +521,10 @@ def spec_from_namespace(kind: str, ns: argparse.Namespace) -> Any:
             common[key[8:]] = value
     if common.get("output_dir"):
         common["output_dir"] = os.path.abspath(os.path.expanduser(str(common["output_dir"])))
+    if d.get("back_images"):
+        # kept as given (D:/pics/back.jpg stays exactly that) apart from a leading "~", which
+        # Windows shells pass on unexpanded
+        d["back_images"] = os.path.expanduser(str(d["back_images"]))
     d["common"] = common
     return job_from_dict(d)
 
@@ -768,6 +773,12 @@ def _cmd_run(console: Console, ns: argparse.Namespace) -> int:
                 q = base / q
             fixed.append(str(q))
         spec.inputs = fixed
+    # the SHARP 360 back photo follows the same rule: a job file kept next to its pictures
+    back = getattr(spec, "back_images", None)
+    if back:
+        q = Path(str(back).strip().strip('"').strip("'").strip()).expanduser()
+        if not q.is_absolute() and not q.exists() and (base / q).exists():
+            spec.back_images = str(base / q)
     return _cmd_job(console, spec, ns.dry_run)
 
 

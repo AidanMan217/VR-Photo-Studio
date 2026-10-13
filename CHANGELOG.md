@@ -4,6 +4,51 @@ All notable changes to VR Photo Studio are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+**SHARP 360°: AI and photo backs, previews.** Design: `docs/design/SHARP360.md` (milestones M2
+and M3).
+
+### Added
+
+- **SHARP 360° back made by TRELLIS:** with the TRELLIS add-on installed (no new download), an
+  AI builds the whole person in 3D from the photo; the app finds how that shape is turned and
+  sized, lines it up exactly behind SHARP's front, matches its colours to the photo and uses
+  only its back half. Real volume (hair, shoulders, a bag), soft texture; about 4-8 minutes on
+  a GeForce GTX 1080 (estimate). *Back made by: Automatic* now uses TRELLIS when it is installed
+  (except with *Fast* back quality); if it cannot make a usable back the built-in shape is used,
+  with a note saying why.
+- **SHARP 360° back from your own photo** (*Back made by: Your own back photo* and *Back
+  photo*): a photo of the person from behind - or a back view made with any AI photo tool - is
+  cut out, bent onto the outline of the front photo and lifted onto a back surface, with its
+  colours matched to the photo. Optional side photos next to it (`right`, `left`, `back_right`,
+  `back_left`, `front_right`, `front_left`) shape and colour the sides; left and right named the
+  wrong way round are often noticed and fixed (both pictures together; otherwise a note says the
+  naming could not be confirmed). A phone photo taken at eye level and tilted down is
+  straightened before the pose check; side photos with the feet cut off keep their real size. A
+  back in a different pose is not used (note, built-in back); a back or side photo that cannot
+  be read, or where the person is too small, is named in the note. No download, about 1-3
+  minutes (estimate).
+- **Preview pictures:** every SHARP 360° job saves `<name>_sharp360_preview.jpg`, the finished
+  splat seen from 8 directions (rendered on the CPU), and with your own back photo
+  `<name>_sharp360_views.png`, showing how your photos were lined up.
+- New SHARP 360° options: *Back photo*, *Back detail* (relief from the depth model or smooth),
+  *Match colours to the photo*, *AI attempts* and *AI steps* (TRELLIS; the best-fitting attempt
+  is kept). *Variation* now also applies to SHARP 360° (a different TRELLIS back and seam
+  pattern; the photographed front never changes).
+- Command line: `--back-source trellis|images`, `--back-images FILE`, `--back-relief`,
+  `--no-color-match`, `--back-tries`, `--back-steps` and `--seed` for `--method sharp360`.
+- When *TRELLIS* is chosen as the back but not installed, the app asks whether to open the
+  Add-ons window, continue with the built-in back, or cancel.
+
+### Changed
+
+- Bad SHARP 360° options (a missing or unreadable back photo, an unknown *Back detail*, out-of-range
+  attempts / steps / *Variation*) stop the job before any slow work, with a plain message.
+- The *Back photo* is checked when you click *Create*, exactly as the job checks it (a folder of
+  views and a path pasted with quotes are fine). `vrphoto-cli run --spec job.json` finds the
+  back photo next to the job file, like the inputs.
+
 ## [0.2.0b1] - 2026-10-12
 
 First beta of **SHARP 360°**. Design: `docs/design/SHARP360.md`.

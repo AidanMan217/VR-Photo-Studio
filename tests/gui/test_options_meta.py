@@ -85,15 +85,27 @@ def test_metadata_is_consistent(name, meta, default):
     if meta.enabled_if:
         other, allowed = meta.enabled_if
         assert allowed
+    for other, allowed in meta.enabled_if_all:
+        assert isinstance(other, str) and isinstance(allowed, tuple) and allowed, name
+    assert meta.conditions() == ((meta.enabled_if,) if meta.enabled_if else ()) + meta.enabled_if_all
     if meta.only_modes is not None:
         assert meta.only_modes <= set(JOB_TYPES)
+    if meta.addon_optional:
+        assert meta.addon_choices, f"{name}: addon_optional without addon_choices"
+    if meta.file_filter:
+        assert meta.kind == "file" and meta.file_filter in ("images",), name
 
 
 def test_enabled_if_refers_to_sibling_fields():
     for kind, meta in om.JOB_META.items():
         for name, m in meta.items():
-            if m.enabled_if:
-                assert m.enabled_if[0] in meta, f"{kind}.{name} depends on unknown field"
+            for other, allowed in m.conditions():
+                assert other in meta, f"{kind}.{name} depends on unknown field {other!r}"
+                assert other != name, f"{kind}.{name} depends on itself"
+                sib = meta[other]
+                if sib.kind == "combo" and sib.choices and not sib.choices_from:
+                    unknown = set(allowed) - set(sib.choice_values())
+                    assert not unknown, f"{kind}.{name}: {other} has no choice(s) {sorted(unknown)}"
 
 
 @pytest.mark.parametrize("kind", sorted(om.PRESETS))
@@ -129,6 +141,97 @@ def test_required_addons():
     assert req("object", {"method": "sharp360"}) == ("sharp",)
     assert req("object", {"method": "sharp360", "back_source": "shell"}) == ("sharp",)
     assert req("object", {"method": "billboard", "back_source": "auto"}) == ()
+    # the flattened wrapper lists the optional back source too
+    assert req("object", {"method": "sharp360", "back_source": "trellis"}) == ("sharp", "trellis")
+    assert req("object", {"method": "billboard", "back_source": "trellis"}) == ()
+
+
+def test_required_addon_groups():
+    """docs/design/SHARP360.md §1.7 / §5.5: (any-of ids, optional) groups."""
+    groups = om.required_addon_groups
+    assert groups("stereo", {}) == ()
+    assert groups("unknown", {"method": "trellis"}) == ()
+    assert groups("capture", {}) == ((("capture",), False),)
+    assert groups("object", {"method": "trellis"}) == ((("trellis",), False),)
+    assert groups("vr180", {"fill": "outpaint"}) == ((("sdxl360",), False),)
+    sharp360 = {"method": "sharp360", "back_source": "trellis"}
+    assert groups("object", sharp360) == ((("sharp",), False), (("trellis",), True))
+    for source in ("auto", "shell", "images"):  # nothing to install: the job picks / needs none
+        assert groups("object", {"method": "sharp360", "back_source": source}) == ((("sharp",), False),)
+    # a remembered TRELLIS back on another method asks for nothing more (greyed-out option)
+    assert groups("object", {"method": "billboard", "back_source": "trellis"}) == ()
+    assert groups("object", {"method": "trellis", "back_source": "trellis"}) == ((("trellis",), False),)
+    # broken remembered values name no add-on
+    assert groups("object", {"method": ["x"], "back_source": {"a": 1}}) == ()
+
+
+def test_required_addon_groups_follow_the_full_job_values():
+    """The GUI passes every option of the form: the defaults of an ObjectJob need nothing."""
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    values = {f.name: getattr(ObjectJob(), f.name) for f in _fields(ObjectJob)}
+    assert om.required_addon_groups("object", values) == ()
+    values.update(method="sharp360", back_source="trellis")
+    assert om.required_addon_groups("object", values) == ((("sharp",), False), (("trellis",), True))
+    values.update(method="sharp")
+    assert om.required_addon_groups("object", values) == ((("sharp",), False),)
+
+
+def test_a_group_needed_both_ways_is_required(monkeypatch):
+    obj = dict(om.JOB_META["object"])
+    back = obj["back_source"]
+    monkeypatch.setitem(
+        om.JOB_META,
+        "object",
+        {**obj, "back_source": dataclasses.replace(back, addon_choices={"trellis": ("sharp",)})},
+    )
+    assert om.required_addon_groups("object", {"method": "sharp360", "back_source": "trellis"}) == (
+        (("sharp",), False),
+    )
+
+
+# --------------------------------------------------------------------------- field_applies
+def test_field_applies_follows_enabled_if_and_enabled_if_all():
+    fa = om.field_applies
+    assert fa("object", "method", {})  # no condition
+    assert fa("object", "seed", {"method": "trellis"}) and not fa("object", "seed", {"method": "billboard"})
+    on = {"method": "sharp360", "back_source": "images"}
+    assert fa("object", "back_images", on)
+    assert not fa("object", "back_images", {**on, "back_source": "trellis"})  # enabled_if_all
+    assert not fa("object", "back_images", {**on, "method": "sharp"})  # enabled_if
+    for source, tries_on in (("auto", True), ("trellis", True), ("shell", False), ("images", False)):
+        vals = {"method": "sharp360", "back_source": source}
+        for name in ("back_tries", "back_steps"):
+            assert fa("object", name, vals) is tries_on, (name, source)
+    # unknown kinds / fields and the Common options never grey anything out
+    assert fa("nope", "x", {}) and fa("object", "not_a_field", {"method": "billboard"})
+    assert fa("common", "depth_model", {})
+
+
+def test_field_applies_missing_siblings_do_not_restrict():
+    """The panel leaves out invalid entries: their value greys nothing out."""
+    assert om.field_applies("object", "back_images", {})
+    assert om.field_applies("object", "back_images", {"method": "sharp360"})
+    assert not om.field_applies("object", "back_images", {"back_source": "shell"})
+
+
+def test_field_applies_is_transitive_and_safe_with_cycles():
+    """A field under a greyed-out switch is greyed out even if it forgot the switch."""
+    meta = {
+        "mode": om.FieldMeta("Mode", "x" * 20, "combo", choices=(("a", "A"), ("b", "B"))),
+        "sub": om.FieldMeta(
+            "Sub", "x" * 20, "combo", choices=(("p", "P"), ("q", "Q")), enabled_if=("mode", ("a",))
+        ),
+        "leaf": om.FieldMeta("Leaf", "x" * 20, "check", enabled_if=("sub", ("p",))),
+        "loop1": om.FieldMeta("L1", "x" * 20, "check", enabled_if=("loop2", (True,))),
+        "loop2": om.FieldMeta("L2", "x" * 20, "check", enabled_if=("loop1", (True,))),
+    }
+    vals = {"mode": "a", "sub": "p", "leaf": True, "loop1": True, "loop2": True}
+    assert om.field_applies(None, "leaf", vals, meta=meta)
+    assert not om.field_applies(None, "leaf", {**vals, "mode": "b"}, meta=meta)  # via "sub"
+    assert not om.field_applies(None, "leaf", {**vals, "sub": "q"}, meta=meta)
+    assert om.field_applies(None, "loop1", vals, meta=meta)
+    assert not om.field_applies(None, "loop1", {**vals, "loop1": False}, meta=meta)  # loop2 off
 
 
 def test_addon_choice_ids_match_manifests():
@@ -145,21 +248,27 @@ def test_addon_choice_ids_match_manifests():
 
 # --------------------------------------------------------------------------- review fixes
 def test_seed_is_not_offered_for_sharp():
-    """SHARP is deterministic and ignores the seed: 'Variation' must be greyed out for it."""
-    other, allowed = om.JOB_META["object"]["seed"].enabled_if
+    """SHARP is deterministic and ignores the seed: 'Variation' must be greyed out for it.
+    SHARP 360 uses it (TRELLIS's result and the seam pattern), design §0.3."""
+    meta = om.JOB_META["object"]["seed"]
+    other, allowed = meta.enabled_if
     assert other == "method"
     assert "sharp" not in allowed
-    assert set(allowed) == {"trellis", "trellis2", "hunyuan"}
-
-
-def test_seed_is_not_offered_for_sharp360_in_this_release():
-    """SHARP 360's built-in back is deterministic too (the seed arrives with the AI backs)."""
-    _other, allowed = om.JOB_META["object"]["seed"].enabled_if
-    assert "sharp360" not in allowed
+    assert set(allowed) == {"trellis", "trellis2", "hunyuan", "sharp360"}
+    assert not meta.enabled_if_all
+    assert "SHARP 360" in meta.tooltip and "Plain SHARP" in meta.tooltip
 
 
 # --------------------------------------------------------------------------- SHARP 360
 SHARP360_FIELDS = ("back_source", "back_quality", "seam_deg", "size_from", "save_extras")
+#: M2 fields: (name, extra all-of condition on back_source or None)
+SHARP360_M2_FIELDS = (
+    ("back_images", ("images",)),
+    ("back_relief", None),
+    ("color_match", None),
+    ("back_tries", ("auto", "trellis")),
+    ("back_steps", ("auto", "trellis")),
+)
 
 
 def test_sharp360_is_an_experimental_method_that_needs_sharp():
@@ -193,7 +302,12 @@ def test_sharp360_fields_metadata():
         assert obj[name].enabled_if == ("method", ("sharp360",)), name
         assert "SHARP 360" in obj[name].tooltip, name
     assert obj["back_source"].label == "Back made by"
-    assert dict(obj["back_source"].choices) == {"auto": "Automatic", "shell": "Built-in shape (no download)"}
+    assert dict(obj["back_source"].choices) == {
+        "auto": "Automatic (best installed)",
+        "shell": "Built-in shape (no download)",
+        "trellis": "TRELLIS (add-on)",
+        "images": "Your own back photo",
+    }
     assert not obj["back_source"].advanced and not obj["back_quality"].advanced
     assert dict(obj["back_quality"].choices)["best"].startswith("Best")
     seam = obj["seam_deg"]
@@ -206,8 +320,51 @@ def test_sharp360_fields_metadata():
         "photo": "Measured by SHARP",
     }
     assert obj["save_extras"].kind == "check" and obj["save_extras"].advanced
-    # no add-on is attached to a back source yet: the built-in back needs no download
-    assert not obj["back_source"].addon_choices
+    # TRELLIS is optional: the job warns and falls back to the built-in back without it
+    assert obj["back_source"].addon_choices == {"trellis": ("trellis",)}
+    assert obj["back_source"].addon_optional
+    assert not obj["method"].addon_optional  # SHARP itself is required
+
+
+def test_sharp360_m2_fields_metadata():
+    """Back photo, relief, colour match and the AI knobs (design §1.2)."""
+    from vrphoto.pipeline import run as R
+    from vrphoto.pipeline.jobs import ObjectJob
+
+    obj = om.JOB_META["object"]
+    for name, sources in SHARP360_M2_FIELDS:
+        m = obj[name]
+        assert m.enabled_if == ("method", ("sharp360",)), name
+        assert m.enabled_if_all == ((("back_source", sources),) if sources else ()), name
+        assert "SHARP 360" in m.tooltip and len(m.tooltip) > 150, name
+    back = obj["back_images"]
+    assert (back.kind, back.label, back.file_filter, back.advanced) == ("file", "Back photo", "images", False)
+    assert ObjectJob().back_images is None
+    for word in ("right", "left", "back_right", "back_left", "front_right", "front_left"):
+        assert word in back.tooltip, word
+    assert "walked to your right" in back.tooltip and "AI" in back.tooltip and "behind" in back.tooltip
+    relief = obj["back_relief"]
+    assert (relief.kind, relief.label, relief.advanced) == ("combo", "Back detail", True)
+    assert tuple(relief.choice_values()) == R.BACK_RELIEFS
+    cm = obj["color_match"]
+    assert (cm.kind, cm.label, cm.advanced) == ("check", "Match colours to the photo", True)
+    assert ObjectJob().color_match is True
+    for name, label, hi in (("back_tries", "AI attempts", 4), ("back_steps", "AI steps", 100)):
+        m = obj[name]
+        assert (m.kind, m.label, m.minimum, m.maximum, m.zero_label, m.advanced) == (
+            "spin",
+            label,
+            0,
+            hi,
+            "Automatic",
+            True,
+        ), name
+        assert getattr(ObjectJob(), name) == 0
+        assert "GTX 1080" in m.tooltip, name
+    # the plain-language source tooltip names every choice and the expected time
+    tip = obj["back_source"].tooltip
+    for word in ("Automatic", "Built-in shape", "TRELLIS", "Your own back photo", "GTX 1080", "minutes"):
+        assert word in tip, word
 
 
 def test_thickness_and_back_apply_to_the_sharp360_built_in_back():

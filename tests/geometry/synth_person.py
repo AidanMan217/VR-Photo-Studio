@@ -1038,3 +1038,38 @@ __all__ = [
     "synth_front_model",
     "true_back_depth",
 ]
+
+
+# --------------------------------------------------------------------------- SHARP 360 views (views_lift tests)
+def make_body_pose(left_arm_deg: float = 20.0, **kw) -> Body:
+    """:func:`make_body` (same keywords) with the raised LEFT arm at ``left_arm_deg`` above the
+    horizontal instead of 20 deg - another pose of the same person, e.g. for a back photo that
+    does not match the front."""
+    from dataclasses import replace as _replace
+
+    body = make_body(**kw)
+    a = math.radians(left_arm_deg)
+    sh_l = (0.17, 1.38, 0.0)
+    hand_l = (0.17 + 0.62 * math.cos(a), 1.38 + 0.62 * math.sin(a), 0.0)
+    _, ctr, radii, rot = _seg("arm_left", sh_l, hand_l, 0.05, 0.02)
+    k = body.part("arm_left")
+    centers, rots, rad = body.centers.copy(), body.rot.copy(), body.radii.copy()
+    centers[k] = body.origin + body.R_cb @ ctr
+    rots[k] = body.R_cb @ rot
+    rad[k] = radii
+    return _replace(body, centers=centers, rot=rots, radii=rad)
+
+
+def ortho_view_parts(body: Body, canon: Canon, phi_deg: float, m: float = 0.01, N: int = 200) -> np.ndarray:
+    """``(N, N)`` int index (into ``body.names``) of the first body part hit at each pixel centre
+    of :func:`ortho_view` with the same arguments (-1 where the ray misses the body)."""
+    right, down, fwd = ortho_axes(canon, phi_deg)
+    rows, cols = np.mgrid[0:N, 0:N]
+    u = (cols + 0.5).ravel()
+    v = (rows + 0.5).ravel()
+    far = 20.0
+    o = canon.c + ((u - N / 2.0) * m)[:, None] * right + ((v - N / 2.0) * m)[:, None] * down - far * fwd
+    return body.raycast_part(o, np.broadcast_to(fwd, o.shape)).reshape(N, N)
+
+
+__all__ += ["make_body_pose", "ortho_view_parts"]
